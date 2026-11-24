@@ -215,6 +215,13 @@ pub enum ApiError {
     #[error("push subscription not found", status = StatusCode::NOT_FOUND)]
     PushSubscriptionNotFound,
 
+    /// Another account already holds a subscription for this push endpoint.
+    #[error(
+        "this push subscription endpoint already belongs to another account",
+        status = StatusCode::CONFLICT
+    )]
+    PushSubscriptionConflict,
+
     /// The browser sent a subscription flyco cannot use.
     #[error("this push subscription is unusable: {0}", status = StatusCode::UNPROCESSABLE_ENTITY)]
     InvalidPushSubscription(&'static str),
@@ -885,6 +892,13 @@ pub enum ApiError {
         /// Longest key the control plane accepts.
         max: usize,
     },
+
+    /// An `Idempotency-Key` was reused with a different request payload.
+    #[error(
+        "this Idempotency-Key was already used with a different request payload",
+        status = StatusCode::UNPROCESSABLE_ENTITY
+    )]
+    IdempotencyPayloadMismatch,
 
     /// The CLI sign-in being polled or approved is gone.
     ///
@@ -1657,6 +1671,7 @@ impl ApiError {
             Self::WebhookUnverified => "webhook-unverified",
             Self::WebhookMalformed { .. } => "webhook-malformed",
             Self::PushSubscriptionNotFound => "push-subscription-not-found",
+            Self::PushSubscriptionConflict => "push-subscription-conflict",
             Self::InvalidPushSubscription(_) => "invalid-push-subscription",
             Self::PushDeliveryFailed(_) => "push-delivery-failed",
             Self::ProviderAccountNotFound => "provider-account-not-found",
@@ -1725,6 +1740,7 @@ impl ApiError {
             Self::SessionCapReached { .. } => "session-cap-reached",
             Self::IdempotencyInFlight => "idempotency-in-flight",
             Self::InvalidIdempotencyKey { .. } => "invalid-idempotency-key",
+            Self::IdempotencyPayloadMismatch => "idempotency-payload-mismatch",
             Self::HandoffNotPending => "handoff-not-pending",
             Self::HandoffObjectMissing { .. } => "handoff-object-missing",
             Self::HandoffChecksumMismatch { .. } => "handoff-checksum-mismatch",

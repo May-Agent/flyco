@@ -37,7 +37,9 @@ use crate::extract::{CallerLocation, Headers, path_id, path_segment};
 use crate::github::{GithubClient, GithubOauth};
 use crate::host_room::HostAttachResponse;
 use crate::mcp_catalog::RegistryClient;
-use crate::middleware::{DaemonSession, RequireAuth, RequireDaemon};
+use crate::middleware::{
+    AuthenticatedHost, DaemonSession, RequireAuth, RequireDaemon, RequireHost,
+};
 use crate::problem::Outcome;
 use crate::provisioning_queue::{self, ProvisioningJob};
 use crate::request_budget;
@@ -245,22 +247,15 @@ async fn start_session(
     // what creation commits the session to, so it travels alongside the
     // resolution rather than through it.
     let source = request.source.clone();
+    let payload_hash = idempotency::payload_hash(&request)?;
     let resolved = resolve_request(user, request, near, config, github, db, kv, queue).await?;
 
     // Claimed only once everything that could refuse the request has
     // refused it: a key bound to a request that was never going to be
     // accepted would poison a corrected retry under the same key.
-    let claim = match idempotency_key {
-        Some(key) => match idempotency::claim(db, user.id, key).await? {
-            idempotency::Claim::Committed(session) => {
-                return sessions::find(db, user.id, session)
-                    .await
-                    .map(|detail| Created(Json(detail)));
-            }
-            idempotency::Claim::InFlight => return Err(ApiError::IdempotencyInFlight),
-            idempotency::Claim::Fresh(claim) => Some(claim),
-        },
-        None => None,
+    let claim = match claim_session_key(db, user.id, idempotency_key, &payload_hash).await? {
+        SessionClaim::Replay(detail) => return Ok(Created(Json(*detail))),
+        SessionClaim::Proceed(claim) => claim,
     };
 
     let session = match sessions::create(
@@ -304,7 +299,14 @@ async fn start_session(
         )
         .await?;
     }
-    let machine = machines::reserve(db, id, resolved.account.id, &resolved.spec).await?;
+    let machine = fail_session_on(
+        db,
+        rooms,
+        id,
+        "the session's machine could not be reserved",
+        machines::reserve(db, id, resolved.account.id, &resolved.spec).await,
+    )
+    .await?;
 
     // The prompt is posted to the session's room *before* the machine is
     // queued, so the agent's first instruction is durable before anything
@@ -357,6 +359,31 @@ async fn start_session(
         "opened a session and queued its machine"
     );
     Ok(Created(Json(session)))
+}
+
+enum SessionClaim {
+    Replay(Box<SessionDetail>),
+    Proceed(Option<idempotency::FreshClaim>),
+}
+
+async fn claim_session_key(
+    db: &Db,
+    user: UserId,
+    idempotency_key: Option<&str>,
+    payload_hash: &str,
+) -> Result<SessionClaim, ApiError> {
+    let Some(key) = idempotency_key else {
+        return Ok(SessionClaim::Proceed(None));
+    };
+    match idempotency::claim(db, user, key, payload_hash).await? {
+        idempotency::Claim::Committed(session) => sessions::find(db, user, session)
+            .await
+            .map(Box::new)
+            .map(SessionClaim::Replay),
+        idempotency::Claim::InFlight => Err(ApiError::IdempotencyInFlight),
+        idempotency::Claim::PayloadMismatch => Err(ApiError::IdempotencyPayloadMismatch),
+        idempotency::Claim::Fresh(claim) => Ok(SessionClaim::Proceed(Some(claim))),
+    }
 }
 
 /// Everything `start_session` settles before a row is written: the request's
@@ -1307,28 +1334,15 @@ async fn pair_daemon(
 /// credential, so it sits outside [`RequireAuth`].
 #[skyzen::openapi]
 async fn attach_daemon(
-    params: Params,
-    headers: Headers,
+    State(session): State<DaemonSession>,
     rooms: Rooms,
     db: Db,
     Json(attach): Json<DaemonAttach>,
 ) -> Outcome<Json<DaemonAttached>> {
-    daemon_attach(&params, &headers, &rooms, &db, attach)
-        .await
-        .into()
-}
-
-async fn daemon_attach(
-    params: &Params,
-    headers: &Headers,
-    rooms: &Rooms,
-    db: &Db,
-    attach: DaemonAttach,
-) -> Result<Json<DaemonAttached>, ApiError> {
-    let id = path_id::<SessionId>(params, "id")?;
-    relay::attach_daemon(rooms, db, id, headers.bearer(), attach)
+    relay::attach_daemon(&rooms, &db, session.0, attach)
         .await
         .map(Json)
+        .into()
 }
 
 /// Query of the daemon command stream.
@@ -1342,51 +1356,26 @@ struct CommandEpoch {
 /// through still running.
 #[skyzen::openapi]
 async fn open_daemon_commands(
-    params: Params,
-    headers: Headers,
+    State(session): State<DaemonSession>,
     Query(query): Query<CommandEpoch>,
     rooms: Rooms,
-    db: Db,
 ) -> Outcome<Response> {
-    daemon_commands(&params, &headers, &query, &rooms, &db)
+    relay::daemon_commands(&rooms, session.0, query.epoch)
         .await
         .into()
-}
-
-async fn daemon_commands(
-    params: &Params,
-    headers: &Headers,
-    query: &CommandEpoch,
-    rooms: &Rooms,
-    db: &Db,
-) -> Result<Response, ApiError> {
-    let id = path_id::<SessionId>(params, "id")?;
-    relay::daemon_commands(rooms, db, id, headers.bearer(), query.epoch).await
 }
 
 /// Accepts one batch of a session daemon's outbound frames.
 #[skyzen::openapi]
 async fn post_daemon_frames(
-    params: Params,
-    headers: Headers,
+    State(session): State<DaemonSession>,
     rooms: Rooms,
     db: Db,
     Json(batch): Json<DaemonFrames>,
 ) -> Outcome<NoContent> {
-    daemon_frames(&params, &headers, &rooms, &db, batch)
+    relay::daemon_frames(&rooms, &db, session.0, batch)
         .await
         .into()
-}
-
-async fn daemon_frames(
-    params: &Params,
-    headers: &Headers,
-    rooms: &Rooms,
-    db: &Db,
-    batch: DaemonFrames,
-) -> Result<NoContent, ApiError> {
-    let id = path_id::<SessionId>(params, "id")?;
-    relay::daemon_frames(rooms, db, id, headers.bearer(), batch).await
 }
 
 /// Attaches an enrolled machine to its host room.
@@ -1396,78 +1385,37 @@ async fn daemon_frames(
 /// [`RequireAuth`].
 #[skyzen::openapi]
 async fn attach_host(
-    params: Params,
-    headers: Headers,
+    State(host): State<AuthenticatedHost>,
     rooms: HostRooms,
     db: Db,
     Json(attach): Json<HostAttach>,
 ) -> Outcome<Json<HostAttachResponse>> {
-    host_attach(&params, &headers, &rooms, &db, attach)
-        .await
-        .into()
-}
-
-async fn host_attach(
-    params: &Params,
-    headers: &Headers,
-    rooms: &HostRooms,
-    db: &Db,
-    attach: HostAttach,
-) -> Result<Json<HostAttachResponse>, ApiError> {
-    let id = path_id::<flyco_core::HostId>(params, "id")?;
-    relay::attach_host(rooms, db, id, headers.bearer(), attach)
+    relay::attach_host(&rooms, &db, host.0, attach)
         .await
         .map(Json)
+        .into()
 }
 
 /// Opens an enrolled machine's command stream.
 #[skyzen::openapi]
 async fn open_host_commands(
-    params: Params,
-    headers: Headers,
+    State(host): State<AuthenticatedHost>,
     Query(query): Query<CommandEpoch>,
     rooms: HostRooms,
-    db: Db,
 ) -> Outcome<Response> {
-    host_commands(&params, &headers, &query, &rooms, &db)
+    relay::host_commands(&rooms, host.0, query.epoch)
         .await
         .into()
-}
-
-async fn host_commands(
-    params: &Params,
-    headers: &Headers,
-    query: &CommandEpoch,
-    rooms: &HostRooms,
-    db: &Db,
-) -> Result<Response, ApiError> {
-    let id = path_id::<flyco_core::HostId>(params, "id")?;
-    relay::host_commands(rooms, db, id, headers.bearer(), query.epoch).await
 }
 
 /// Accepts one batch of an enrolled machine's outbound frames.
 #[skyzen::openapi]
 async fn post_host_frames(
-    params: Params,
-    headers: Headers,
+    State(host): State<AuthenticatedHost>,
     rooms: HostRooms,
-    db: Db,
     Json(batch): Json<HostFrames>,
 ) -> Outcome<NoContent> {
-    host_frames(&params, &headers, &rooms, &db, batch)
-        .await
-        .into()
-}
-
-async fn host_frames(
-    params: &Params,
-    headers: &Headers,
-    rooms: &HostRooms,
-    db: &Db,
-    batch: HostFrames,
-) -> Result<NoContent, ApiError> {
-    let id = path_id::<flyco_core::HostId>(params, "id")?;
-    relay::host_frames(rooms, db, id, headers.bearer(), batch).await
+    relay::host_frames(&rooms, host.0, batch).await.into()
 }
 
 /// Query of the user event stream.
@@ -2703,7 +2651,9 @@ async fn record_approval(
     let payload = settle_repo_add(session, payload, db, config, github).await?;
     let id = approvals::raise(db, session, &payload).await?;
     let view = approvals::find_for_session(db, session, id).await?;
-    push::notify_approval(db, config, session).await?;
+    if let Err(error) = push::notify_approval(db, config, session).await {
+        tracing::warn!(%session, %error, "could not send approval push notification");
+    }
     tracing::info!(%session, "a daemon raised an approval");
     Ok(Created(Json(view)))
 }
@@ -2799,7 +2749,9 @@ async fn finish_turn(
     db: &Db,
 ) -> Result<NoContent, ApiError> {
     sessions::record_activity(db, session, SessionActivity::after_turn(false)).await?;
-    push::notify_turn(db, config, session, completed).await?;
+    if let Err(error) = push::notify_turn(db, config, session, completed).await {
+        tracing::warn!(%session, %error, "could not send turn push notification");
+    }
     Ok(NoContent)
 }
 
@@ -3626,32 +3578,42 @@ fn public_routes() -> Vec<RouteNode> {
 /// The daemon and host relay routes: REST in, SSE out.
 ///
 /// None carries a user credential — the daemon presents its session's
-/// `fd_` token, the host its `fh_` token — so they authenticate
-/// themselves rather than sitting behind [`RequireAuth`]. The command
-/// routes answer with an SSE stream that never ends, which the `OpenAPI`
-/// response model cannot describe — see
+/// `fd_` token through [`RequireDaemon`], the host its `fh_` token through
+/// [`RequireHost`] — so they authenticate via middleware before entering the
+/// handlers and are charged to their verified session or host budget rather
+/// than the caller's IP address. The command routes answer with an SSE stream
+/// that never ends, which the `OpenAPI` response model cannot describe — see
 /// [`responses::UNDECLARED`](crate::responses::UNDECLARED).
 fn relay_routes() -> Vec<RouteNode> {
-    Route::new((
+    let daemon = Route::new((
         "/v1/sessions/{id}/relay/attach".post(attach_daemon),
         "/v1/sessions/{id}/relay/commands".at(open_daemon_commands),
         "/v1/sessions/{id}/relay/frames".post(post_daemon_frames),
+    ))
+    .middleware(RequireDaemon::new())
+    .into_route_nodes();
+
+    let host = Route::new((
         "/v1/hosts/{id}/relay/attach".post(attach_host),
         "/v1/hosts/{id}/relay/commands".at(open_host_commands),
         "/v1/hosts/{id}/relay/frames".post(post_host_frames),
     ))
-    .into_route_nodes()
+    .middleware(RequireHost::new())
+    .into_route_nodes();
+
+    daemon.into_iter().chain(host).collect()
 }
 
-/// Routes a session's own daemon calls, authenticated by its `fd_` token.
 /// Routes an enrolled machine calls with its own `fh_` token.
 ///
 /// Beside [`daemon_routes`] rather than inside it: an `fd_` token resolves
 /// to a session and an `fh_` token to a machine, and neither may ever be
-/// widened into the other. Each route here checks the presented token
-/// against the host in its own path.
+/// widened into the other. Wrapped in [`RequireHost`] so the verified host id
+/// is present in request extensions for request-budget attribution.
 fn host_routes() -> Vec<RouteNode> {
-    hosts::host_routes()
+    Route::new(hosts::host_routes())
+        .middleware(RequireHost::new())
+        .into_route_nodes()
 }
 
 fn daemon_routes() -> Vec<RouteNode> {

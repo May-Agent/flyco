@@ -75,7 +75,6 @@ use std::sync::{Arc, Mutex};
 use flyco_core::host::HOST_TOKEN_PREFIX;
 use flyco_core::{CurrentUser, DAEMON_TOKEN_PREFIX, HostId, SessionId, UserId};
 use skyzen::middleware::Next;
-use skyzen::routing::Params;
 use skyzen::sql;
 use skyzen::utils::State;
 use skyzen::{Error, Middleware, Request, Response};
@@ -85,7 +84,7 @@ use crate::authenticator::bearer_token;
 use crate::clock::now_unix;
 use crate::crypto::token_hash;
 use crate::error::ApiError;
-use crate::middleware::DaemonSession;
+use crate::middleware::{AuthenticatedHost, DaemonSession};
 use crate::{api_keys, session};
 
 /// The unit the daily ledger keys on, in the seconds `now_unix` counts.
@@ -330,6 +329,7 @@ pub trait RateLimiter: Send + Sync + 'static {
     fn allow(
         &self,
         request: &Request,
+        class: Class,
         key: String,
         per_minute: u32,
     ) -> impl Future<Output = Result<bool, ApiError>> + Send + 'static;
@@ -373,6 +373,7 @@ impl RateLimiter for MemoryRateLimiter {
     fn allow(
         &self,
         _request: &Request,
+        _class: Class,
         key: String,
         per_minute: u32,
     ) -> impl Future<Output = Result<bool, ApiError>> + Send + 'static {
@@ -396,6 +397,7 @@ impl RateLimiter for BindingRateLimiter {
     fn allow(
         &self,
         request: &Request,
+        class: Class,
         key: String,
         _per_minute: u32,
     ) -> impl Future<Output = Result<bool, ApiError>> + Send + 'static {
@@ -405,7 +407,6 @@ impl RateLimiter for BindingRateLimiter {
             .extensions()
             .get::<skyzen::runtime::wasm::WasmEnv>()
             .cloned();
-        let class = Class::of(bearer_token(request.headers()));
         async move {
             let env = env.ok_or_else(|| {
                 ApiError::RateLimiterUnavailable(
@@ -459,13 +460,17 @@ use skyzen::wasm_bindgen::JsCast as _;
 struct Tally {
     /// What D1 last answered: the day's total across every isolate.
     confirmed: u64,
-    /// Requests counted here since, not yet written.
+    /// Requests counted here since, not yet handed to a D1 flush.
     unflushed: u64,
+    /// Requests currently in flight to D1.
+    in_flight: u64,
 }
 
 impl Tally {
     const fn total(self) -> u64 {
-        self.confirmed.saturating_add(self.unflushed)
+        self.confirmed
+            .saturating_add(self.in_flight)
+            .saturating_add(self.unflushed)
     }
 }
 
@@ -487,10 +492,13 @@ pub struct Verdict {
 #[derive(Debug, Default)]
 pub struct Ledger {
     tallies: HashMap<(Principal, u64), Tally>,
-    /// Credential keys refused until an instant: a spent principal's
-    /// credentials, so the pre-auth check refuses them without a storage
-    /// read.
+    /// Credential or address keys refused until UTC midnight: a spent
+    /// principal's credentials (or `ip:<address>` for `Principal::Address`),
+    /// so the pre-auth check refuses them without a storage read.
     blocked: HashMap<String, u64>,
+    /// Address keys temporarily refused until the end of a per-minute window
+    /// after exceeding `LIMIT_PUBLIC` on failed/unauthenticated requests.
+    rate_limited: HashMap<String, u64>,
     swept_day: u64,
 }
 
@@ -501,15 +509,31 @@ impl Ledger {
         Self::default()
     }
 
-    /// The instant a credential key is refused until, if it is.
+    /// The instant a credential or address key is refused until, if it is.
     #[must_use]
     pub fn blocked_until(&self, key: &str, now: u64) -> Option<u64> {
         self.blocked.get(key).copied().filter(|until| *until > now)
     }
 
-    /// Refuses a credential key until `until`.
+    /// Refuses a credential or address key until `until`.
     pub fn block(&mut self, key: String, until: u64) {
         self.blocked.insert(key, until);
+    }
+
+    /// The instant an address key is per-minute throttled until, if it is.
+    #[must_use]
+    pub fn rate_limited_until(&self, key: &str, now: u64) -> Option<u64> {
+        self.rate_limited
+            .get(key)
+            .copied()
+            .filter(|until| *until > now)
+    }
+
+    /// Temporarily throttles an address key until `until`, pruning expired
+    /// entries so per-minute blocks never accumulate across windows.
+    pub fn rate_limit(&mut self, key: String, until: u64, now: u64) {
+        self.rate_limited.retain(|_, exp| *exp > now);
+        self.rate_limited.insert(key, until);
     }
 
     /// Counts one request against `principal`'s day.
@@ -522,6 +546,10 @@ impl Ledger {
     /// isolate learns it is reached; and every [`FLUSH_EVERY`]th between.
     /// A principal already at its ceiling is not counted: it is refused
     /// before the request runs, and the tally is what the refusal reads.
+    ///
+    /// Any flushed count is transferred from `unflushed` into `in_flight`
+    /// while the lock is held so concurrent requests on the same isolate
+    /// never double-flush the same batch to D1.
     pub fn charge(&mut self, principal: &Principal, limit: Limit, now: u64) -> Verdict {
         let day = now / SECONDS_PER_DAY;
         self.sweep(day, now);
@@ -534,17 +562,24 @@ impl Ledger {
         }
         tally.unflushed = tally.unflushed.saturating_add(1);
         let exhausted = tally.total() >= limit.per_day;
-        let first = tally.confirmed == 0 && tally.unflushed == 1;
-        let flush =
-            (first || exhausted || tally.unflushed >= FLUSH_EVERY).then_some(tally.unflushed);
+        let first = tally.confirmed == 0 && tally.in_flight == 0 && tally.unflushed == 1;
+        let should_flush = first || exhausted || tally.unflushed >= FLUSH_EVERY;
+        let flush = if should_flush && tally.unflushed > 0 {
+            let amount = tally.unflushed;
+            tally.unflushed = 0;
+            tally.in_flight = tally.in_flight.saturating_add(amount);
+            Some(amount)
+        } else {
+            None
+        };
         Verdict { exhausted, flush }
     }
 
     /// Records what D1 answered for a flush of `flushed` requests: the
     /// day's total. Returns whether the principal is now at its ceiling.
     ///
-    /// Only the flushed count is retired: requests charged while the
-    /// write was in flight stay unflushed for the next batch.
+    /// Retires the flushed count from `in_flight`; requests charged while the
+    /// write was in flight remain in `unflushed` for the next batch.
     pub fn confirm(
         &mut self,
         principal: &Principal,
@@ -554,10 +589,24 @@ impl Ledger {
         total: u64,
     ) -> bool {
         let day = now / SECONDS_PER_DAY;
+        if day < self.swept_day {
+            return false;
+        }
         let tally = self.tallies.entry((principal.clone(), day)).or_default();
-        tally.confirmed = total;
-        tally.unflushed = tally.unflushed.saturating_sub(flushed);
+        tally.confirmed = tally.confirmed.max(total);
+        tally.in_flight = tally.in_flight.saturating_sub(flushed);
         tally.total() >= limit.per_day
+    }
+
+    /// Restores a failed flush from `in_flight` back to `unflushed` so the
+    /// next flush retries writing those requests to D1.
+    pub fn restore(&mut self, principal: &Principal, now: u64, flushed: u64) {
+        let day = now / SECONDS_PER_DAY;
+        if let Some(tally) = self.tallies.get_mut(&(principal.clone(), day)) {
+            let restored = flushed.min(tally.in_flight);
+            tally.in_flight = tally.in_flight.saturating_sub(restored);
+            tally.unflushed = tally.unflushed.saturating_add(restored);
+        }
     }
 
     /// Drops yesterday's tallies and expired blocks, once per day.
@@ -568,6 +617,7 @@ impl Ledger {
         self.swept_day = day;
         self.tallies.retain(|(_, on), _| *on == day);
         self.blocked.retain(|_, until| *until > now);
+        self.rate_limited.retain(|_, until| *until > now);
     }
 }
 
@@ -585,6 +635,10 @@ struct Caller {
     /// The per-minute limiter's key and the block list's: the credential's
     /// hash for a credentialed class, the address otherwise.
     key: String,
+    /// Always `ip:<address>`, checked pre-auth even when a request presents a
+    /// credential prefix so rotating forged bearers cannot bypass an IP ban
+    /// or per-minute IP throttle.
+    address_key: String,
     address: String,
 }
 
@@ -604,26 +658,27 @@ impl Caller {
                     .map(|peer| peer.0.ip().to_string())
             })
             .unwrap_or_else(|| LOCAL_ADDRESS.to_owned());
+        let address_key = format!("ip:{address}");
         let key = match (class, bearer) {
-            (Class::Public, _) | (_, None) => format!("ip:{address}"),
+            (Class::Public, _) | (_, None) => address_key.clone(),
             (class, Some(token)) => format!("{class}:{}", token_hash(token)),
         };
         Self {
             class,
             key,
+            address_key,
             address,
         }
     }
 
     /// Whom the request turned out to be, once the route has run.
     ///
-    /// Read from what the route's own credential check left behind: a
-    /// [`CurrentUser`] or a [`DaemonSession`] in the extensions. A host
-    /// route checks its token inside the handler and leaves nothing, so a
-    /// host-class request that was not refused as unauthenticated is
-    /// charged to the host in its path. Everything else — no credential,
-    /// or one that did not resolve — is charged to the address.
-    fn principal(&self, request: &Request, status: skyzen::StatusCode) -> Principal {
+    /// Read strictly from what the route's authentication middleware inserted
+    /// into the request extensions: [`CurrentUser`], [`DaemonSession`], or
+    /// [`AuthenticatedHost`]. Everything else — public routes or requests
+    /// whose credential failed verification — is charged to the caller's
+    /// address, never to an unverified path parameter or token prefix.
+    fn principal(&self, request: &Request) -> Principal {
         let extensions = request.extensions();
         if let Some(State(user)) = extensions.get::<State<CurrentUser>>() {
             return Principal::User(user.id);
@@ -631,15 +686,8 @@ impl Caller {
         if let Some(State(DaemonSession(session))) = extensions.get::<State<DaemonSession>>() {
             return Principal::Session(*session);
         }
-        if self.class == Class::Host
-            && status != skyzen::StatusCode::UNAUTHORIZED
-            && status != skyzen::StatusCode::FORBIDDEN
-            && let Some(host) = extensions
-                .get::<Params>()
-                .and_then(|params| params.get("id").ok())
-                .and_then(|raw| raw.parse::<HostId>().ok())
-        {
-            return Principal::Host(host);
+        if let Some(State(AuthenticatedHost(host))) = extensions.get::<State<AuthenticatedHost>>() {
+            return Principal::Host(*host);
         }
         Principal::Address(self.address.clone())
     }
@@ -677,28 +725,29 @@ impl<L: RateLimiter> RequestBudget<L> {
 
     /// Charges the request the route just answered.
     ///
-    /// A ledger write that fails is logged and the request stays counted
-    /// locally: the next flush carries it. Nothing here can fail the
+    /// A ledger write that fails is logged and the in-flight count is restored
+    /// to `unflushed` so the next flush carries it. Nothing here can fail the
     /// response — it was already produced.
     async fn charge(&self, request: &Request, caller: &Caller, principal: Principal, now: u64) {
         let limit = self.limits.for_class(principal.class());
         let verdict = self.ledger().charge(&principal, limit, now);
         let mut exhausted = verdict.exhausted;
         if let Some(flushed) = verdict.flush {
-            match request.extensions().get::<Db>().cloned() {
-                Some(db) => match flush(&db, &principal, now / SECONDS_PER_DAY, flushed).await {
+            if let Some(db) = request.extensions().get::<Db>().cloned() {
+                match flush(&db, &principal, now / SECONDS_PER_DAY, flushed).await {
                     Ok(total) => {
                         exhausted |= self
                             .ledger()
                             .confirm(&principal, limit, now, flushed, total);
                     }
                     Err(error) => {
+                        self.ledger().restore(&principal, now, flushed);
                         tracing::warn!(%principal, %error, "a request budget flush did not reach D1");
                     }
-                },
-                None => {
-                    tracing::error!(%principal, "a request budget flush found no database in the request");
                 }
+            } else {
+                self.ledger().restore(&principal, now, flushed);
+                tracing::error!(%principal, "a request budget flush found no database in the request");
             }
         }
         if exhausted {
@@ -706,15 +755,25 @@ impl<L: RateLimiter> RequestBudget<L> {
         }
     }
 
-    /// Puts a spent principal's credential on the block list and says so
-    /// once, where Workers Logs keeps it.
+    /// Puts a spent principal's credential (or `ip:<address>` when the
+    /// principal is an address) on the block list and says so once, where
+    /// Workers Logs keeps it.
+    ///
+    /// For [`Principal::Address`], the block key is always `ip:<address>`
+    /// rather than `caller.key` so an attacker rotating fake bearer prefixes
+    /// cannot fill the isolate's block map with random token hashes or bypass
+    /// the address ban.
     fn refuse(&self, caller: &Caller, principal: &Principal, now: u64) {
+        let block_key = match principal {
+            Principal::Address(_) => &caller.address_key,
+            Principal::User(_) | Principal::Session(_) | Principal::Host(_) => &caller.key,
+        };
         let until = now + until_midnight(now);
         let mut ledger = self.ledger();
-        if ledger.blocked_until(&caller.key, now).is_some() {
+        if ledger.blocked_until(block_key, now).is_some() {
             return;
         }
-        ledger.block(caller.key.clone(), until);
+        ledger.block(block_key.clone(), until);
         drop(ledger);
         tracing::warn!(
             %principal,
@@ -731,19 +790,37 @@ impl<L: RateLimiter> Middleware for RequestBudget<L> {
         let now = now_unix();
         let caller = Caller::of(request);
 
-        let blocked_until = self.ledger().blocked_until(&caller.key, now);
-        if let Some(until) = blocked_until {
-            return Ok(ApiError::RequestBudgetExhausted {
-                class: caller.class,
-                retry_after: until.saturating_sub(now),
+        let pre_auth_block = {
+            let ledger = self.ledger();
+            if let Some(until) = ledger.blocked_until(&caller.key, now) {
+                Some(ApiError::RequestBudgetExhausted {
+                    class: caller.class,
+                    retry_after: until.saturating_sub(now),
+                })
+            } else if caller.key != caller.address_key
+                && let Some(until) = ledger.blocked_until(&caller.address_key, now)
+            {
+                Some(ApiError::RequestBudgetExhausted {
+                    class: Class::Public,
+                    retry_after: until.saturating_sub(now),
+                })
+            } else {
+                ledger
+                    .rate_limited_until(&caller.address_key, now)
+                    .map(|until| ApiError::RateLimited {
+                        class: Class::Public,
+                        retry_after: until.saturating_sub(now).max(1),
+                    })
             }
-            .into_response());
+        };
+        if let Some(refusal) = pre_auth_block {
+            return Ok(refusal.into_response());
         }
 
         let per_minute = self.limits.for_class(caller.class).per_minute;
         let admitted = self
             .limiter
-            .allow(request, caller.key.clone(), per_minute)
+            .allow(request, caller.class, caller.key.clone(), per_minute)
             .await;
         match admitted {
             Ok(true) => {}
@@ -764,7 +841,45 @@ impl<L: RateLimiter> Middleware for RequestBudget<L> {
         }
 
         let response = next.run(request).await?;
-        let principal = caller.principal(request, response.status());
+        let principal = caller.principal(request);
+
+        // A request carrying a credential prefix that did not authenticate
+        // (failed auth or hit an unauthenticated public route) is billed to
+        // its address AND subject to the per-minute IP bound so rotating
+        // random `fs_`/`fk_`/`fd_`/`fh_` tokens cannot bypass IP throttling.
+        if matches!(principal, Principal::Address(_)) && caller.class != Class::Public {
+            let ip_per_minute = self.limits.public.per_minute;
+            let ip_admitted = self
+                .limiter
+                .allow(
+                    request,
+                    Class::Public,
+                    caller.address_key.clone(),
+                    ip_per_minute,
+                )
+                .await;
+            self.charge(request, &caller, principal, now).await;
+            match ip_admitted {
+                Ok(true) => return Ok(response),
+                Ok(false) => {
+                    self.ledger()
+                        .rate_limit(caller.address_key.clone(), now + WINDOW_SECONDS, now);
+                    tracing::warn!(
+                        class = %Class::Public,
+                        key = %caller.address_key,
+                        per_minute = ip_per_minute,
+                        "an address exceeded its per-minute unauthenticated request limit"
+                    );
+                    return Ok(ApiError::RateLimited {
+                        class: Class::Public,
+                        retry_after: WINDOW_SECONDS,
+                    }
+                    .into_response());
+                }
+                Err(error) => return Ok(error.into_response()),
+            }
+        }
+
         self.charge(request, &caller, principal, now).await;
         Ok(response)
     }
@@ -903,6 +1018,54 @@ mod tests {
         ledger.confirm(&principal, limit, NOON, 1, 1);
         let tally = ledger.tallies[&(principal, NOON / SECONDS_PER_DAY)];
         assert_eq!((tally.confirmed, tally.unflushed), (1, 2));
+    }
+
+    #[test]
+    fn concurrent_charges_do_not_double_flush_and_failed_flushes_restore() {
+        let mut ledger = Ledger::new();
+        let principal = Principal::User(UserId::generate());
+        let limit = Limit {
+            per_minute: 1_000,
+            per_day: 10_000,
+        };
+
+        // First sighting flushes 1 and marks it in_flight; concurrent arrivals
+        // before confirm do not trigger redundant flushes.
+        assert_eq!(ledger.charge(&principal, limit, NOON), within(Some(1)));
+        assert_eq!(ledger.charge(&principal, limit, NOON), within(None));
+        assert!(!ledger.confirm(&principal, limit, NOON, 1, 1));
+
+        // 24 more charges reach FLUSH_EVERY (1 already unflushed + 24 = 25).
+        for _ in 0..(FLUSH_EVERY - 2) {
+            assert_eq!(ledger.charge(&principal, limit, NOON), within(None));
+        }
+        assert_eq!(
+            ledger.charge(&principal, limit, NOON),
+            within(Some(FLUSH_EVERY))
+        );
+        // Another request lands while the 25-request flush is still in flight:
+        // it must not flush the same 25 again.
+        assert_eq!(ledger.charge(&principal, limit, NOON), within(None));
+
+        // If the D1 flush fails, restore returns the 25 to unflushed so the
+        // next charge flushes all accumulated unflushed requests (25 + 1 + 1).
+        ledger.restore(&principal, NOON, FLUSH_EVERY);
+        assert_eq!(
+            ledger.charge(&principal, limit, NOON),
+            within(Some(FLUSH_EVERY + 2))
+        );
+        assert!(!ledger.confirm(
+            &principal,
+            limit,
+            NOON,
+            FLUSH_EVERY + 2,
+            1 + FLUSH_EVERY + 2
+        ));
+        let tally = ledger.tallies[&(principal, NOON / SECONDS_PER_DAY)];
+        assert_eq!(
+            (tally.confirmed, tally.in_flight, tally.unflushed),
+            (1 + FLUSH_EVERY + 2, 0, 0)
+        );
     }
 
     #[test]
