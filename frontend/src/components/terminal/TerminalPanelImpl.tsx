@@ -67,55 +67,125 @@ export default function TerminalPanelImpl(props: TerminalPanelImplProps) {
       // shows its own notice otherwise — so the greeting is always this.
       term.writeln(`Connected to ${props.sessionId}'s fish shell.`);
 
+      let pendingInput = "";
+      let inputTimer: ReturnType<typeof setTimeout> | undefined;
+      let inputInFlight = false;
+
+      async function flushInput(): Promise<void> {
+        if (unmounted || inputInFlight || pendingInput === "") {
+          return;
+        }
+        if (props.relay.state() !== "live") {
+          pendingInput = "";
+          return;
+        }
+        inputInFlight = true;
+        try {
+          while (!unmounted && pendingInput !== "" && props.relay.state() === "live") {
+            const batch = pendingInput;
+            pendingInput = "";
+            await props.relay.send({ type: "terminal_input", data: batch });
+          }
+        } catch (error) {
+          if (!unmounted) {
+            props.onError(error);
+          }
+        } finally {
+          inputInFlight = false;
+        }
+      }
+
       const inputSubscription = term.onData((data) => {
         if (props.relay.state() !== "live") {
           return;
         }
-        // A lost keystroke is its own notice — the echo never comes — and
-        // the refusal is reported rather than swallowed: a `terminal_input`
-        // that the room turned away needs no retry, but the user is owed
-        // the fact that it never landed.
-        void props.relay
-          .send({ type: "terminal_input", data })
-          .catch(props.onError);
+        pendingInput += data;
+        if (!inputInFlight && inputTimer === undefined) {
+          inputTimer = setTimeout(() => {
+            inputTimer = undefined;
+            void flushInput();
+          }, 40);
+        }
       });
 
-      function tellSize(): void {
-        if (props.relay.state() !== "live") {
+      let lastCols: number | null = null;
+      let lastRows: number | null = null;
+      let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+
+      function tellSize(force = false): void {
+        if (unmounted || props.relay.state() !== "live") {
           return;
         }
+        const cols = term.cols;
+        const rows = term.rows;
+        if (!force && cols === lastCols && rows === lastRows) {
+          return;
+        }
+        lastCols = cols;
+        lastRows = rows;
         void props.relay
-          .send({ type: "terminal_resize", cols: term.cols, rows: term.rows })
-          .catch(props.onError);
+          .send({ type: "terminal_resize", cols, rows })
+          .catch((error) => {
+            if (!unmounted) {
+              props.onError(error);
+            }
+          });
       }
-      const resizeSubscription = term.onResize(tellSize);
+      const resizeSubscription = term.onResize(() => tellSize(false));
       fit.fit();
-      const observer = new ResizeObserver(() => fit.fit());
+      const observer = new ResizeObserver(() => {
+        if (resizeTimer !== undefined) {
+          clearTimeout(resizeTimer);
+        }
+        resizeTimer = setTimeout(() => {
+          resizeTimer = undefined;
+          if (!unmounted) {
+            fit.fit();
+            tellSize(false);
+          }
+        }, 120);
+      });
       observer.observe(container);
       createEffect(() => {
         if (props.relay.state() === "live") {
-          tellSize();
+          tellSize(true);
         }
       });
 
       onCleanup(() => {
+        if (inputTimer !== undefined) {
+          clearTimeout(inputTimer);
+          inputTimer = undefined;
+        }
+        if (resizeTimer !== undefined) {
+          clearTimeout(resizeTimer);
+          resizeTimer = undefined;
+        }
+        pendingInput = "";
         observer.disconnect();
         resizeSubscription.dispose();
         inputSubscription.dispose();
         term.dispose();
       });
 
-      // Writes every not-yet-seen `terminal_output` event. `processed`
-      // tracks how far this has read so a re-run — the relay's `events`
-      // signal changes on every new frame, not just terminal ones — never
-      // rewrites history the terminal has already shown.
+      // Writes every not-yet-seen `terminal_output` / `terminal_exited` event.
+      // `processed` tracks how far this has read so a re-run — the relay's
+      // `events` signal changes on every new frame, not just terminal ones —
+      // never rewrites history the terminal has already shown.
       let processed = 0;
       createEffect(() => {
         const events = props.relay.events();
         for (let i = processed; i < events.length; i += 1) {
           const entry = events[i];
-          if (entry !== undefined && entry.event.type === "terminal_output") {
+          if (entry === undefined) {
+            continue;
+          }
+          if (entry.event.type === "terminal_output") {
             term.write(entry.event.data);
+          } else if (entry.event.type === "terminal_exited") {
+            const suffix =
+              entry.event.code === null ? "" : ` (code ${entry.event.code})`;
+            term.writeln(`\r\n[Terminal process exited${suffix}]`);
           }
         }
         processed = events.length;

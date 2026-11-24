@@ -263,6 +263,15 @@ describe("route smoke tests", () => {
     // further from where it is used.
     expect(getByLabelText("Search sessions by title or repository")).toBeInTheDocument();
     expect(await findByText("No sessions yet.")).toBeInTheDocument();
+    // Shared SessionsProvider in AppShell serves both SessionNav and Home with one fetch.
+    const sessionListGets = vi
+      .mocked(fetch)
+      .mock.calls.filter(
+        ([input, init]) =>
+          new URL(String(input instanceof Request ? input.url : input)).pathname === "/v1/sessions" &&
+          (init?.method ?? "GET").toUpperCase() === "GET",
+      );
+    expect(sessionListGets).toHaveLength(1);
   });
 
   it("refuses to send until every prerequisite is present", async () => {
@@ -449,11 +458,11 @@ describe("route smoke tests", () => {
   });
 
   it("renders /sessions/:id as a header, a transcript and a composer", async () => {
-    const { findByText, getByLabelText } = renderAt("/sessions/abc-123");
+    const { findByRole, findByText, getByLabelText } = renderAt("/sessions/abc-123");
 
     // The title, not the id: a session is identified by what it is for.
     expect(
-      await findByText("Audit the relay for dropped frames"),
+      await findByRole("button", { name: "Audit the relay for dropped frames" }),
     ).toBeInTheDocument();
     expect(getByLabelText("Message the agent")).toBeInTheDocument();
     // The prompt already went out with `POST /v1/sessions` and the machine
@@ -619,7 +628,7 @@ describe("route smoke tests", () => {
     });
 
     const { findByText } = renderAt("/sessions/abc-123");
-    expect(await findByText("t3.large · $0.04/hr · spot")).toBeInTheDocument();
+    expect(await findByText("t3.large")).toBeInTheDocument();
 
     await vi.waitFor(() => expect(feeds.length).toBeGreaterThan(0));
     const frame = `id: 1\ndata: ${JSON.stringify({
@@ -638,7 +647,7 @@ describe("route smoke tests", () => {
     }
 
     expect(
-      await findByText("m7g.xlarge · $0.16/hr · spot"),
+      await findByText("m7g.xlarge"),
     ).toBeInTheDocument();
   });
 
@@ -849,9 +858,9 @@ describe("route smoke tests", () => {
   });
 
   it("keeps the session's side panels behind the collapsed drawer", async () => {
-    const { findByText, queryByLabelText, getByLabelText } =
+    const { findByRole, queryByLabelText, getByLabelText } =
       renderAt("/sessions/abc-123");
-    await findByText("Audit the relay for dropped frames");
+    await findByRole("button", { name: "Audit the relay for dropped frames" });
 
     // docs/ux.md §9.4: the drawer starts closed, so the transcript gets
     // the width and the terminal is one click away rather than always on.

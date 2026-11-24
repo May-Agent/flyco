@@ -1,9 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
-import { render } from "@solidjs/testing-library";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render } from "@solidjs/testing-library";
 import { MemoryRouter, Route, createMemoryHistory } from "@solidjs/router";
 import ComputeCard from "./ComputeCard";
 import { ApiProblem } from "../api/problem";
 import type { CloudUsageRow, MachineDefault, ProviderAccountView } from "../api/client";
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 const DEFAULT_MACHINE_PATH = "/v1/machines/default";
 
@@ -254,5 +259,61 @@ describe("ComputeCard", () => {
     // the way to them is on the dialog.
     expect(queryByRole("button", { name: "Unlink" })).toBeNull();
     expect(getByRole("link", { name: "Go to Sessions" })).toHaveAttribute("href", "/");
+  });
+
+  it("omits banned explanatory spot and hardware sentences", async () => {
+    answerMachineWith(machineResponse);
+    const { findByText, queryByText } = mount(AWS, undefined);
+    await findByText("t3.large");
+    expect(queryByText(/flyco handles eviction/)).toBeNull();
+    expect(queryByText(/Uninterruptible, and dearer/)).toBeNull();
+
+    const host = mount(HOST, undefined);
+    expect(await host.findByText("your hardware")).toBeInTheDocument();
+    expect(host.queryByText(/spends no budget/)).toBeNull();
+  });
+
+  it("bounds catalog polling with a finite deadline and offers manual Retry", async () => {
+    vi.useFakeTimers();
+    let calls = 0;
+    let ready = false;
+    answerMachineWith(() => {
+      calls += 1;
+      return ready ? machineResponse() : notReadyResponse();
+    });
+
+    const { getByRole, getByText } = mount(AWS, undefined);
+    for (let i = 0; i < 10; i += 1) {
+      await Promise.resolve();
+    }
+    expect(getByText("Reading your AWS account\u2019s machines\u2026")).toBeInTheDocument();
+    expect(calls).toBe(1);
+
+    for (let elapsed = 0; elapsed < 120_000; elapsed += 5_000) {
+      await vi.advanceTimersByTimeAsync(5_000);
+      for (let i = 0; i < 10; i += 1) {
+        await Promise.resolve();
+      }
+    }
+    const callsAtTimeout = calls;
+    expect(callsAtTimeout).toBeGreaterThan(1);
+    expect(getByText("Timed out reading machines.")).toBeInTheDocument();
+
+    // Stops polling past deadline until manual Retry is clicked.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(calls).toBe(callsAtTimeout);
+
+    // Manual Retry restarts polling and resolves once the catalog is ready.
+    fireEvent.click(getByRole("button", { name: "Retry" }));
+    for (let i = 0; i < 10; i += 1) {
+      await Promise.resolve();
+    }
+    expect(calls).toBe(callsAtTimeout + 1);
+    ready = true;
+    await vi.advanceTimersByTimeAsync(5_000);
+    for (let i = 0; i < 10; i += 1) {
+      await Promise.resolve();
+    }
+    expect(getByText("t3.large")).toBeInTheDocument();
   });
 });

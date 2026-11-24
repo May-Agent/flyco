@@ -348,4 +348,84 @@ describe("createDesktopFeed", () => {
 
     feed.dispose();
   });
+
+  it("preserves definitiveFailure and Retry-After / attempt across visibilitychange", async () => {
+    vi.useFakeTimers();
+    let visibility: DocumentVisibilityState = "visible";
+    vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
+
+    // 1. Definitive failure stays failed across hidden -> visible transitions.
+    const failedStub = stubStreams(() => problem(404));
+    const failedFeed = createDesktopFeed(SESSION, {
+      listener: recording(),
+      backoff: { baseMs: 1000, random: () => 0.5 },
+      pauseWhenHidden: true,
+    });
+    await flush();
+    expect(failedFeed.state()).toBe("failed");
+
+    visibility = "hidden";
+    document.dispatchEvent(new Event("visibilitychange"));
+    expect(failedFeed.state()).toBe("failed");
+
+    visibility = "visible";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await flush();
+    expect(failedFeed.state()).toBe("failed");
+    expect(failedStub.calls).toHaveLength(1);
+    failedFeed.dispose();
+
+    // 2. Retry-After is preserved across hidden -> visible rather than resetting attempt/timer.
+    const rateStub = stubStreams(() => rateLimited(30));
+    const rateFeed = createDesktopFeed(SESSION, {
+      listener: recording(),
+      backoff: { baseMs: 1000, random: () => 0.5 },
+      pauseWhenHidden: true,
+    });
+    await flush();
+    expect(rateStub.calls).toHaveLength(1);
+    expect(rateFeed.state()).toBe("reconnecting");
+
+    visibility = "hidden";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await vi.advanceTimersByTimeAsync(10_000);
+    visibility = "visible";
+    document.dispatchEvent(new Event("visibilitychange"));
+    await flush();
+
+    // Still 20s left of the 30s Retry-After: must NOT reconnect early.
+    expect(rateStub.calls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(19_999);
+    expect(rateStub.calls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await flush();
+    expect(rateStub.calls).toHaveLength(2);
+    rateFeed.dispose();
+  });
+
+  it("isolates listener exceptions from triggering network reconnects", async () => {
+    const stub = stubStreams();
+    const listener: DesktopListener = {
+      hello() {
+        throw new Error("boom in hello");
+      },
+      chunk() {
+        throw new Error("boom in chunk");
+      },
+      resync() {
+        throw new Error("boom in resync");
+      },
+    };
+    const feed = createDesktopFeed(SESSION, { listener, ...feedOptions });
+    stub.tail.push(
+      sse({ event: "hello", data: { watcher: 5, takeover: false } }),
+      sse({ event: "chunk", data: { keyframe: true, data: btoa("x") } }),
+      sse({ event: "resync", data: {} }),
+    );
+    await settle();
+    expect(feed.state()).toBe("live");
+    expect(feed.watcher()).toBe(5);
+    expect(stub.calls).toHaveLength(1);
+    feed.dispose();
+  });
 });

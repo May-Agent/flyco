@@ -206,6 +206,8 @@ describe("MachineSlider", () => {
     expect(queryByLabelText("Machine")).toBeNull();
     expect(getByText("Standard_D4als_v6 · 4 vCPU / 16 GiB")).toBeInTheDocument();
     expect(getByText("$0.14/hr")).toBeInTheDocument();
+    // Auto segment already names Auto; do not repeat it inside the panel body.
+    expect(document.querySelectorAll("p").length).toBe(2);
   });
 
   it("lists the forms the catalog offers, Auto first", () => {

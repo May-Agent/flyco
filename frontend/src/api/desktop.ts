@@ -107,20 +107,37 @@ export function createDesktopFeed(
 
   let attempt = 0;
   let running = false;
+  let disposed = false;
+  let definitiveFailure = false;
+  let retryNotBefore = 0;
+  let generation = 0;
   let abort: AbortController | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
-  async function pump(response: Response): Promise<void> {
+  function notifyListener(action: () => void): void {
+    try {
+      action();
+    } catch {
+      // Isolate listener exceptions from triggering network reconnects.
+    }
+  }
+
+  async function pump(
+    response: Response,
+    controller: AbortController,
+    gen: number,
+  ): Promise<void> {
     const body = response.body;
     if (body === null) {
       throw new Error("the desktop stream answered without a body");
     }
     let silenced = false;
+    let normalEnd = false;
     let lastByteAt = Date.now();
     const watchdog = setInterval(() => {
       if (Date.now() - lastByteAt > DESKTOP_SILENCE_LIMIT_MS) {
         silenced = true;
-        abort?.abort();
+        controller.abort();
       }
     }, WATCHDOG_MS);
     const parser: EventSourceParser = createParser({
@@ -129,16 +146,17 @@ export function createDesktopFeed(
         if (event.event === "hello") {
           const hello = parsed as DesktopHello;
           setWatcher(hello.watcher);
-          listener.hello(hello);
+          notifyListener(() => listener.hello(hello));
           return;
         }
         if (event.event === "chunk") {
           const chunk = parsed as { keyframe: boolean; data: string };
-          listener.chunk(decodeBase64(chunk.data), chunk.keyframe);
+          const bytes = decodeBase64(chunk.data);
+          notifyListener(() => listener.chunk(bytes, chunk.keyframe));
           return;
         }
         if (event.event === "resync") {
-          listener.resync();
+          notifyListener(() => listener.resync());
         }
       },
       onComment() {
@@ -150,7 +168,11 @@ export function createDesktopFeed(
     try {
       for (;;) {
         const chunk = await reader.read();
+        if (!running || gen !== generation) {
+          return;
+        }
         if (chunk.done) {
+          normalEnd = true;
           return;
         }
         lastByteAt = Date.now();
@@ -163,12 +185,20 @@ export function createDesktopFeed(
       throw error;
     } finally {
       clearInterval(watchdog);
-      reader.releaseLock();
+      if (!normalEnd) {
+        await reader.cancel().catch(() => {});
+        controller.abort();
+      }
+      try {
+        reader.releaseLock();
+      } catch {
+        // Ignore if cancel already released the reader lock.
+      }
     }
   }
 
-  async function connect(): Promise<void> {
-    if (!running) {
+  async function connect(gen: number): Promise<void> {
+    if (!running || gen !== generation || disposed || definitiveFailure) {
       return;
     }
     const controller = new AbortController();
@@ -179,7 +209,9 @@ export function createDesktopFeed(
     setState(attempt === 0 ? "connecting" : "reconnecting");
     try {
       const response = await openDesktopStream(sessionId, controller.signal);
-      if (!running) {
+      if (!running || gen !== generation || disposed || definitiveFailure) {
+        controller.abort();
+        await response.body?.cancel().catch(() => {});
         return;
       }
       // The ladder resets on a stream that *held*, not on one that merely
@@ -188,48 +220,67 @@ export function createDesktopFeed(
       setFailure(null);
       setState("live");
       try {
-        await pump(response);
+        await pump(response, controller, gen);
       } finally {
-        if (Date.now() - openedAt >= STABLE_MS) {
+        if (gen === generation && Date.now() - openedAt >= STABLE_MS) {
           attempt = 0;
         }
       }
-      if (!running) {
+      if (!running || gen !== generation) {
         return;
       }
-      scheduleReconnect();
+      scheduleReconnect(gen);
     } catch (error) {
-      if (!running) {
+      if (!running || gen !== generation) {
         return;
       }
       if (isDefinitiveFailure(error)) {
+        definitiveFailure = true;
         setFailure(error);
         setState("failed");
         running = false;
+        generation += 1;
+        abort = null;
         return;
       }
-      scheduleReconnect(error);
+      scheduleReconnect(gen, error);
     }
   }
 
-  function scheduleReconnect(error?: unknown): void {
-    if (!running) {
+  function scheduleTimer(gen: number, delayMs: number): void {
+    if (reconnectTimer !== undefined) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
+    }
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = undefined;
+      if (!running || gen !== generation || disposed || definitiveFailure) {
+        return;
+      }
+      void connect(gen);
+    }, delayMs);
+  }
+
+  function scheduleReconnect(gen: number, error?: unknown): void {
+    if (!running || gen !== generation || disposed || definitiveFailure) {
       return;
     }
     setWatcher(null);
     setState("reconnecting");
     // A 429's Retry-After is a wait, not a transport error: it floors the
     // delay whatever rung the ladder is on.
+    const now = Date.now();
     const retryAfterMs = error instanceof ApiProblem ? error.retryAfterMs : undefined;
-    const delay = Math.max(nextBackoffDelay(attempt, options.backoff), retryAfterMs ?? 0);
+    const rawDelay = Math.max(nextBackoffDelay(attempt, options.backoff), retryAfterMs ?? 0);
+    retryNotBefore = Math.max(retryNotBefore, now + rawDelay);
+    const delay = Math.max(0, retryNotBefore - now);
     attempt += 1;
-    reconnectTimer = setTimeout(() => {
-      void connect();
-    }, delay);
+    scheduleTimer(gen, delay);
   }
 
   function stop(): void {
     running = false;
+    generation += 1;
     if (reconnectTimer !== undefined) {
       clearTimeout(reconnectTimer);
       reconnectTimer = undefined;
@@ -237,11 +288,13 @@ export function createDesktopFeed(
     abort?.abort();
     abort = null;
     setWatcher(null);
-    setState("closed");
+    if (!definitiveFailure) {
+      setState("closed");
+    }
   }
 
   function onVisibility(): void {
-    if (options.pauseWhenHidden === false) {
+    if (options.pauseWhenHidden === false || disposed || definitiveFailure) {
       return;
     }
     if (document.visibilityState === "hidden") {
@@ -250,19 +303,31 @@ export function createDesktopFeed(
     }
     if (!running) {
       running = true;
-      attempt = 0;
-      void connect();
+      generation += 1;
+      const gen = generation;
+      const remaining = retryNotBefore - Date.now();
+      if (remaining > 0) {
+        setState("reconnecting");
+        scheduleTimer(gen, remaining);
+      } else {
+        void connect(gen);
+      }
     }
   }
 
   running = true;
-  void connect();
+  generation += 1;
+  void connect(generation);
   if (options.pauseWhenHidden !== false && typeof document !== "undefined") {
     document.addEventListener("visibilitychange", onVisibility);
   }
 
   function dispose(): void {
+    disposed = true;
     stop();
+    if (definitiveFailure) {
+      setState("closed");
+    }
     if (options.pauseWhenHidden !== false && typeof document !== "undefined") {
       document.removeEventListener("visibilitychange", onVisibility);
     }

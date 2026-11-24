@@ -305,4 +305,34 @@ describe("the palette", () => {
 
     expect(props.onSend).toHaveBeenCalledWith("/goal keep going until the tests pass");
   });
+
+  it("awaits async onSend before clearing draft in both send() and palette choose()", async () => {
+    let resolveNext!: (ok: boolean) => void;
+    const onSend = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveNext = resolve;
+        }),
+    );
+    const { getByLabelText, getAllByRole } = mount({ onSend });
+    const field = getByLabelText("Message the agent") as HTMLTextAreaElement;
+
+    // 1. Palette choose() retains draft when async onSend returns false.
+    type(field, "/");
+    getAllByRole("option").find((el) => el.textContent?.includes("/presence:status"))!.click();
+    expect(onSend).toHaveBeenCalledWith("/presence:status");
+    expect(field.value).toBe("/");
+
+    resolveNext(false);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(field.value).toBe("/");
+
+    // 2. Plain send() clears draft only after async onSend resolves true.
+    type(field, "ship it");
+    press(field, "Enter");
+    expect(field.value).toBe("ship it");
+    resolveNext(true);
+    await vi.waitFor(() => expect(field.value).toBe(""));
+  });
 });

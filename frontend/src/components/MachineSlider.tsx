@@ -451,7 +451,6 @@ export default function MachineSlider(props: MachineSliderProps) {
           >
             {(automatic) => (
               <div class={styles.auto}>
-                <p class={styles.autoName}>{AUTO_NAME}</p>
                 <p class={styles.autoPick}>{detentLabel(automatic().entry)}</p>
                 <p class={styles.note}>{priceLabel(automatic().entry, props.spot)}</p>
                 <Show when={spotOffered() && props.onSpot}>

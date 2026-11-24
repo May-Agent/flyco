@@ -14,6 +14,7 @@ import type {
   ProviderBonusHint,
 } from "../../../api/client";
 import { HOST_ENROLL_COMMAND } from "../../../test/setup";
+import { CLOUD_POLL_DEADLINE_MS } from "./cloud";
 import {
   command,
   json,
@@ -828,5 +829,60 @@ describe("the consent road", () => {
       level: 1,
       name: "Run this in Google Cloud Shell",
     });
+  });
+
+  it("stops consent polling past the finite deadline and offers Try again", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    noProgrammes();
+    let polls = 0;
+    route(
+      (path, method) =>
+        (method === "POST" && path === "/v1/providers/azure/oauth/start") ||
+        (method === "GET" && path === "/v1/providers/azure/oauth/attempt-1"),
+      (init) => {
+        if (init?.method === "POST") {
+          return json({
+            attempt_id: "attempt-1",
+            authorize_url: "https://consent.azure.invalid/a",
+          });
+        }
+        polls += 1;
+        return json({ state: "pending" });
+      },
+    );
+    const flow = await choosePlace(/Azure/);
+    const { container, findByRole, getByRole } = flow;
+    await answerBonus(flow, "Azure", { newcomer: false, student: false });
+    await findByRole("heading", { level: 1, name: "Sign in with Microsoft" });
+
+    vi.useFakeTimers();
+    try {
+      fireEvent.click(primary(container));
+      for (let i = 0; i < 10; i += 1) {
+        await Promise.resolve();
+      }
+      await vi.advanceTimersByTimeAsync(2000);
+      for (let i = 0; i < 10; i += 1) {
+        await Promise.resolve();
+      }
+      expect(polls).toBe(1);
+
+      vi.setSystemTime(Date.now() + CLOUD_POLL_DEADLINE_MS);
+      await vi.advanceTimersByTimeAsync(2000);
+      for (let i = 0; i < 10; i += 1) {
+        await Promise.resolve();
+      }
+
+      expect(getByRole("alert")).toHaveTextContent(
+        "Timed out waiting for Microsoft sign-in. Try again.",
+      );
+      expect(primary(container)).toHaveTextContent("Try again");
+      expect(primary(container)).toBeEnabled();
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(polls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

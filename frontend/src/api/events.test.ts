@@ -211,4 +211,85 @@ describe("createUserStream reconnect backoff", () => {
 
     unsubscribe();
   });
+
+  it("drops stale open/reconnect work across rapid unsubscribe/subscribe via generation guard", async () => {
+    vi.useFakeTimers();
+    let resolveFirst!: (res: Response) => void;
+    const firstCancel = vi.fn(() => Promise.resolve());
+    const second = sseBody();
+    let callCount = 0;
+
+    const stream = createUserStream({
+      backoff,
+      open: () => {
+        callCount += 1;
+        if (callCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveFirst = resolve;
+          });
+        }
+        return Promise.resolve(
+          new Response(second.body, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          }),
+        );
+      },
+    });
+
+    const unsub1 = stream.subscribe(SESSION, recording());
+    expect(callCount).toBe(1);
+    unsub1();
+
+    const listener2 = recording();
+    const unsub2 = stream.subscribe(SESSION, listener2);
+    expect(callCount).toBe(2);
+
+    // Late resolution of the superseded generation 1 open must be cancelled and ignored.
+    const staleStream = new ReadableStream<Uint8Array>({ cancel: firstCancel });
+    resolveFirst(
+      new Response(staleStream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+    await flush();
+    expect(firstCancel).toHaveBeenCalledTimes(1);
+    expect(stream.state()).toBe("live");
+
+    unsub2();
+  });
+
+  it("validates event.id with /^\\d+$/ and pushes current state to late subscribers", async () => {
+    vi.useFakeTimers();
+    const first = sseBody();
+    const stub = stubStreams(() => sseResponse(first));
+    const stream = createUserStream({ backoff });
+
+    const firstListener = recording();
+    const unsub1 = stream.subscribe(SESSION, firstListener);
+    await flush();
+
+    // Invalid id must not overwrite lastId with NaN; valid numeric id advances it.
+    first.push(
+      `id: 42\ndata: ${JSON.stringify({ session: SESSION, seq: 1, at_unix: 0, event: { type: "started", harness_session_id: "h1" } })}\n\n`,
+      `id: bogus\ndata: ${JSON.stringify({ session: SESSION, seq: 2, at_unix: 0, event: { type: "started", harness_session_id: "h2" } })}\n\n`,
+    );
+    await flush();
+
+    // Late subscriber receives current "live" state immediately without waiting for next event.
+    const lateListener = recording();
+    const unsub2 = stream.subscribe("session-2", lateListener);
+    expect(lateListener.states).toEqual(["live"]);
+
+    first.close();
+    await flush();
+    await vi.advanceTimersByTimeAsync(1000);
+    await flush();
+
+    expect(stub.calls[1]).toContain("after=42");
+
+    unsub1();
+    unsub2();
+  });
 });

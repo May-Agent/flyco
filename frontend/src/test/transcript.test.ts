@@ -673,6 +673,19 @@ describe("foldTranscript local command output and context", () => {
 
     expect(items).toHaveLength(0);
   });
+
+  it("folds computer_use_changed into an info notice and ignores terminal_exited", () => {
+    const items = foldTranscript([
+      at(0, { type: "computer_use_changed", enabled: true }),
+      at(1, { type: "computer_use_changed", enabled: false }),
+      at(2, { type: "terminal_exited", code: 0 }),
+    ]);
+
+    expect(items).toEqual([
+      { kind: "notice", key: "notice-0", text: "Computer use enabled.", tone: "info", atUnix: T0 },
+      { kind: "notice", key: "notice-1", text: "Computer use disabled.", tone: "info", atUnix: T0 + 1 },
+    ]);
+  });
 });
 
 describe("shellCommandIn", () => {

@@ -72,14 +72,17 @@ export function nextBackoffDelay(attempt: number, options: BackoffOptions = {}):
 }
 
 /**
- * Statuses that a retry can still get past.
- *
- * `401` is an expired session token, which the next request re-mints; `429`
- * is the control plane asking for a slower client. Every other 4xx is a
- * statement about the request itself — this session does not exist, or it
- * is not this account's — and repeating it cannot change the answer.
+ * Whether `error` is the control plane saying a daily/account budget ceiling
+ * was exhausted rather than a short per-minute rate limit.
  */
-const RETRYABLE_CLIENT_STATUSES: readonly number[] = [401, 429];
+export function isBudgetExhausted(error: unknown): boolean {
+  return (
+    error instanceof ApiProblem &&
+    error.status === 429 &&
+    (error.type.endsWith("/request-budget-exhausted") ||
+      error.type.endsWith("/row-budget-exhausted"))
+  );
+}
 
 /**
  * Whether a failure means "not now" or "not ever".
@@ -87,10 +90,10 @@ const RETRYABLE_CLIENT_STATUSES: readonly number[] = [401, 429];
  * A stream that backs off and retries forever is right about a dropped
  * network, a restarting worker and a 5xx, and wrong about an account that
  * cannot open the stream: the page would spin a `Reconnecting…` pill on a
- * connection that will never open. So a 4xx problem document other than
- * the two above stops the stream for good, and so does a
- * [`NotImplementedError`] — a build without the route does not grow one
- * while the page is open.
+ * connection that will never open. So `401`, budget-exhausted `429`
+ * (`request-budget-exhausted` / `row-budget-exhausted`), every other 4xx
+ * problem document except a transient `429`, and [`NotImplementedError`]
+ * stop the stream for good.
  *
  * Everything that is not an [`ApiProblem`] — a [`NetworkError`], an
  * [`UnexpectedResponseError`], a body that ended — is retried, because
@@ -103,11 +106,10 @@ export function isDefinitiveFailure(error: unknown): boolean {
   if (error instanceof NotImplementedError) {
     return true;
   }
-  return (
-    error.status >= 400 &&
-    error.status < 500 &&
-    !RETRYABLE_CLIENT_STATUSES.includes(error.status)
-  );
+  if (error.status === 429) {
+    return isBudgetExhausted(error);
+  }
+  return error.status >= 400 && error.status < 500;
 }
 
 /** What a session view registers to follow its envelopes. */
@@ -162,6 +164,7 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
   let lastId: number | undefined;
   let attempt = 0;
   let running = false;
+  let generation = 0;
   let abort: AbortController | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -171,14 +174,22 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
       return;
     }
     for (const listener of set) {
-      listener.event(envelope);
+      try {
+        listener.event(envelope);
+      } catch {
+        // Isolate listener failures from the shared SSE transport.
+      }
     }
   }
 
   function announce(next: "connecting" | "live" | "reconnecting"): void {
     for (const set of listeners.values()) {
       for (const listener of set) {
-        listener.state(next);
+        try {
+          listener.state(next);
+        } catch {
+          // Isolate listener failures from the shared SSE transport.
+        }
       }
     }
   }
@@ -188,22 +199,27 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
    * watchdog's abort, or a parse failure all land here as a throw or a
    * return, and all of them mean the same thing: connect again.
    */
-  async function pump(response: Response): Promise<void> {
+  async function pump(
+    response: Response,
+    controller: AbortController,
+    gen: number,
+  ): Promise<void> {
     const body = response.body;
     if (body === null) {
       throw new Error("the event stream answered without a body");
     }
     let silenced = false;
+    let normalEnd = false;
     let lastByteAt = Date.now();
     const watchdog = setInterval(() => {
       if (Date.now() - lastByteAt > silenceLimitMs) {
         silenced = true;
-        abort?.abort();
+        controller.abort();
       }
     }, WATCHDOG_MS);
     const parser: EventSourceParser = createParser({
       onEvent(event) {
-        if (event.id !== undefined) {
+        if (event.id !== undefined && /^\d+$/.test(event.id)) {
           lastId = Number(event.id);
         }
         dispatch(parseSessionEvent(JSON.parse(event.data)));
@@ -217,7 +233,11 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
     try {
       for (;;) {
         const chunk = await reader.read();
+        if (!running || gen !== generation) {
+          return;
+        }
         if (chunk.done) {
+          normalEnd = true;
           return;
         }
         lastByteAt = Date.now();
@@ -230,12 +250,20 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
       throw error;
     } finally {
       clearInterval(watchdog);
-      reader.releaseLock();
+      if (!normalEnd) {
+        await reader.cancel().catch(() => {});
+        controller.abort();
+      }
+      try {
+        reader.releaseLock();
+      } catch {
+        // Ignore if cancel already released the reader lock.
+      }
     }
   }
 
-  async function connect(): Promise<void> {
-    if (!running) {
+  async function connect(gen: number): Promise<void> {
+    if (!running || gen !== generation) {
       return;
     }
     const controller = new AbortController();
@@ -244,7 +272,9 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
     announce(attempt === 0 ? "connecting" : "reconnecting");
     try {
       const response = await open(lastId, controller.signal);
-      if (!running) {
+      if (!running || gen !== generation) {
+        controller.abort();
+        await response.body?.cancel().catch(() => {});
         return;
       }
       // The ladder resets on a stream that *held*, not on one that merely
@@ -254,43 +284,52 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
       setState("live");
       announce("live");
       try {
-        await pump(response);
+        await pump(response, controller, gen);
       } finally {
-        if (Date.now() - openedAt >= STABLE_MS) {
+        if (gen === generation && Date.now() - openedAt >= STABLE_MS) {
           attempt = 0;
         }
       }
-      if (!running) {
+      if (!running || gen !== generation) {
         return;
       }
       // A body that ended is a dropped connection: the server never ends
       // this stream on purpose.
-      scheduleReconnect();
+      scheduleReconnect(gen);
     } catch (error) {
-      // `running` alone separates the two aborts: dispose clears it, the
-      // silence watchdog does not — a watchdog kill is a dead connection,
-      // which is exactly the case to reconnect.
-      if (!running) {
+      // `running` and `generation` separate dispose/restart from a drop or
+      // silence watchdog kill that should trigger a reconnect.
+      if (!running || gen !== generation) {
         return;
       }
       if (isDefinitiveFailure(error)) {
         setFailure(error);
         setState("failed");
         running = false;
+        generation += 1;
+        abort = null;
         for (const set of listeners.values()) {
           for (const listener of set) {
-            listener.failed(error);
+            try {
+              listener.failed(error);
+            } catch {
+              // Isolate listener failures.
+            }
           }
         }
         return;
       }
-      scheduleReconnect(error);
+      scheduleReconnect(gen, error);
     }
   }
 
-  function scheduleReconnect(error?: unknown): void {
-    if (!running) {
+  function scheduleReconnect(gen: number, error?: unknown): void {
+    if (!running || gen !== generation) {
       return;
+    }
+    if (reconnectTimer !== undefined) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = undefined;
     }
     setState("reconnecting");
     announce("reconnecting");
@@ -300,7 +339,11 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
     const delay = Math.max(nextBackoffDelay(attempt, options.backoff), retryAfterMs ?? 0);
     attempt += 1;
     reconnectTimer = setTimeout(() => {
-      void connect();
+      reconnectTimer = undefined;
+      if (!running || gen !== generation) {
+        return;
+      }
+      void connect(gen);
     }, delay);
   }
 
@@ -309,11 +352,13 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
       return;
     }
     running = true;
-    void connect();
+    generation += 1;
+    void connect(generation);
   }
 
   function stop(): void {
     running = false;
+    generation += 1;
     if (reconnectTimer !== undefined) {
       clearTimeout(reconnectTimer);
       reconnectTimer = undefined;
@@ -330,7 +375,22 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
       listeners.set(session, set);
     }
     set.add(listener);
-    ensureRunning();
+    const current = state();
+    if (current === "closed") {
+      ensureRunning();
+    } else if (current === "failed") {
+      try {
+        listener.failed(failure());
+      } catch {
+        // Isolate listener failures.
+      }
+    } else {
+      try {
+        listener.state(current);
+      } catch {
+        // Isolate listener failures.
+      }
+    }
     return () => {
       const set = listeners.get(session);
       set?.delete(listener);

@@ -68,22 +68,25 @@ beforeEach(() => {
 
 describe("HostCard", () => {
   it("states what the machine is, and that it costs nothing to meter", () => {
-    const { getByText } = mount();
+    const { getByText, queryByText } = mount();
 
     expect(getByText("mercury")).toBeInTheDocument();
-    expect(getByText(/^x86-64 · 16 vCPU \/ 64 GiB$/)).toBeInTheDocument();
+    expect(getByText("x86-64")).toBeInTheDocument();
+    expect(getByText("16 vCPU / 64 GiB")).toBeInTheDocument();
     expect(getByText("812 GiB free")).toBeInTheDocument();
+    expect(queryByText(/where Podman keeps/)).toBeNull();
     expect(getByText("Podman 5.4.0 · Linux 6.8.0-45-generic")).toBeInTheDocument();
     // Not `$0.00`: flyco meters nothing here, and a zero would tell a
     // budget it can run forever.
     expect(getByText("your hardware")).toBeInTheDocument();
+    expect(queryByText(/spends no budget/)).toBeNull();
   });
 
   it("names the hostname once a rename has hidden it", () => {
     const { getByText } = mount({ ...HOST, label: "the loud one under the desk" });
 
     expect(getByText("the loud one under the desk")).toBeInTheDocument();
-    expect(getByText("· mercury")).toBeInTheDocument();
+    expect(getByText("mercury")).toBeInTheDocument();
   });
 
   it("says whether the machine is reachable right now", () => {

@@ -51,6 +51,7 @@ import ContextRing, { type SessionTotals } from "../components/ContextRing";
 import SessionComposer, { type SessionCommand } from "../components/SessionComposer";
 import SessionDrawer from "../components/SessionDrawer";
 import SessionHeader from "../components/SessionHeader";
+import { useSessions } from "../components/SessionNav";
 import Transcript, { ProvisioningTimeline } from "../components/Transcript";
 import composerStyles from "../components/Composer.module.css";
 import {
@@ -129,11 +130,20 @@ export default function SessionDetail() {
 function SessionView(props: { id: string }) {
   const navigate = useNavigate();
   const readiness = useReadiness();
+  const { syncSession } = useSessions();
   const [session, { refetch: refetchSession, mutate: mutateSession }] = createQuery(
     () => props.id,
     getSession,
   );
   const [machine, { refetch: refetchMachine }] = createQuery(() => props.id, getSessionMachine);
+
+  createEffect(
+    on(session, (current) => {
+      if (current !== undefined) {
+        syncSession(current);
+      }
+    }),
+  );
 
   const relay = createSessionRelay(props.id);
   onCleanup(() => relay.dispose());
@@ -168,7 +178,9 @@ function SessionView(props: { id: string }) {
             // A repository landed mid-session: the header's checkout list
             // and the drawer's diff selector both read `session.repos`,
             // which is stale until re-fetched.
-            event.type === "repo_added",
+            event.type === "repo_added" ||
+            // `computer_use` toggled: `SessionDrawer` shows/hides the Screen tab.
+            event.type === "computer_use_changed",
         ).length,
   );
   createEffect(
@@ -646,19 +658,29 @@ function SessionView(props: { id: string }) {
    * live, and the composer says so when it is not rather than swallowing
    * the command.
    */
-  function onSend(text: string): boolean | Promise<boolean> {
+  async function onSend(text: string): Promise<boolean> {
     const command = shellCommandIn(text);
-    if (command === null) {
-      void attempt(() => relay.send({ type: "user_message", text }));
-      return true;
-    }
     setError(null);
+    if (command === null) {
+      try {
+        await relay.send({ type: "user_message", text });
+        return true;
+      } catch (failure) {
+        setError(failure);
+        return false;
+      }
+    }
     if (relay.state() !== "live") {
       setError(new Error("Reconnecting to the session — a shell command needs a live connection."));
       return false;
     }
-    void attempt(() => relay.send({ type: "shell_command", command }));
-    return true;
+    try {
+      await relay.send({ type: "shell_command", command });
+      return true;
+    } catch (failure) {
+      setError(failure);
+      return false;
+    }
   }
 
   function onStop(): void {

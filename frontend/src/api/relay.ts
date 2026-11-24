@@ -123,6 +123,12 @@ export type Clock = () => number;
 
 const systemClock: Clock = () => Math.floor(Date.now() / 1000);
 
+/** A dated event together with its sequence position when recorded. */
+export interface SequencedEvent {
+  timed: TimedEvent;
+  seq: number | null;
+}
+
 /**
  * Turns catch-up pages and live envelopes into a deduplicated, dated
  * [`ClientEvent`] sequence. Pure and framework-free, so it is unit-testable
@@ -131,12 +137,16 @@ const systemClock: Clock = () => Math.floor(Date.now() / 1000);
 export class EventStream {
   private lastSeq: number | null = null;
   /**
-   * Canonical keys of events already shown via a live frame.
+   * Sequenced live frames arrived ahead of the catch-up cursor (e.g. across
+   * a seq gap), cleared as catch-up advances past them.
+   */
+  private readonly seenSeqs = new Set<number>();
+  /**
+   * Canonical keys of unsequenced live frames (`seq === null`) already shown.
    *
-   * Catch-up checks against this set and nothing else does: it is the one
-   * case where the same fact is genuinely delivered twice, because the seq
-   * log and the broadcast are independent deliveries. See the module
-   * comment for why neither path dedupes against itself.
+   * Catch-up checks against this list with one-shot consumption so repeated
+   * identical missed events are not dropped; sequenced live frames dedupe
+   * strictly by `seq`.
    */
   private readonly liveKeys: string[] = [];
   private readonly clock: Clock;
@@ -152,19 +162,34 @@ export class EventStream {
 
   /**
    * Feeds one catch-up page (events ascending by `seq`). Skips anything at
-   * or below the cursor already reached, and anything already shown
-   * (because it arrived live first).
+   * or below the cursor already reached, anything already shown via a
+   * matching sequenced live frame, and (one-shot) an unsequenced live frame.
    */
   ingestCatchUp(events: StoredEvent[]): TimedEvent[] {
-    const out: TimedEvent[] = [];
+    return this.ingestCatchUpSequenced(events).map((entry) => entry.timed);
+  }
+
+  /** Like {@link ingestCatchUp}, retaining each event's `seq` for ordering. */
+  ingestCatchUpSequenced(events: StoredEvent[]): SequencedEvent[] {
+    const out: SequencedEvent[] = [];
     for (const stored of events) {
       if (this.lastSeq !== null && stored.seq <= this.lastSeq) {
         continue;
       }
       this.lastSeq = stored.seq;
-      if (!this.liveKeys.includes(canonicalKey(stored.event))) {
-        out.push({ event: parseClientEvent(stored.event), atUnix: stored.at_unix });
+      if (this.seenSeqs.delete(stored.seq)) {
+        continue;
       }
+      const key = canonicalKey(stored.event);
+      const liveIndex = this.liveKeys.indexOf(key);
+      if (liveIndex !== -1) {
+        this.liveKeys.splice(liveIndex, 1);
+        continue;
+      }
+      out.push({
+        timed: { event: parseClientEvent(stored.event), atUnix: stored.at_unix },
+        seq: stored.seq,
+      });
     }
     return out;
   }
@@ -172,18 +197,21 @@ export class EventStream {
   /**
    * Feeds one live envelope off the stream. Returns `null` for a replay —
    * a sequenced event the record already served (`seq` at or below the
-   * cursor). Everything else is a new occurrence — two identical payloads
-   * are two events, not a redelivery — so it is never dropped on content.
-   * It only records the event's key, which is what lets a later catch-up
-   * recognise the same fact in the seq log.
+   * cursor) or a sequenced live frame already delivered. Everything else is
+   * a new occurrence — two identical payloads are two events, not a
+   * redelivery — so it is never dropped on content. Unsequenced frames
+   * record a one-shot key so a subsequent catch-up recognises them.
    */
   ingestLive(envelope: SessionEvent): TimedEvent | null {
-    if (
-      envelope.seq !== null &&
-      this.lastSeq !== null &&
-      envelope.seq <= this.lastSeq
-    ) {
-      return null;
+    if (envelope.seq !== null) {
+      if (this.lastSeq !== null && envelope.seq <= this.lastSeq) {
+        return null;
+      }
+      if (this.seenSeqs.has(envelope.seq)) {
+        return null;
+      }
+      this.seenSeqs.add(envelope.seq);
+      return { event: envelope.event, atUnix: this.clock() };
     }
     this.remember(canonicalKey(envelope.event));
     return { event: envelope.event, atUnix: this.clock() };
@@ -244,20 +272,47 @@ export function createSessionRelay(
   const user = options.stream ?? userStream();
 
   let disposed = false;
+  let seqEntries: SequencedEvent[] = [];
+  let catchUpInFlight: Promise<void> | null = null;
+  let catchUpQueued = false;
 
-  function pushEvent(event: TimedEvent): void {
-    setEvents((prev) => [...prev, event]);
+  function insertOrdered(target: SequencedEvent[], item: SequencedEvent): void {
+    if (item.seq === null) {
+      target.push(item);
+      return;
+    }
+    const insertAt = target.findIndex(
+      (existing) => existing.seq !== null && existing.seq > item.seq!,
+    );
+    if (insertAt === -1) {
+      target.push(item);
+    } else {
+      target.splice(insertAt, 0, item);
+    }
   }
 
-  async function catchUp(): Promise<void> {
+  function appendBatch(items: readonly SequencedEvent[]): void {
+    if (items.length === 0) {
+      return;
+    }
+    const next = seqEntries.slice();
+    for (const item of items) {
+      insertOrdered(next, item);
+    }
+    seqEntries = next;
+    setEvents(next.map((entry) => entry.timed));
+  }
+
+  async function catchUpOnce(): Promise<void> {
     let more = true;
     let pages = 0;
     while (more && !disposed) {
       const before = stream.cursor;
       const page = await getSessionEvents(sessionId, before ?? undefined);
-      for (const event of stream.ingestCatchUp(page.events)) {
-        pushEvent(event);
+      if (disposed) {
+        return;
       }
+      appendBatch(stream.ingestCatchUpSequenced(page.events));
       more = page.more;
       pages += 1;
       if (more && (pages >= MAX_CATCH_UP_PAGES || stream.cursor === before)) {
@@ -268,22 +323,50 @@ export function createSessionRelay(
     }
   }
 
+  function catchUp(): Promise<void> {
+    if (catchUpInFlight !== null) {
+      catchUpQueued = true;
+      return catchUpInFlight;
+    }
+    catchUpInFlight = (async () => {
+      try {
+        do {
+          catchUpQueued = false;
+          await catchUpOnce();
+        } while (catchUpQueued && !disposed);
+      } finally {
+        catchUpInFlight = null;
+      }
+    })();
+    return catchUpInFlight;
+  }
+
+  let unsubscribe: (() => void) | null = null;
+
   function onFailure(error: unknown): void {
     if (disposed) {
       return;
     }
+    disposed = true;
     setFailure(error);
     setState("failed");
+    unsubscribe?.();
   }
 
-  const unsubscribe = user.subscribe(sessionId, {
+  unsubscribe = user.subscribe(sessionId, {
     event(envelope) {
+      if (disposed) {
+        return;
+      }
       const timed = stream.ingestLive(envelope);
       if (timed !== null) {
-        pushEvent(timed);
+        appendBatch([{ timed, seq: envelope.seq }]);
       }
     },
     state(next) {
+      if (disposed) {
+        return;
+      }
       if (next === "live") {
         // Every open — the first and every reconnect — closes the window
         // between the last catch-up page and the stream's delivery, and
@@ -302,8 +385,15 @@ export function createSessionRelay(
     failed: onFailure,
   });
 
-  // The recorded past renders whether or not the stream has opened yet.
-  catchUp().catch(onFailure);
+  if (disposed) {
+    unsubscribe();
+  }
+
+  // The recorded past renders whether or not the stream has opened yet, unless
+  // an already-live shared stream just started catch-up inside subscribe().
+  if (catchUpInFlight === null && !disposed) {
+    catchUp().catch(onFailure);
+  }
 
   async function send(command: ClientCommand): Promise<void> {
     switch (command.type) {
@@ -326,7 +416,7 @@ export function createSessionRelay(
 
   function dispose(): void {
     disposed = true;
-    unsubscribe();
+    unsubscribe?.();
     setState("closed");
   }
 

@@ -134,12 +134,13 @@ export default function HostCard(props: HostCardProps) {
         </Show>
       }
       meta={
-        <>
-          Your own machine · enrolled {formatDate(props.host.created_at_unix)}
+        <span class={styles.factInline}>
+          <span>Your own machine</span>
+          <span>Enrolled {formatDate(props.host.created_at_unix)}</span>
           <Show when={props.host.state !== "online" && props.host.last_seen_unix}>
-            {(seen) => <> · last seen {relativeTime(seen(), Date.now())}</>}
+            {(seen) => <span>Last seen {relativeTime(seen(), Date.now())}</span>}
           </Show>
-        </>
+        </span>
       }
       status={
         <span class={styles.state}>
@@ -207,24 +208,19 @@ export default function HostCard(props: HostCardProps) {
       }
     >
       <Fact label="Machine">
-        {ARCHITECTURE_LABEL[props.host.facts.architecture]}
-        {" · "}
-        {hostCapacityLabel(props.host.facts)}
-        {/* The card opens under the machine's own hostname, so repeating it
-            here would say the same thing twice. A renamed machine is the
-            case where the hostname is worth stating. */}
-        <Show when={props.host.facts.hostname !== props.host.label}>
-          <span class={styles.dim}>
-            {" · "}
-            {props.host.facts.hostname}
-          </span>
-        </Show>
+        <span class={styles.factInline}>
+          <span>{ARCHITECTURE_LABEL[props.host.facts.architecture]}</span>
+          <span>{hostCapacityLabel(props.host.facts)}</span>
+          {/* The card opens under the machine's own hostname, so repeating it
+              here would say the same thing twice. A renamed machine is the
+              case where the hostname is worth stating. */}
+          <Show when={props.host.facts.hostname !== props.host.label}>
+            <span class={styles.dim}>{props.host.facts.hostname}</span>
+          </Show>
+        </span>
       </Fact>
 
-      <Fact label="Disk">
-        {hostDiskLabel(props.host.facts)}
-        <span class={styles.dim}> · where Podman keeps containers and volumes</span>
-      </Fact>
+      <Fact label="Disk">{hostDiskLabel(props.host.facts)}</Fact>
 
       <Fact label="Software">{hostSoftwareLabel(props.host.facts)}</Fact>
 

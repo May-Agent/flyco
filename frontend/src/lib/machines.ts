@@ -319,24 +319,11 @@ export const MACHINE_STATE_LABEL: Record<MachineState, string> = {
 };
 
 /**
- * The header's machine chip (docs/ux.md §9.1):
- * `m7i-flex.xlarge · $0.15/hr · spot`.
+ * The header's machine chip (docs/ux.md §9.1).
  *
- * The hourly rate is what a *running* machine costs, so it is quoted only
- * while one is running: a failed, archived or paused session whose machine
- * is stopped or released reads `m7i-flex.xlarge · stopped`, because a price
- * on a machine that is not there is a bill the user is not being sent
- * (issue #135). `spot` goes with the rate for the same reason — it says
- * which of two prices this one is.
- *
- * A running machine flyco meters nothing on (hardware the user enrolled)
- * quotes no price either: `$0.00/hr` would read as "this is free", which is
- * a different claim.
- *
- * A managed container reads `Container · $0.21/hr`, for the reason
- * {@link entryName} gives: `aca-4x8` is flyco's key for a size, not a name
- * anybody would recognise in a header. The size is not repeated here — the
- * header has one line and the drawer's machine tab has the whole entry.
+ * Collapsed, the chip carries only what identifies the machine — and its
+ * lifecycle state when it is not running (`stopped`, `released`, `starting`).
+ * Price and capacity mode stay inside the panel when opened.
  */
 export function machineChip(machine: MachineView): string {
   const parts = [
@@ -346,13 +333,6 @@ export function machineChip(machine: MachineView): string {
   ];
   if (machine.state !== "running") {
     parts.push(MACHINE_STATE_LABEL[machine.state]);
-    return parts.join(" · ");
-  }
-  if (machine.hourly !== null && machine.hourly !== undefined) {
-    parts.push(`${formatUsd(machine.hourly)}/hr`);
-  }
-  if (machine.spot) {
-    parts.push("spot");
   }
   return parts.join(" · ");
 }
@@ -368,6 +348,9 @@ export function machineChip(machine: MachineView): string {
  * open is not asking every frame.
  */
 export const CATALOG_POLL_SECONDS = 5;
+
+/** Finite deadline for pending catalog polling (2 minutes). */
+export const CATALOG_POLL_DEADLINE_MS = 120_000;
 
 /**
  * Whether a refusal means "flyco has not finished reading this yet".

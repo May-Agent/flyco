@@ -38,6 +38,8 @@ import styles from "./pages.module.css";
 
 /** How often the page asks whether the consent has come back. */
 const POLL_MS = 2000;
+/** Upper bound on waiting for the browser-tab OAuth consent to complete. */
+export const CLOUD_POLL_DEADLINE_MS = 15 * 60 * 1000;
 
 /** What each vendor's consent screen is called, and what it hands over. */
 const VENDOR: Record<
@@ -94,16 +96,50 @@ export const CloudSignIn: PageComponent<{
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
+  let pollDeadline = 0;
+  let pollGeneration = 0;
   onCleanup(() => {
     closed = true;
+    pollGeneration += 1;
     clearTimeout(timer);
+    timer = undefined;
   });
 
+  function failTimeout(): void {
+    clearTimeout(timer);
+    timer = undefined;
+    setAttempt(null);
+    setFailure(new Error(`Timed out waiting for ${vendor.name} sign-in. Try again.`));
+  }
+
+  function schedule(attemptId: string, gen: number): void {
+    clearTimeout(timer);
+    timer = undefined;
+    if (closed || gen !== pollGeneration) {
+      return;
+    }
+    if (Date.now() >= pollDeadline) {
+      failTimeout();
+      return;
+    }
+    timer = setTimeout(() => {
+      timer = undefined;
+      void ask(attemptId, gen);
+    }, POLL_MS);
+  }
+
   /** Asks once whether the vendor has sent the browser back; asks again if not. */
-  async function ask(attemptId: string): Promise<void> {
+  async function ask(attemptId: string, gen: number): Promise<void> {
+    if (closed || gen !== pollGeneration) {
+      return;
+    }
+    if (Date.now() >= pollDeadline) {
+      failTimeout();
+      return;
+    }
     try {
       const progress = await pollProviderOauth(props.page.provider, attemptId);
-      if (closed) {
+      if (closed || gen !== pollGeneration) {
         return;
       }
       if (progress.state === "authorized") {
@@ -111,7 +147,13 @@ export const CloudSignIn: PageComponent<{
           // Nothing to choose: the finish creates the environment
           // repository and links the account in one call.
           await finishCodespacesOauth(attemptId);
+          if (closed || gen !== pollGeneration) {
+            return;
+          }
           await readiness.refresh();
+          if (closed || gen !== pollGeneration) {
+            return;
+          }
           props.advance({});
           return;
         }
@@ -130,9 +172,9 @@ export const CloudSignIn: PageComponent<{
         setRefusal(progress.reason);
         return;
       }
-      timer = setTimeout(() => void ask(attemptId), POLL_MS);
+      schedule(attemptId, gen);
     } catch (error) {
-      if (!closed) {
+      if (!closed && gen === pollGeneration) {
         setAttempt(null);
         setFailure(error);
       }
@@ -178,9 +220,14 @@ export const CloudSignIn: PageComponent<{
           }
         }
         const started = await startProviderOauth(props.page.provider);
+        if (closed) {
+          return;
+        }
+        pollGeneration += 1;
+        pollDeadline = Date.now() + CLOUD_POLL_DEADLINE_MS;
         openInNewTab(started.authorize_url);
         setAttempt(started.attempt_id);
-        timer = setTimeout(() => void ask(started.attempt_id), POLL_MS);
+        schedule(started.attempt_id, pollGeneration);
       },
     };
   };

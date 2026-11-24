@@ -23,6 +23,7 @@ import { useReadiness } from "../../Readiness";
 import { pollCodexOauth, startCodexOauth } from "../../../api/client";
 import {
   CHATGPT_SECURITY_SETTINGS_URL,
+  CODEX_POLL_DEADLINE_MS,
   IDLE,
   nextSignIn,
   pollDelayMs,
@@ -40,6 +41,7 @@ export const CodexSignIn: PageComponent<{ id: "codex-sign-in" }> = (props) => {
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
+  let pollDeadline = 0;
 
   // A poll already in flight still resolves after the page goes away; the
   // flag is what stops it writing to a signal nobody is reading.
@@ -55,14 +57,32 @@ export const CodexSignIn: PageComponent<{ id: "codex-sign-in" }> = (props) => {
   }
 
   function schedule(state: SignIn, attempt: CodexAttempt): void {
+    clearTimeout(timer);
     const delay = pollDelayMs(state);
     if (delay === null || closed) {
+      return;
+    }
+    if (Date.now() >= pollDeadline) {
+      transition({
+        kind: "failed",
+        error: new Error("Timed out waiting for Codex approval. Get a new code and try again."),
+      });
       return;
     }
     timer = setTimeout(() => void ask(attempt), delay);
   }
 
   async function ask(attempt: CodexAttempt): Promise<void> {
+    if (closed) {
+      return;
+    }
+    if (Date.now() >= pollDeadline) {
+      transition({
+        kind: "failed",
+        error: new Error("Timed out waiting for Codex approval. Get a new code and try again."),
+      });
+      return;
+    }
     try {
       const outcome = await pollCodexOauth(attempt.attemptId);
       if (closed) {
@@ -91,6 +111,7 @@ export const CodexSignIn: PageComponent<{ id: "codex-sign-in" }> = (props) => {
       if (closed) {
         return;
       }
+      pollDeadline = Date.now() + CODEX_POLL_DEADLINE_MS;
       const attempt: CodexAttempt = {
         attemptId: started.attempt_id,
         userCode: started.user_code,
