@@ -151,7 +151,47 @@ pub fn targets(config: &DaemonConfig, agent: Option<&AgentUser>) -> Vec<Target> 
     };
     dirs.extend(codex);
 
+    // Antigravity's global skills directory (`<gemini-dir>/config/skills`).
+    let antigravity = match config.harness {
+        DriverKind::Acp if config.acp().agent == "antigravity" => {
+            gemini_dir_arg(&config.acp().args).map_or_else(
+                || {
+                    home.as_ref().map(|home| Target {
+                        dir: home.join(".gemini").join("config").join("skills"),
+                        reconcile: false,
+                    })
+                },
+                |gemini_dir| {
+                    Some(Target {
+                        dir: PathBuf::from(gemini_dir).join("config").join("skills"),
+                        reconcile: true,
+                    })
+                },
+            )
+        }
+        _ => home.as_ref().map(|home| Target {
+            dir: home.join(".gemini").join("config").join("skills"),
+            reconcile: false,
+        }),
+    };
+    dirs.extend(antigravity);
+
     dirs
+}
+
+/// Extracts `--gemini-dir <PATH>` (or `--gemini-dir=<PATH>`) from an ACP
+/// command's argument list.
+fn gemini_dir_arg(args: &[String]) -> Option<&str> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--gemini-dir" {
+            return iter.next().map(String::as_str);
+        }
+        if let Some(value) = arg.strip_prefix("--gemini-dir=") {
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// The home directory the agent process reads `~` under.
@@ -837,5 +877,22 @@ mod tests {
         assert_eq!(file.permissions().mode() & 0o777, 0o444);
         let sub = std::fs::metadata(dir.0.join("skill/sub")).expect("stat the dir");
         assert_eq!(sub.permissions().mode() & 0o777, 0o555);
+    }
+
+    #[test]
+    fn gemini_dir_arg_extracts_both_split_and_equals_forms() {
+        assert_eq!(
+            super::gemini_dir_arg(&[
+                "acp".to_owned(),
+                "--gemini-dir".to_owned(),
+                "/var/lib/flyco/antigravity".to_owned(),
+            ]),
+            Some("/var/lib/flyco/antigravity")
+        );
+        assert_eq!(
+            super::gemini_dir_arg(&["--gemini-dir=/srv/ag".to_owned()]),
+            Some("/srv/ag")
+        );
+        assert_eq!(super::gemini_dir_arg(&["acp".to_owned()]), None);
     }
 }

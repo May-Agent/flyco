@@ -91,11 +91,13 @@ pub async fn pick_harness(api: &Api, mode: out::Mode) -> Outcome<Exit> {
         HarnessKind::ClaudeCode,
         HarnessKind::Codex,
         HarnessKind::Devin,
+        HarnessKind::Antigravity,
     ];
     let chosen = pick::pick("Harness", &harnesses, |harness| match harness {
         HarnessKind::ClaudeCode => "Claude Code".to_owned(),
         HarnessKind::Codex => "Codex".to_owned(),
         HarnessKind::Devin => "Devin".to_owned(),
+        HarnessKind::Antigravity => "Antigravity".to_owned(),
     })?;
     launch(api, harnesses[chosen], None, &SessionSpec::default(), mode).await
 }

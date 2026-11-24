@@ -176,6 +176,12 @@ codex_version=rust-v0.172.0
 codex_sha256_x64=a2342a8f7f68f088be30620ccfe9cb84162c93a6b56177855961cda3ed6be392
 codex_sha256_aarch64=0b99526c185a4425fe96a2214fb7b6a6a7f7c1471883b7afbebe97e15e83e79e
 
+agy_version=1.5.16
+agy_build=1.5.16-5250855658717184
+agy_dist_base=https://storage.googleapis.com/antigravity-public/antigravity-cli
+agy_sha256_x64=9bdab234d06bad1a61be2321072652eb06be78baff1acbfae47331da5a090abc
+agy_sha256_aarch64=7ddeec790084e550af18adb04a5b6c5fdf2db3e1026854f49901a04cb4265c7e
+
 # Everything a session runs on, whether the machine is a VM or a container:
 # the packages, the runtime user, the directories the daemon writes, bun for
 # MCP server aliases (`bunx`/`npx`/`node`), native `claude`, `codex`, `devin`,
@@ -204,10 +210,10 @@ install_session_runtime() {
   #   MCP broker and desktop IPC sockets; agent connects.
   # - Agent workspace and writable harness state (`flyco:flyco`).
   install -d -o root -g root -m 0700 /etc/flycod /var/lib/flyco/transcripts /var/lib/flyco/daemon-home
-  install -d -o root -g root -m 0755 /var/lib/flyco /var/lib/flyco/codex /var/lib/flyco/devin-config /etc/claude-code
+  install -d -o root -g root -m 0755 /var/lib/flyco /var/lib/flyco/codex /var/lib/flyco/devin-config /var/lib/flyco/antigravity /var/lib/flyco/antigravity/config /etc/claude-code
   install -d -o root -g "$runtime_group" -m 0750 /var/lib/flyco/run
   install -d -o "$runtime_user" -g "$runtime_group" -m 0755 /srv/flyco/work
-  install -d -o "$runtime_user" -g "$runtime_group" -m 0750 /var/lib/flyco/claude /var/lib/flyco/devin
+  install -d -o "$runtime_user" -g "$runtime_group" -m 0750 /var/lib/flyco/claude /var/lib/flyco/devin /var/lib/flyco/antigravity/antigravity-cli
 
   # Bun, kept for `bunx`/`npx`/`node` MCP server registrations.
   case "$artifact" in
@@ -281,6 +287,23 @@ EOF
   tar xzf "$scratch/devin.tar.gz" -C "$scratch/devin" bin/devin
   install -m 0755 "$scratch/devin/bin/devin" "$install_root/devin"
 
+  # Native Antigravity CLI (`agy`), pinned to verified release tarballs.
+  case "$artifact" in
+    flycod-linux-x86_64)
+      agy_archive=linux-x64/cli_linux_x64.tar.gz
+      expected_agy_hash=$agy_sha256_x64
+      ;;
+    flycod-linux-aarch64)
+      agy_archive=linux-arm/cli_linux_arm64.tar.gz
+      expected_agy_hash=$agy_sha256_aarch64
+      ;;
+  esac
+  download "$agy_dist_base/$agy_build/$agy_archive" "$scratch/agy.tar.gz"
+  printf '%s  %s\n' "$expected_agy_hash" "$scratch/agy.tar.gz" | sha256sum --check -
+  mkdir "$scratch/agy"
+  tar xzf "$scratch/agy.tar.gz" -C "$scratch/agy" antigravity
+  install -m 0755 "$scratch/agy/antigravity" "$install_root/agy"
+
   # `node` and `npx` are the commands MCP server registrations name, and
   # there is no Node on this runtime: bunx runs the same packages, so the
   # aliases keep those servers working.
@@ -297,6 +320,7 @@ verify_session_runtime() {
   runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/claude" --version
   runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/codex" --version
   runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/devin" --version
+  runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/agy" --version
 }
 
 install_session() {

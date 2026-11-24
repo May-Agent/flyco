@@ -15,7 +15,7 @@
  * lockup (the AWS one) and a square glyph sit on the same baseline.
  */
 import { For } from "solid-js";
-import { siAnthropic, siGithub, siGooglecloud } from "simple-icons";
+import { siAnthropic, siGithub, siGooglecloud, siGooglegemini } from "simple-icons";
 import type { CloudProviderKind, HarnessKind } from "../api/client";
 import awsAsset from "../assets/logos/aws.svg?raw";
 import azureAsset from "../assets/logos/azure.svg?raw";
@@ -73,6 +73,10 @@ export const GITHUB_MARK: Mark = iconMark(siGithub);
 export const ANTHROPIC_MARK: Mark = iconMark(siAnthropic);
 export const OPENAI_MARK: Mark = assetMark("OpenAI", openaiAsset);
 export const DEVIN_MARK: Mark = assetMark("Devin", devinAsset);
+export const ANTIGRAVITY_MARK: Mark = {
+  ...iconMark(siGooglegemini),
+  title: "Antigravity",
+};
 export const AWS_MARK: Mark = assetMark("Amazon Web Services", awsAsset);
 export const AZURE_MARK: Mark = assetMark("Microsoft Azure", azureAsset);
 export const GOOGLE_CLOUD_MARK: Mark = iconMark(siGooglecloud);
@@ -82,6 +86,7 @@ export const HARNESS_MARK: Record<HarnessKind, Mark> = {
   claude_code: ANTHROPIC_MARK,
   codex: OPENAI_MARK,
   devin: DEVIN_MARK,
+  antigravity: ANTIGRAVITY_MARK,
 };
 
 /**

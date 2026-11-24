@@ -1117,7 +1117,8 @@ describe("route smoke tests", () => {
     ).toBeInTheDocument();
     expect(getAllByText("Claude Code").length).toBeGreaterThan(0);
     expect(getAllByText("Codex").length).toBeGreaterThan(0);
-    expect(getAllByText("Not linked")).toHaveLength(3);
+    expect(getAllByText("Antigravity").length).toBeGreaterThan(0);
+    expect(getAllByText("Not linked")).toHaveLength(4);
   });
 
   it("renders /settings/compute as an empty state with its one action", async () => {

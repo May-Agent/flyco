@@ -23,6 +23,7 @@ const READ_ONLY_PREFIXES: &[&str] = &[
     "/etc/claude-code",
     "/var/lib/flyco/codex",
     "/var/lib/flyco/devin-config",
+    "/var/lib/flyco/antigravity/config",
 ];
 
 /// Partial Claude Code `PreToolUse` hook stdin payload.
@@ -242,6 +243,15 @@ mod tests {
         });
         assert!(matches!(
             evaluate_pre_tool_use(&bash_rm.to_string()),
+            HookDecision::Block(_)
+        ));
+
+        let edit_antigravity = json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": "/var/lib/flyco/antigravity/config/mcp_config.json" }
+        });
+        assert!(matches!(
+            evaluate_pre_tool_use(&edit_antigravity.to_string()),
             HookDecision::Block(_)
         ));
 

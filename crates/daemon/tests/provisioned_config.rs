@@ -18,12 +18,12 @@ use flyco_core::{
 };
 use flyco_daemon::config::{ClaudeAuth, DaemonConfig, InProcessAgent};
 use flyco_provider::flycod::{
-    self, CLAUDE_BIN, CLAUDE_CONFIG_DIR, CLAUDE_MANAGED_DIR, CLAUDE_PROJECT_DIR_NAME, CODEX_BIN,
-    CODEX_HOME, WORKDIR,
+    self, AGY_BIN, ANTIGRAVITY_APP_DATA_DIR, ANTIGRAVITY_GEMINI_DIR, CLAUDE_BIN, CLAUDE_CONFIG_DIR,
+    CLAUDE_MANAGED_DIR, CLAUDE_PROJECT_DIR_NAME, CODEX_BIN, CODEX_HOME, WORKDIR,
 };
 use flyco_provider::{
-    CheckoutSpec, ClaudeCredential, CodexCredential, DaemonBootstrap, DevinCredential, GitAccess,
-    GitIdentity, HarnessCredential,
+    AntigravityCredential, CheckoutSpec, ClaudeCredential, CodexCredential, DaemonBootstrap,
+    DevinCredential, GitAccess, GitIdentity, HarnessCredential,
 };
 
 const CONTROL_PLANE: &str = "https://flyco.dev/";
@@ -428,5 +428,78 @@ fn a_provisioned_devin_configuration_is_the_same_table_pointed_at_devin() {
     assert!(
         credentials.path.starts_with(data_home),
         "credentials.toml lands where the configured XDG_DATA_HOME reads it"
+    );
+}
+
+#[test]
+fn a_provisioned_antigravity_configuration_is_one_this_daemon_accepts() {
+    let config = parse(&bootstrap(HarnessCredential::Antigravity(
+        AntigravityCredential::ApiKey {
+            key: "AIzaSy-provisioned".to_owned(),
+        },
+    )));
+
+    assert_eq!(config.harness, DriverKind::Acp);
+    assert!(config.claude.is_none());
+    let acp = config.acp.as_ref().expect("acp");
+    assert_eq!(acp.agent, "antigravity");
+    assert_eq!(acp.in_process, None);
+    assert_eq!(acp.program, std::path::PathBuf::from(AGY_BIN));
+    assert_eq!(
+        acp.args,
+        [
+            "acp",
+            "--stdio",
+            "--disable-telemetry",
+            "--gemini-dir",
+            ANTIGRAVITY_GEMINI_DIR,
+            "--app-data-dir",
+            ANTIGRAVITY_APP_DATA_DIR,
+        ]
+    );
+    assert_eq!(acp.auth_method.as_deref(), Some("gemini-api-key"));
+    assert!(acp.mcp_via_files);
+    assert_eq!(acp.effort_option.as_deref(), Some("thought_level"));
+    assert_eq!(
+        acp.env.get("GEMINI_API_KEY").map(String::as_str),
+        Some("AIzaSy-provisioned")
+    );
+
+    let settings = acp
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("settings.json"))
+        .expect("an API key writes settings.json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&settings.contents).expect("settings.json is JSON");
+    assert_eq!(parsed["modelProvider"], "gemini");
+    assert!(settings.path.starts_with(ANTIGRAVITY_GEMINI_DIR));
+
+    let mcp = acp
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("mcp_config.json"))
+        .expect("the MCP registry is always written");
+    let mcp_json: serde_json::Value =
+        serde_json::from_str(&mcp.contents).expect("mcp_config.json is JSON");
+    assert!(
+        mcp_json["mcpServers"]["flyco"]["command"].is_string(),
+        "flyco's stdio MCP server lands in mcp_config.json"
+    );
+
+    let mut bypass = bootstrap(HarnessCredential::Antigravity(
+        AntigravityCredential::ApiKey {
+            key: "AIzaSy-provisioned".to_owned(),
+        },
+    ));
+    bypass.permission_mode = PermissionMode::BypassPermissions;
+    let bypass_cfg = parse(&bypass);
+    assert!(
+        bypass_cfg
+            .acp
+            .expect("acp")
+            .args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions")
     );
 }

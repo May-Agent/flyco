@@ -378,6 +378,7 @@ async fn pick_session(
             HarnessKind::ClaudeCode,
             HarnessKind::Codex,
             HarnessKind::Devin,
+            HarnessKind::Antigravity,
         ] {
             if from.is_some_and(|wanted| wanted != harness) {
                 continue;
@@ -397,6 +398,7 @@ async fn pick_session(
         HarnessKind::ClaudeCode,
         HarnessKind::Codex,
         HarnessKind::Devin,
+        HarnessKind::Antigravity,
     ] {
         if from.is_some_and(|wanted| wanted != harness) {
             continue;
@@ -407,7 +409,7 @@ async fn pick_session(
     match candidates.len() {
         0 => Err(Failure::problem(
             Exit::NotFoundOrConflict,
-            "no local claude, codex or devin session has ever run in this worktree",
+            "no local claude, codex, devin or antigravity session has ever run in this worktree",
         )),
         1 => Ok(candidates.into_iter().next().expect("one")),
         _ if interactive() => {
@@ -475,6 +477,7 @@ async fn discover(harness: HarnessKind, root: &Path) -> Outcome<Vec<LocalSession
         HarnessKind::ClaudeCode => discover_claude(root).await,
         HarnessKind::Codex => discover_codex(root).await,
         HarnessKind::Devin => discover_devin(root).await,
+        HarnessKind::Antigravity => discover_antigravity(root).await,
     }
 }
 
@@ -510,6 +513,21 @@ async fn find_named(harness: HarnessKind, id: &str, root: &Path) -> Outcome<Opti
             let modified = mtime(&transcript).await;
             Ok(Some(LocalSession {
                 harness: HarnessKind::Devin,
+                session_id: id.to_owned(),
+                transcript,
+                cwd: root.to_path_buf(),
+                modified,
+                title: id.to_owned(),
+            }))
+        }
+        HarnessKind::Antigravity => {
+            let transcript = antigravity_transcript(id);
+            if !transcript.is_file() {
+                return Ok(None);
+            }
+            let modified = mtime(&transcript).await;
+            Ok(Some(LocalSession {
+                harness: HarnessKind::Antigravity,
                 session_id: id.to_owned(),
                 transcript,
                 cwd: root.to_path_buf(),
@@ -778,12 +796,51 @@ fn devin_transcript(id: &str) -> PathBuf {
     home().join(format!(".local/share/devin/cli/transcripts/{id}.json"))
 }
 
+fn antigravity_transcript(id: &str) -> PathBuf {
+    home().join(format!(
+        ".gemini/antigravity-cli/brain/{id}/.system_generated/logs/transcript.jsonl"
+    ))
+}
+
+/// Antigravity stores transcripts at
+/// `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`.
+async fn discover_antigravity(root: &Path) -> Outcome<Vec<LocalSession>> {
+    let dir = home().join(".gemini/antigravity-cli/brain");
+    let Some(mut entries) = read_dir(&dir).await else {
+        return Ok(Vec::new());
+    };
+    let root_text = root.display().to_string();
+    let mut found = Vec::new();
+    while let Some(entry) = entries_next(&mut entries).await {
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let transcript = entry.path().join(".system_generated/logs/transcript.jsonl");
+        if !transcript.is_file() {
+            continue;
+        }
+        let lines = head_lines(&transcript, 64 * 1024).await?;
+        if !lines.iter().any(|line| line.contains(&root_text)) {
+            continue;
+        }
+        let modified = mtime(&transcript).await;
+        found.push(LocalSession {
+            harness: HarnessKind::Antigravity,
+            title: id.clone(),
+            session_id: id,
+            transcript,
+            cwd: root.to_path_buf(),
+            modified,
+        });
+    }
+    Ok(found)
+}
+
 /// The session's own summary of its work, written by its own harness.
 async fn summarize(session: &LocalSession) -> Outcome<String> {
     let summary = match session.harness {
         HarnessKind::ClaudeCode => claude_summary(session).await,
         HarnessKind::Codex => codex_summary(session).await,
         HarnessKind::Devin => devin_summary(session).await,
+        HarnessKind::Antigravity => antigravity_summary(session).await,
     }?;
     let summary = summary.trim().to_owned();
     if summary.is_empty() {
@@ -846,6 +903,37 @@ async fn devin_summary(session: &LocalSession) -> Outcome<String> {
         return Err(command_failed("devin", &output));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// `agy -p --output-format json --resume <id> <prompt>`: reads `result` or
+/// `text`, falling back to raw stdout.
+async fn antigravity_summary(session: &LocalSession) -> Outcome<String> {
+    let output = run_timed(
+        Command::new("agy")
+            .args([
+                "-p",
+                "--output-format",
+                "json",
+                "--resume",
+                &session.session_id,
+                SUMMARY_PROMPT,
+            ])
+            .current_dir(&session.cwd),
+    )
+    .await?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success() {
+        return Err(command_failed("agy", &output));
+    }
+    Ok(serde_json::from_str::<serde_json::Value>(&stdout)
+        .ok()
+        .and_then(|document| {
+            document["result"]
+                .as_str()
+                .or_else(|| document["text"].as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| stdout.into_owned()))
 }
 
 /// Codex's summary rides `codex app-server`'s newline-JSON-RPC: resume
@@ -1159,6 +1247,7 @@ const fn label(harness: HarnessKind) -> &'static str {
         HarnessKind::ClaudeCode => "claude",
         HarnessKind::Codex => "codex",
         HarnessKind::Devin => "devin",
+        HarnessKind::Antigravity => "antigravity",
     }
 }
 

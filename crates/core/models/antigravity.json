@@ -1,0 +1,66 @@
+[
+  {
+    "id": "gemini-4-neon",
+    "label": "Gemini 4 Neon",
+    "description": "Most capable Gemini 4 model for complex engineering and architecture.",
+    "is_default": true,
+    "efforts": ["low", "medium", "high", "xhigh"],
+    "default_effort": "high"
+  },
+  {
+    "id": "gemini-4-carbon",
+    "label": "Gemini 4 Carbon",
+    "description": "Balanced Gemini 4 model for everyday coding tasks.",
+    "is_default": false,
+    "efforts": ["low", "medium", "high"],
+    "default_effort": "medium"
+  },
+  {
+    "id": "gemini-4-hydrogen",
+    "label": "Gemini 4 Hydrogen",
+    "description": "Fast Gemini 4 model with extended reasoning support.",
+    "is_default": false,
+    "efforts": ["low", "medium", "high", "xhigh"],
+    "default_effort": "high"
+  },
+  {
+    "id": "gemini-4-argon",
+    "label": "Gemini 4 Argon",
+    "description": "Lightweight Gemini 4 model for quick edits and lookups.",
+    "is_default": false,
+    "efforts": ["low", "medium", "high"],
+    "default_effort": "medium"
+  },
+  {
+    "id": "gemini-3.8-flash",
+    "label": "Gemini 3.8 Flash",
+    "description": "Fast Gemini 3.8 Flash model for rapid iteration.",
+    "is_default": false,
+    "efforts": ["low", "medium", "high"],
+    "default_effort": "medium"
+  },
+  {
+    "id": "gemini-3.7-flash",
+    "label": "Gemini 3.7 Flash",
+    "description": "Previous-generation Gemini 3.7 Flash model.",
+    "is_default": false,
+    "efforts": ["low", "medium", "high"],
+    "default_effort": "medium"
+  },
+  {
+    "id": "gemini-3.6-flash",
+    "label": "Gemini 3.6 Flash",
+    "description": "Previous-generation Gemini 3.6 Flash model.",
+    "is_default": false,
+    "efforts": ["low", "medium", "high"],
+    "default_effort": "medium"
+  },
+  {
+    "id": "gemini-3.1-pro",
+    "label": "Gemini 3.1 Pro",
+    "description": "Gemini 3.1 Pro model for general coding.",
+    "is_default": false,
+    "efforts": ["low", "high"],
+    "default_effort": "low"
+  }
+]

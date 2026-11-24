@@ -1,4 +1,4 @@
-//! Claude Code and Codex accounts, plus observed LLM usage.
+//! Harness accounts (Claude Code, Codex, Devin, and Antigravity), plus observed LLM usage.
 //!
 //! Credentials enter through an authenticated JSON request — or through the
 //! Claude OAuth flow in [`crate::claude_oauth`], which ends in the same
@@ -22,7 +22,9 @@ use flyco_core::{
     LinkHarnessAccount, LlmUsageView, ModelOption, PlanUsage, UserId, builtin_models,
     normalize_models,
 };
-use flyco_provider::{ClaudeCredential, CodexCredential, DevinCredential, HarnessCredential};
+use flyco_provider::{
+    AntigravityCredential, ClaudeCredential, CodexCredential, DevinCredential, HarnessCredential,
+};
 use serde::{Deserialize, Serialize};
 use skyzen::routing::{CreateRouteNode, Params, Route, RouteNode, Routes as _};
 use skyzen::sql;
@@ -66,9 +68,10 @@ pub enum StoredCredential {
         /// The access token the daemon provisions as `.credentials.json`.
         token: String,
     },
-    /// An Anthropic or `OpenAI` API key.
+    /// An Anthropic, `OpenAI`, Devin, or Gemini API key.
     ApiKey {
-        /// Value for `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
+        /// Value for `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, Devin's
+        /// `windsurf_api_key`, or `GEMINI_API_KEY`.
         key: String,
     },
     /// A Claude subscription grant from the browser OAuth flow.
@@ -187,9 +190,12 @@ impl StoredCredential {
             | (Self::CodexOauth { .. }, HarnessKind::Codex) => true,
             (
                 Self::OauthToken { .. } | Self::ClaudeOauth { .. },
-                HarnessKind::Codex | HarnessKind::Devin,
+                HarnessKind::Codex | HarnessKind::Devin | HarnessKind::Antigravity,
             )
-            | (Self::CodexOauth { .. }, HarnessKind::ClaudeCode | HarnessKind::Devin) => false,
+            | (
+                Self::CodexOauth { .. },
+                HarnessKind::ClaudeCode | HarnessKind::Devin | HarnessKind::Antigravity,
+            ) => false,
         }
     }
 
@@ -221,6 +227,9 @@ impl StoredCredential {
             }
             (Self::ApiKey { key }, HarnessKind::Devin) => {
                 HarnessCredential::Devin(DevinCredential::ApiKey { key })
+            }
+            (Self::ApiKey { key }, HarnessKind::Antigravity) => {
+                HarnessCredential::Antigravity(AntigravityCredential::ApiKey { key })
             }
             (
                 Self::CodexOauth {
@@ -505,6 +514,11 @@ async fn list(
 }
 
 /// Links a harness credential, replacing the credential for that harness.
+///
+/// Cost per call: 1 D1 write (`INSERT ... ON CONFLICT DO UPDATE`), 2 D1 reads
+/// (model list and stored credential for [`usage`]), 0 KV/DO/R2 ops, and 0–1
+/// vendor subrequests (1 for Devin `/v3/self` identity validation or Claude
+/// subscription plan usage; 0 for API-key harnesses such as Antigravity).
 #[skyzen::openapi]
 async fn link_harness_account(
     State(user): State<CurrentUser>,
@@ -539,7 +553,8 @@ fn validated(
         },
         HarnessCredentialInput::ClaudeApiKey { key }
         | HarnessCredentialInput::CodexApiKey { key }
-        | HarnessCredentialInput::DevinApiKey { key } => StoredCredential::ApiKey {
+        | HarnessCredentialInput::DevinApiKey { key }
+        | HarnessCredentialInput::AntigravityApiKey { key } => StoredCredential::ApiKey {
             key: key.trim().to_owned(),
         },
         HarnessCredentialInput::ClaudeOauth {

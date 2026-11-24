@@ -36,7 +36,7 @@ use crate::vendors::Vendors;
 
 /// The schema every database-backed test starts from, in the order
 /// `wrangler d1 migrations apply` would run it.
-pub const MIGRATIONS: [&str; 38] = [
+pub const MIGRATIONS: [&str; 39] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_sessions.sql"),
     include_str!("../../../migrations/0003_daemon.sql"),
@@ -75,6 +75,7 @@ pub const MIGRATIONS: [&str; 38] = [
     include_str!("../../../migrations/0037_keep_machine_awake.sql"),
     include_str!("../../../migrations/0038_shared_skills.sql"),
     include_str!("../../../migrations/0039_idempotency_request_hash.sql"),
+    include_str!("../../../migrations/0040_antigravity_harness.sql"),
 ];
 
 /// Client id the test configuration presents to GitHub.
@@ -1995,9 +1996,11 @@ pub async fn seed_harness_account(db: &Db, user: UserId, harness: HarnessKind) -
         HarnessKind::ClaudeCode => StoredCredential::OauthToken {
             token: HARNESS_TOKEN.to_owned(),
         },
-        HarnessKind::Codex | HarnessKind::Devin => StoredCredential::ApiKey {
-            key: HARNESS_TOKEN.to_owned(),
-        },
+        HarnessKind::Codex | HarnessKind::Devin | HarnessKind::Antigravity => {
+            StoredCredential::ApiKey {
+                key: HARNESS_TOKEN.to_owned(),
+            }
+        }
     };
     seed_credential(db, user, harness, &credential).await
 }

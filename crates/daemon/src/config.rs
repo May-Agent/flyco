@@ -256,6 +256,15 @@ pub struct AcpConfig {
     /// Arguments the program is spawned with (`["acp"]` for `devin acp`).
     #[serde(default)]
     pub args: Vec<String>,
+    /// Optional ACP `authenticate` method id to invoke right after `initialize`
+    /// (for example `"gemini-api-key"` for Antigravity).
+    #[serde(default)]
+    pub auth_method: Option<String>,
+    /// When true, MCP servers are mounted solely through `[acp.files]`
+    /// rather than passed in `session/new` / `session/resume` (and HTTP MCP
+    /// transport capability checks on the ACP handshake are skipped).
+    #[serde(default)]
+    pub mcp_via_files: bool,
     /// Extra environment for the agent process, on top of the daemon's
     /// own. Where credentials that travel as variables are injected —
     /// `CODEX_HOME`, `XDG_DATA_HOME` and friends are values here.

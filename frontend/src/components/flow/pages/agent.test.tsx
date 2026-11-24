@@ -61,7 +61,8 @@ describe("the agents list", () => {
     expect(getByRole("radio", { name: /^Claude Code/ })).toBeInTheDocument();
     expect(getByRole("radio", { name: /^Codex/ })).toBeInTheDocument();
     expect(getByRole("radio", { name: /^Devin/ })).toBeInTheDocument();
-    expect(getAllByText(/^Not linked/)).toHaveLength(3);
+    expect(getByRole("radio", { name: /^Antigravity/ })).toBeInTheDocument();
+    expect(getAllByText(/^Not linked/)).toHaveLength(4);
     // Nothing here chooses the agent tasks run on.
     expect(queryByText(/Which agent should/)).not.toBeInTheDocument();
     expect(primary(container)).toHaveTextContent("Next");
@@ -709,6 +710,34 @@ describe("Codex, opened for it alone", () => {
     expect(postedTo("/v1/harness-accounts")).toEqual({
       label: "OpenAI API key",
       credential: { kind: "codex_api_key", key: "sk-proj-a-real-looking-key" },
+    });
+  });
+});
+
+describe("Antigravity, opened for it alone", () => {
+  it("opens directly on the Gemini API-key page and links with a pasted key", async () => {
+    const { container, findByRole, findByLabelText, getByRole, onDone } =
+      renderFlow(["agent"], { agents: ["antigravity"] });
+
+    await findByRole("heading", { level: 1, name: "Paste your Gemini API key" });
+    expect(
+      getByRole("link", { name: /Create a key on Google AI Studio/ }),
+    ).toHaveAttribute("href", "https://aistudio.google.com/app/api-keys");
+    expect(primary(container)).toHaveTextContent("Link Antigravity");
+    expect(primary(container)).toBeDisabled();
+    expectEveryButtonNamed(container);
+
+    type(await findByLabelText("Gemini API key"), "AIzaSy-a-real-looking-key");
+    await waitFor(() => expect(primary(container)).toBeEnabled());
+    fireEvent.click(primary(container));
+
+    await waitFor(() => expect(onDone).toHaveBeenCalledOnce());
+    expect(postedTo("/v1/harness-accounts")).toEqual({
+      label: "Gemini API key",
+      credential: {
+        kind: "antigravity_api_key",
+        key: "AIzaSy-a-real-looking-key",
+      },
     });
   });
 });

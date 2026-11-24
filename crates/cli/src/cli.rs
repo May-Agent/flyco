@@ -7,7 +7,7 @@
 
 use clap::{Args, Parser, Subcommand};
 
-/// `flyco` — run Claude Code, Codex and Devin sessions on flyco from a terminal.
+/// `flyco` — run Claude Code, Codex, Devin and Antigravity sessions on flyco from a terminal.
 #[derive(Debug, Parser)]
 #[command(name = "flyco", version, about)]
 pub struct Cli {
@@ -87,6 +87,7 @@ pub enum Command {
     /// Open a Claude Code TUI on a new session, bridged to this terminal.
     Claude {
         /// `owner/name`; asked for when omitted on a TTY.
+        #[arg(id = "target_repo", value_name = "REPO")]
         repo: Option<String>,
         /// The session's settings.
         #[command(flatten)]
@@ -95,6 +96,7 @@ pub enum Command {
     /// Open a Codex TUI on a new session, bridged to this terminal.
     Codex {
         /// `owner/name`; asked for when omitted on a TTY.
+        #[arg(id = "target_repo", value_name = "REPO")]
         repo: Option<String>,
         /// The session's settings.
         #[command(flatten)]
@@ -103,6 +105,16 @@ pub enum Command {
     /// Open a Devin TUI on a new session, bridged to this terminal.
     Devin {
         /// `owner/name`; asked for when omitted on a TTY.
+        #[arg(id = "target_repo", value_name = "REPO")]
+        repo: Option<String>,
+        /// The session's settings.
+        #[command(flatten)]
+        spec: SessionSpec,
+    },
+    /// Open an Antigravity session, bridged to this terminal.
+    Antigravity {
+        /// `owner/name`; asked for when omitted on a TTY.
+        #[arg(id = "target_repo", value_name = "REPO")]
         repo: Option<String>,
         /// The session's settings.
         #[command(flatten)]
@@ -532,14 +544,15 @@ fn parse_runtime(text: &str) -> Result<flyco_core::Runtime, String> {
     }
 }
 
-/// `claude`/`codex`/`devin` spellings of the three harnesses.
+/// `claude`/`codex`/`devin`/`antigravity` spellings of the supported harnesses.
 fn parse_harness(text: &str) -> Result<flyco_core::HarnessKind, String> {
     match text {
         "claude" | "claude_code" | "claude-code" => Ok(flyco_core::HarnessKind::ClaudeCode),
         "codex" => Ok(flyco_core::HarnessKind::Codex),
         "devin" => Ok(flyco_core::HarnessKind::Devin),
+        "antigravity" | "agy" => Ok(flyco_core::HarnessKind::Antigravity),
         other => Err(format!(
-            "`{other}` is not a harness — `claude`, `codex` or `devin`"
+            "`{other}` is not a harness — `claude`, `codex`, `devin` or `antigravity`"
         )),
     }
 }
@@ -859,5 +872,23 @@ mod tests {
             req.machine.expect("machine").runtime,
             flyco_core::Runtime::Container
         );
+    }
+
+    #[test]
+    fn antigravity_harness_and_subcommand_parse() {
+        assert_eq!(
+            parse_harness("antigravity").expect("antigravity"),
+            flyco_core::HarnessKind::Antigravity
+        );
+        assert_eq!(
+            parse_harness("agy").expect("agy"),
+            flyco_core::HarnessKind::Antigravity
+        );
+        let parsed = Cli::try_parse_from(["flyco", "antigravity", "lexoliu/flyco"])
+            .expect("flyco antigravity parses");
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Antigravity { repo: Some(ref slug), .. }) if slug == "lexoliu/flyco"
+        ));
     }
 }

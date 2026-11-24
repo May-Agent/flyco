@@ -114,6 +114,22 @@ const VENDORS: Record<HarnessKind, KeyVendor> = {
       link: { credential: { kind: "devin_api_key", key: value } },
     }),
   },
+  antigravity: {
+    title: "Paste your Gemini API key",
+    lede:
+      "Billed per token by Google via the Gemini API. Flyco encrypts the key before storing it.",
+    label: "Gemini API key",
+    hint: "Starts with AIza.",
+    keysUrl: "https://aistudio.google.com/app/api-keys",
+    keysPage: "Google AI Studio",
+    read: (value) => ({
+      ok: true,
+      link: {
+        label: "Gemini API key",
+        credential: { kind: "antigravity_api_key", key: value },
+      },
+    }),
+  },
 };
 
 export const ApiKey: PageComponent<{ id: "api-key"; agent: HarnessKind }> = (

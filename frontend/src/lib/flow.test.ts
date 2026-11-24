@@ -114,7 +114,14 @@ describe("pagesFor", () => {
   it("swaps the sign-in's second page for the API-key page behind the link", () => {
     const claude = advance(
       advance(startFlow({ stages: ["agent"] }), { linking: "claude_code" }),
-      { routes: { claude_code: "api-key", codex: "sign-in", devin: "sign-in" } },
+      {
+        routes: {
+          claude_code: "api-key",
+          codex: "sign-in",
+          devin: "sign-in",
+          antigravity: "api-key",
+        },
+      },
     );
     expect(ids(claude)).toEqual(["agents", "claude-sign-in", "api-key"]);
     expect(currentPage(claude)).toEqual({
@@ -123,7 +130,12 @@ describe("pagesFor", () => {
     });
 
     const codex = advance(startFlow({ stages: ["agent"], agents: ["codex"] }), {
-      routes: { claude_code: "sign-in", codex: "api-key", devin: "sign-in" },
+      routes: {
+        claude_code: "sign-in",
+        codex: "api-key",
+        devin: "sign-in",
+        antigravity: "api-key",
+      },
     });
     expect(ids(codex)).toEqual(["codex-sign-in", "api-key"]);
     expect(currentPage(codex)).toEqual({ id: "api-key", agent: "codex" });
@@ -153,11 +165,27 @@ describe("pagesFor", () => {
           claude_code: "sign-in",
           codex: "sign-in",
           devin: "api-key",
+          antigravity: "api-key",
         },
       },
     );
     expect(ids(devin)).toEqual(["agents", "devin-sign-in", "api-key"]);
     expect(currentPage(devin)).toEqual({ id: "api-key", agent: "devin" });
+  });
+
+  it("opens Antigravity directly on its Gemini API-key page", () => {
+    const antigravity = advance(startFlow({ stages: ["agent"] }), {
+      linking: "antigravity",
+    });
+    expect(ids(antigravity)).toEqual(["agents", "api-key"]);
+    expect(currentPage(antigravity)).toEqual({
+      id: "api-key",
+      agent: "antigravity",
+    });
+
+    expect(
+      ids(startFlow({ stages: ["agent"], agents: ["antigravity"] })),
+    ).toEqual(["api-key"]);
   });
 
   it("returns to the list when an agent links, its pages gone and the list reading Linked", () => {
@@ -180,7 +208,12 @@ describe("pagesFor", () => {
     expect(isFinished(finishLink(codex, "codex", CODEX))).toBe(true);
 
     const key = advance(startFlow({ stages: ["agent"], agents: ["codex"] }), {
-      routes: { claude_code: "sign-in", codex: "api-key", devin: "sign-in" },
+      routes: {
+        claude_code: "sign-in",
+        codex: "api-key",
+        devin: "sign-in",
+        antigravity: "api-key",
+      },
     });
     expect(currentPage(key).id).toBe("api-key");
     expect(isFinished(finishLink(key, "codex", CODEX))).toBe(true);

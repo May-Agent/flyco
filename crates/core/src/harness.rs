@@ -11,19 +11,21 @@ use crate::money::Usd;
 ///
 /// This is the *product* vocabulary — what a session row names, what an
 /// account is linked to, what the picker offers. How each one is driven
-/// is [`DriverKind`]'s question: every harness but Claude Code reaches
-/// its agent over ACP, so a Codex session and a Devin session are the
-/// same daemon machinery pointed at a different program.
+/// is [`DriverKind`]'s question: every harness reaches its agent through
+/// the unified ACP driver — Claude Code and Codex via in-process ACP hosts,
+/// and Devin and Antigravity as ACP subprocesses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(feature = "sql", derive(skyzen::Column))]
 pub enum HarnessKind {
-    /// Anthropic's Claude Code, driven through the Agent SDK sidecar.
+    /// Anthropic's Claude Code, driven through the in-process `claude-acp` host.
     ClaudeCode,
-    /// `OpenAI`'s Codex, driven over ACP through the `codex-acp` adapter.
+    /// `OpenAI`'s Codex, driven through the in-process `codex-acp` host.
     Codex,
     /// Cognition's Devin, driven over ACP through `devin acp`.
     Devin,
+    /// Google's Antigravity CLI, driven over ACP through `agy acp`.
+    Antigravity,
 }
 
 impl HarnessKind {
@@ -44,37 +46,36 @@ impl HarnessKind {
 ///
 /// This is the *driver* vocabulary — what `flycod`'s `harness = "…"`
 /// setting selects. It is deliberately narrower than [`HarnessKind`]:
-/// a provisioned Codex or Devin session stores its product harness on the
-/// session row and renders `harness = "acp"` plus an `[acp]` table onto
-/// the machine, because ACP is the whole interface the daemon needs.
-/// A hand-written `flycod` config can drive *any* ACP agent the same
+/// provisioned Codex, Devin, and Antigravity sessions store their product
+/// harness on the session row and render `harness = "acp"` plus an `[acp]`
+/// table onto the machine, because ACP is the whole interface the daemon
+/// needs. A hand-written `flycod` config can drive *any* ACP agent the same
 /// way — the daemon never learns which product harness it is standing
 /// in for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
-    /// The Claude Code driver: the Agent SDK sidecar.
+    /// The Claude Code driver: in-process `claude-acp` supervising the native
+    /// `claude` CLI.
     ClaudeCode,
-    /// The generic ACP driver: any agent speaking the Agent Client
-    /// Protocol over stdio.
+    /// The generic ACP driver: in-process `codex-acp` or any external agent
+    /// speaking the Agent Client Protocol over stdio.
     Acp,
 }
 
 /// The permission mode a session runs under.
 ///
-/// Spelled the way the Claude Agent SDK spells its `PermissionMode` union,
-/// in `camelCase`, so the sidecar passes the value straight into `query`'s
-/// `permissionMode` option. Every mode other than [`Self::Default`] narrows
-/// what reaches flyco's approval UI, because an auto-approved tool never
-/// calls back.
+/// Spelled in `camelCase` matching Claude Code's permission-mode union so
+/// every boundary shares one canonical vocabulary. Every mode other than
+/// [`Self::Default`] narrows what reaches flyco's approval UI, because an
+/// auto-approved tool never calls back.
 ///
 /// It lives in the domain model rather than in the daemon because it
 /// crosses every boundary flyco has: the control plane stores it on the
 /// session row and writes it into the `flycod` configuration it provisions
-/// onto a machine, the daemon reads that configuration back and applies a
-/// change to the running harness — `setPermissionMode` on Claude's live
-/// query, `approvalPolicy`/`sandboxPolicy` overrides on Codex's next
-/// `turn/start`.
+/// onto a machine, and the daemon reads that configuration back and applies
+/// mode changes to the running ACP session via `session/set_mode` and
+/// `session/set_config_option`.
 #[derive(
     Debug,
     Clone,
@@ -258,6 +259,8 @@ pub struct HarnessFeature {
     pub codex: Availability,
     /// Status on Devin.
     pub devin: Availability,
+    /// Status on Antigravity.
+    pub antigravity: Availability,
 }
 
 /// The verified availability of `feature` on `harness`.
@@ -274,7 +277,7 @@ pub const fn availability(harness: HarnessKind, feature: Feature) -> Availabilit
         )
         | (_, Feature::AutoMode | Feature::BackgroundTasks) => Availability::Supported,
         (
-            HarnessKind::Devin,
+            HarnessKind::Devin | HarnessKind::Antigravity,
             Feature::UsageDisplay
             | Feature::ContextWindowDisplay
             | Feature::GoalMode
@@ -284,12 +287,13 @@ pub const fn availability(harness: HarnessKind, feature: Feature) -> Availabilit
         | (_, Feature::DynamicWorkflows | Feature::Settings)
         | (HarnessKind::ClaudeCode, Feature::Advisor | Feature::Monitor) => Availability::Planned,
         (_, Feature::SideChat) => Availability::HarnessLimitation,
-        (HarnessKind::Codex | HarnessKind::Devin, Feature::Advisor | Feature::Monitor) => {
-            Availability::NotApplicable
-        }
+        (
+            HarnessKind::Codex | HarnessKind::Devin | HarnessKind::Antigravity,
+            Feature::Advisor | Feature::Monitor,
+        ) => Availability::NotApplicable,
         (_, Feature::RemoteControl | Feature::Resume) => Availability::Disabled,
         // Computer control joins the takeover set: one implementation
-        // serves both harnesses, because the session's own flyco MCP
+        // serves every harness, because the session's own flyco MCP
         // server carries the tools — the harness never had them.
         (_, Feature::Skills | Feature::Mcp | Feature::Memory | Feature::ComputerControl) => {
             Availability::Takeover
@@ -308,6 +312,7 @@ pub fn matrix() -> Vec<HarnessFeature> {
             claude_code: availability(HarnessKind::ClaudeCode, feature),
             codex: availability(HarnessKind::Codex, feature),
             devin: availability(HarnessKind::Devin, feature),
+            antigravity: availability(HarnessKind::Antigravity, feature),
         })
         .collect()
 }
@@ -583,6 +588,7 @@ pub fn builtin_models(harness: HarnessKind) -> Vec<ModelOption> {
         HarnessKind::ClaudeCode => include_str!("../models/claude_code.json"),
         HarnessKind::Codex => include_str!("../models/codex.json"),
         HarnessKind::Devin => include_str!("../models/devin.json"),
+        HarnessKind::Antigravity => include_str!("../models/antigravity.json"),
     };
     serde_json::from_str(document).expect("a built-in model list parses")
 }
@@ -840,6 +846,11 @@ pub enum HarnessCredentialInput {
         /// `devin-session-token$…` session token.
         key: String,
     },
+    /// A Gemini API key used by Antigravity CLI (`gemini-api-key` auth method).
+    AntigravityApiKey {
+        /// Value for `GEMINI_API_KEY`.
+        key: String,
+    },
 }
 
 impl core::fmt::Debug for HarnessCredentialInput {
@@ -851,6 +862,7 @@ impl core::fmt::Debug for HarnessCredentialInput {
             Self::ClaudeOauth { .. } => "claude_oauth",
             Self::CodexOauth { .. } => "codex_oauth",
             Self::DevinApiKey { .. } => "devin_api_key",
+            Self::AntigravityApiKey { .. } => "antigravity_api_key",
         };
         f.debug_struct("HarnessCredentialInput")
             .field("kind", &kind)
@@ -868,6 +880,7 @@ impl HarnessCredentialInput {
             | Self::ClaudeOauth { .. } => HarnessKind::ClaudeCode,
             Self::CodexApiKey { .. } | Self::CodexOauth { .. } => HarnessKind::Codex,
             Self::DevinApiKey { .. } => HarnessKind::Devin,
+            Self::AntigravityApiKey { .. } => HarnessKind::Antigravity,
         }
     }
 
@@ -876,9 +889,10 @@ impl HarnessCredentialInput {
     pub fn secret(&self) -> &str {
         match self {
             Self::ClaudeSetupToken { token } => token,
-            Self::ClaudeApiKey { key } | Self::CodexApiKey { key } | Self::DevinApiKey { key } => {
-                key
-            }
+            Self::ClaudeApiKey { key }
+            | Self::CodexApiKey { key }
+            | Self::DevinApiKey { key }
+            | Self::AntigravityApiKey { key } => key,
             Self::ClaudeOauth { access_token, .. } | Self::CodexOauth { access_token, .. } => {
                 access_token
             }
@@ -886,7 +900,7 @@ impl HarnessCredentialInput {
     }
 }
 
-/// Request to link a Claude Code, Codex, or Devin account.
+/// Request to link a Claude Code, Codex, Devin, or Antigravity account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LinkHarnessAccount {
     /// User-facing name that distinguishes this credential from another.
@@ -1241,6 +1255,10 @@ mod tests {
             );
             assert_eq!(row.codex, availability(HarnessKind::Codex, feature));
             assert_eq!(row.devin, availability(HarnessKind::Devin, feature));
+            assert_eq!(
+                row.antigravity,
+                availability(HarnessKind::Antigravity, feature)
+            );
         }
     }
 
@@ -1263,21 +1281,31 @@ mod tests {
                 availability(HarnessKind::Codex, feature),
                 Availability::Supported
             );
-            assert_eq!(
-                availability(HarnessKind::Devin, feature),
-                if feature == Feature::BackgroundTasks || feature == Feature::AutoMode {
-                    Availability::Supported
-                } else {
-                    Availability::Planned
-                }
-            );
+            for acp_harness in [HarnessKind::Devin, HarnessKind::Antigravity] {
+                assert_eq!(
+                    availability(acp_harness, feature),
+                    if feature == Feature::BackgroundTasks || feature == Feature::AutoMode {
+                        Availability::Supported
+                    } else {
+                        Availability::Planned
+                    }
+                );
+            }
         }
         assert_eq!(
             availability(HarnessKind::Codex, Feature::Advisor),
             Availability::NotApplicable
         );
         assert_eq!(
+            availability(HarnessKind::Antigravity, Feature::Advisor),
+            Availability::NotApplicable
+        );
+        assert_eq!(
             availability(HarnessKind::ClaudeCode, Feature::Skills),
+            Availability::Takeover
+        );
+        assert_eq!(
+            availability(HarnessKind::Antigravity, Feature::Mcp),
             Availability::Takeover
         );
         assert_eq!(
@@ -1296,6 +1324,7 @@ mod tests {
             HarnessKind::ClaudeCode,
             HarnessKind::Codex,
             HarnessKind::Devin,
+            HarnessKind::Antigravity,
         ] {
             let models = builtin_models(harness);
             assert!(!models.is_empty(), "{harness:?} lists no models");
@@ -1318,6 +1347,9 @@ mod tests {
         assert_eq!(claude.effort, None);
         let codex = ModelChoice::default_of(&builtin_models(HarnessKind::Codex));
         assert_eq!(codex.model, "gpt-5.6-terra");
+        let agy = ModelChoice::default_of(&builtin_models(HarnessKind::Antigravity));
+        assert_eq!(agy.model, "gemini-4-neon");
+        assert_eq!(agy.effort, None);
     }
 
     #[test]
