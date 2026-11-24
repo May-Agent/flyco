@@ -29,14 +29,14 @@ use skyzen::sql;
 use skyzen::utils::{Json, State};
 use skyzen_services::Db;
 
-use crate::anthropic::{ClaudeOauth as _, TokenRequest, TokenSet};
+use crate::anthropic::{AnthropicError, ClaudeOauth as _, TokenRequest, TokenSet};
 use crate::clock::now_unix;
 use crate::config::ApiConfig;
 use crate::devin::DevinApi as _;
 use crate::error::ApiError;
 use crate::extract::path_id;
 use crate::observations;
-use crate::openai::{self, CodexOauth as _, Grant};
+use crate::openai::{self, CodexOauth as _, Grant, OpenAiError};
 use crate::problem::Outcome;
 use crate::respond::{Created, NoContent};
 use crate::sessions;
@@ -346,7 +346,7 @@ pub async fn usage(
     user: UserId,
     harness: HarnessKind,
 ) -> Result<PlanUsage, ApiError> {
-    let Some(credential) = stored(db, config, user, harness).await? else {
+    let Some((prev_sealed, credential)) = stored_row(db, config, user, harness).await? else {
         return Ok(PlanUsage::Unmetered);
     };
 
@@ -371,7 +371,17 @@ pub async fn usage(
     // failed request — the account is still linked, and what it needs is
     // to be linked again, which the page can only say if it renders.
     let credential = if expiring_soon(&credential) {
-        match renewed(db, config, vendors, user, harness, &credential).await {
+        match renewed(
+            db,
+            config,
+            vendors,
+            user,
+            harness,
+            &prev_sealed,
+            &credential,
+        )
+        .await
+        {
             Ok(rotated) => rotated,
             Err(error) => {
                 tracing::warn!(%error, ?harness, "a grant could not be renewed to read the plan");
@@ -670,19 +680,15 @@ async fn link(
     store(db, config, vendors, user, &label, harness, &credential).await
 }
 
-/// The stored credential for one user's harness, or `None` if unlinked.
-///
-/// # Errors
-///
-/// Returns [`ApiError`] when the database read, authenticated decryption, or
-/// tagged credential decoding fails, or when the stored mode cannot
-/// authenticate the harness its row names.
-pub async fn stored(
+/// Reads both the raw sealed ciphertext and decoded credential for one user's
+/// harness so renewal writes can compare-and-swap on the exact row that was
+/// read.
+async fn stored_row(
     db: &Db,
     config: &ApiConfig,
     user: UserId,
     harness: HarnessKind,
-) -> Result<Option<StoredCredential>, ApiError> {
+) -> Result<Option<(String, StoredCredential)>, ApiError> {
     let sealed: Option<String> = sql!(
         db,
         "SELECT credential_enc FROM harness_accounts \
@@ -699,12 +705,30 @@ pub async fn stored(
         .map_err(|_| ApiError::CorruptRecord("a harness credential has an unknown encoding"))?;
 
     if credential.suits(harness) {
-        Ok(Some(credential))
+        Ok(Some((sealed, credential)))
     } else {
         Err(ApiError::CorruptRecord(
             "a harness credential is incompatible with its account",
         ))
     }
+}
+
+/// The stored credential for one user's harness, or `None` if unlinked.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] when the database read, authenticated decryption, or
+/// tagged credential decoding fails, or when the stored mode cannot
+/// authenticate the harness its row names.
+pub async fn stored(
+    db: &Db,
+    config: &ApiConfig,
+    user: UserId,
+    harness: HarnessKind,
+) -> Result<Option<StoredCredential>, ApiError> {
+    Ok(stored_row(db, config, user, harness)
+        .await?
+        .map(|(_, credential)| credential))
 }
 
 /// Credential provisioned for a user's selected harness.
@@ -731,12 +755,21 @@ pub async fn credential(
     user: UserId,
     harness: HarnessKind,
 ) -> Result<HarnessCredential, ApiError> {
-    let Some(credential) = stored(db, config, user, harness).await? else {
+    let Some((prev_sealed, credential)) = stored_row(db, config, user, harness).await? else {
         return Ok(HarnessCredential::inherit(harness));
     };
 
     let credential = if expiring_soon(&credential) {
-        renewed(db, config, vendors, user, harness, &credential).await?
+        renewed(
+            db,
+            config,
+            vendors,
+            user,
+            harness,
+            &prev_sealed,
+            &credential,
+        )
+        .await?
     } else {
         credential
     };
@@ -750,25 +783,43 @@ fn expiring_soon(credential: &StoredCredential) -> bool {
         .is_some_and(|at| at <= now_unix().saturating_add(REFRESH_WINDOW_SECONDS))
 }
 
-/// Redeems the refresh token of whichever grant this is.
+/// Redeems the refresh token of whichever grant this is, fencing the D1 write
+/// on `prev_sealed` so concurrent single-use refresh rotations never overwrite
+/// each other or falsely revoke a grant that another request already rotated.
 async fn renewed(
     db: &Db,
     config: &ApiConfig,
     vendors: &Vendors,
     user: UserId,
     harness: HarnessKind,
+    prev_sealed: &str,
     credential: &StoredCredential,
 ) -> Result<StoredCredential, ApiError> {
     let renewed = match credential {
         StoredCredential::ClaudeOauth { refresh_token, .. } => {
-            let tokens = vendors
+            let tokens = match vendors
                 .claude
                 .exchange(TokenRequest::RefreshToken {
                     refresh_token,
                     client_id: config.claude_oauth_client_id(),
                 })
                 .await
-                .map_err(ApiError::from)?;
+            {
+                Ok(tokens) => tokens,
+                Err(error @ AnthropicError::Rejected { .. }) => {
+                    // Refresh tokens rotate on redemption: a refusal after the
+                    // row moved means a racing request already redeemed it and
+                    // wrote the new grant.
+                    if let Some((current_sealed, current)) =
+                        stored_row(db, config, user, harness).await?
+                        && current_sealed != prev_sealed
+                    {
+                        return Ok(current);
+                    }
+                    return Err(ApiError::from(error));
+                }
+                Err(error) => return Err(ApiError::from(error)),
+            };
             tracing::info!("refreshed a Claude OAuth grant before using it");
             StoredCredential::from_tokens(&tokens, now_unix())
         }
@@ -776,15 +827,26 @@ async fn renewed(
             let previous = credential
                 .grant()
                 .ok_or(ApiError::CorruptRecord("a ChatGPT grant lost its tokens"))?;
-            let rotated = vendors
+            let rotated = match vendors
                 .codex
                 .exchange(openai::TokenRequest::RefreshToken {
                     refresh_token,
                     client_id: config.codex_oauth_client_id(),
                 })
                 .await
-                .map_err(ApiError::from)?
-                .rotated(&previous);
+            {
+                Ok(tokens) => tokens.rotated(&previous),
+                Err(error @ OpenAiError::Rejected { .. }) => {
+                    if let Some((current_sealed, current)) =
+                        stored_row(db, config, user, harness).await?
+                        && current_sealed != prev_sealed
+                    {
+                        return Ok(current);
+                    }
+                    return Err(ApiError::from(error));
+                }
+                Err(error) => return Err(ApiError::from(error)),
+            };
             tracing::info!("refreshed a ChatGPT grant before using it");
             StoredCredential::from_grant(&rotated)?
         }
@@ -798,14 +860,24 @@ async fn renewed(
 
     let sealed = seal(config, &renewed)?;
     let expires_at_unix = renewed.expires_at_unix();
-    sql!(
+    let written = sql!(
         db,
         "UPDATE harness_accounts \
          SET credential_enc = {sealed}, expires_at_unix = {expires_at_unix} \
-         WHERE user_id = {user} AND harness = {harness}"
+         WHERE user_id = {user} AND harness = {harness} AND credential_enc = {prev_sealed}"
     )
     .execute()
-    .await?;
+    .await?
+    .rows_written;
+    if written == 0 {
+        // The row changed while our exchange was in flight: another request
+        // (or a relink) persisted a newer grant first, so return what D1 holds
+        // rather than overwriting it.
+        if let Some((_, current)) = stored_row(db, config, user, harness).await? {
+            return Ok(current);
+        }
+        return Err(ApiError::HarnessAccountNotFound);
+    }
 
     Ok(renewed)
 }
@@ -877,4 +949,206 @@ pub fn routes() -> Vec<RouteNode> {
         "/v1/usage/llm".at(llm_usage),
     ))
     .into_route_nodes()
+}
+
+#[cfg(test)]
+mod cas_tests {
+    use flyco_core::HarnessKind;
+    use skyzen_services::Db;
+
+    use crate::clock::now_unix;
+    use crate::harness_accounts::{StoredCredential, renewed, seal, store, stored_row};
+    use crate::testing::{
+        CLAUDE_ACCESS_TOKEN, CLAUDE_REFRESH_TOKEN, CODEX_ACCOUNT_ID, CODEX_ID_TOKEN,
+        CODEX_REFRESH_TOKEN, CODEX_RENEWED_ACCESS_TOKEN, CODEX_RENEWED_REFRESH_TOKEN,
+        CODEX_RENEWED_TOKEN_EXPIRY, CodexBehaviour, TestCodex, migrate, seed_user, test_config,
+        test_vendors,
+    };
+    use crate::vendors::Vendors;
+
+    #[skyzen::test]
+    async fn claude_refresh_cas_and_reload_never_overwrite_a_racing_rotation(db: Db) {
+        migrate(&db).await;
+        let user = seed_user(&db).await;
+        let config = test_config();
+        let vendors = test_vendors();
+
+        // Store an expiring Claude OAuth grant.
+        let initial = StoredCredential::ClaudeOauth {
+            access_token: CLAUDE_ACCESS_TOKEN.to_owned(),
+            refresh_token: CLAUDE_REFRESH_TOKEN.to_owned(),
+            expires_at_unix: now_unix().saturating_sub(10),
+        };
+        store(
+            &db,
+            &config,
+            &vendors,
+            user.id,
+            "Claude",
+            HarnessKind::ClaudeCode,
+            &initial,
+        )
+        .await
+        .expect("store initial grant");
+        let (stale_sealed, _) = stored_row(&db, &config, user.id, HarnessKind::ClaudeCode)
+            .await
+            .expect("read initial")
+            .expect("row exists");
+
+        // Simulate another worker rotating the row first.
+        let winning = StoredCredential::ClaudeOauth {
+            access_token: "sk-ant-oat01-winning-rotation".to_owned(),
+            refresh_token: "sk-ant-ort01-winning-rotation".to_owned(),
+            expires_at_unix: now_unix() + 28_800,
+        };
+        store(
+            &db,
+            &config,
+            &vendors,
+            user.id,
+            "Claude",
+            HarnessKind::ClaudeCode,
+            &winning,
+        )
+        .await
+        .expect("simulate racing rotation");
+
+        // Case 1: Vendor exchange succeeded, but CAS sees `credential_enc` moved
+        // — must return the winning row without overwriting D1.
+        let cas_result = renewed(
+            &db,
+            &config,
+            &vendors,
+            user.id,
+            HarnessKind::ClaudeCode,
+            &stale_sealed,
+            &initial,
+        )
+        .await
+        .expect("CAS miss reloads winning grant");
+        assert_eq!(cas_result, winning);
+
+        // Case 2: Vendor rejects the already-spent single-use refresh token,
+        // and D1 holds a newer `credential_enc` — must reload and return it.
+        let spent = StoredCredential::ClaudeOauth {
+            access_token: CLAUDE_ACCESS_TOKEN.to_owned(),
+            refresh_token: "sk-ant-ort01-already-spent".to_owned(),
+            expires_at_unix: now_unix().saturating_sub(10),
+        };
+        let reload_result = renewed(
+            &db,
+            &config,
+            &vendors,
+            user.id,
+            HarnessKind::ClaudeCode,
+            &stale_sealed,
+            &spent,
+        )
+        .await
+        .expect("rejection after row moved reloads winning grant");
+        assert_eq!(reload_result, winning);
+
+        // Case 3: Vendor rejects AND D1 row has NOT changed — genuine revocation
+        // propagates as an error.
+        let (current_sealed, _) = stored_row(&db, &config, user.id, HarnessKind::ClaudeCode)
+            .await
+            .expect("read current")
+            .expect("row exists");
+        let revoked = renewed(
+            &db,
+            &config,
+            &vendors,
+            user.id,
+            HarnessKind::ClaudeCode,
+            &current_sealed,
+            &spent,
+        )
+        .await;
+        assert!(
+            revoked.is_err(),
+            "a vendor refusal on an unchanged row must surface as an error"
+        );
+    }
+
+    #[skyzen::test]
+    async fn codex_refresh_cas_and_reload_handle_racing_rotations(db: Db) {
+        migrate(&db).await;
+        let user = seed_user(&db).await;
+        let config = test_config();
+        let vendors = test_vendors();
+
+        let initial = StoredCredential::CodexOauth {
+            id_token: CODEX_ID_TOKEN.to_owned(),
+            access_token: crate::testing::CODEX_ACCESS_TOKEN.to_owned(),
+            refresh_token: CODEX_REFRESH_TOKEN.to_owned(),
+            account_id: CODEX_ACCOUNT_ID.to_owned(),
+            expires_at_unix: now_unix().saturating_sub(10),
+        };
+        store(
+            &db,
+            &config,
+            &vendors,
+            user.id,
+            "Codex",
+            HarnessKind::Codex,
+            &initial,
+        )
+        .await
+        .expect("store initial codex grant");
+        let stale_sealed = seal(&config, &initial).expect("seal stale");
+
+        // Racing worker stores a newer rotated grant.
+        let winning = StoredCredential::CodexOauth {
+            id_token: CODEX_ID_TOKEN.to_owned(),
+            access_token: CODEX_RENEWED_ACCESS_TOKEN.to_owned(),
+            refresh_token: CODEX_RENEWED_REFRESH_TOKEN.to_owned(),
+            account_id: CODEX_ACCOUNT_ID.to_owned(),
+            expires_at_unix: CODEX_RENEWED_TOKEN_EXPIRY,
+        };
+        store(
+            &db,
+            &config,
+            &vendors,
+            user.id,
+            "Codex",
+            HarnessKind::Codex,
+            &winning,
+        )
+        .await
+        .expect("store winning codex grant");
+
+        // CAS miss reloads winning row.
+        let cas_result = renewed(
+            &db,
+            &config,
+            &vendors,
+            user.id,
+            HarnessKind::Codex,
+            &stale_sealed,
+            &initial,
+        )
+        .await
+        .expect("codex CAS miss reloads winning grant");
+        assert_eq!(cas_result, winning);
+
+        // Vendor refusal after row moved reloads winning row.
+        let refusing_vendors = Vendors {
+            codex: crate::openai::CodexClient::Fake(TestCodex {
+                behaviour: CodexBehaviour::Refused,
+            }),
+            ..test_vendors()
+        };
+        let reload_result = renewed(
+            &db,
+            &config,
+            &refusing_vendors,
+            user.id,
+            HarnessKind::Codex,
+            &stale_sealed,
+            &initial,
+        )
+        .await
+        .expect("codex refusal after row moved reloads winning grant");
+        assert_eq!(reload_result, winning);
+    }
 }

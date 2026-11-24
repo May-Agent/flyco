@@ -2,7 +2,7 @@
 
 use core::any::TypeId;
 
-use flyco_core::{CurrentUser, SessionId};
+use flyco_core::{CurrentUser, HostId, SessionId};
 use skyzen::middleware::Next;
 use skyzen::middleware::auth::Authenticator;
 use skyzen::routing::Params;
@@ -13,6 +13,7 @@ use skyzen_services::Db;
 use crate::daemon_tokens;
 use crate::error::ApiError;
 use crate::extract::Headers;
+use crate::hosts;
 
 /// Refuses a request that carries no valid credential.
 ///
@@ -130,6 +131,85 @@ impl Middleware for RequireDaemon {
 
     fn provisions(&self) -> Vec<TypeId> {
         vec![TypeId::of::<State<DaemonSession>>()]
+    }
+}
+
+/// The enrolled host a host-scoped request is acting for.
+///
+/// Injected by [`RequireHost`] as request state, so both host handlers and
+/// [`crate::request_budget::RequestBudget`] consume a verified identity rather
+/// than trusting a token prefix or unverified path parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthenticatedHost(pub HostId);
+
+/// Refuses a request that does not carry the host token of the host in its
+/// path.
+///
+/// The host counterpart of [`RequireDaemon`]: an `fh_` token resolves to the
+/// single enrolled machine named by `{id}` and never widens into a user or
+/// session identity.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RequireHost;
+
+impl RequireHost {
+    /// Creates the middleware.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Resolves the host a host-scoped request may act on.
+    async fn authorize(request: &Request) -> Result<HostId, ApiError> {
+        // Read rather than extract: `Params::extract` removes the map, and
+        // downstream handlers (such as `hosts::report_job_result`) still read
+        // path parameters.
+        let raw = request
+            .extensions()
+            .get::<Params>()
+            .ok_or(ApiError::CorruptRecord(
+                "a host route ran without its path parameters",
+            ))?
+            .get("id")
+            .map_err(|_| ApiError::CorruptRecord("a host route bound no host id"))?
+            .to_owned();
+        let host: HostId = raw
+            .parse()
+            .map_err(|_| ApiError::MalformedId(raw.clone()))?;
+
+        let presented = Headers::new(request.headers().clone())
+            .bearer()
+            .ok_or(ApiError::MissingCredential)?
+            .to_owned();
+
+        let db = request
+            .extensions()
+            .get::<Db>()
+            .cloned()
+            .ok_or(ApiError::ServiceMissing("main"))?;
+
+        if hosts::authenticates(&db, host, &presented).await? {
+            Ok(host)
+        } else {
+            Err(ApiError::InvalidHostCredential)
+        }
+    }
+}
+
+impl Middleware for RequireHost {
+    async fn handle(&self, request: &mut Request, next: Next<'_>) -> Result<Response, Error> {
+        match Self::authorize(request).await {
+            Ok(host) => {
+                request
+                    .extensions_mut()
+                    .insert(State(AuthenticatedHost(host)));
+                next.run(request).await
+            }
+            Err(error) => Ok(error.into_response()),
+        }
+    }
+
+    fn provisions(&self) -> Vec<TypeId> {
+        vec![TypeId::of::<State<AuthenticatedHost>>()]
     }
 }
 

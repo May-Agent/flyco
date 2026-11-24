@@ -23,11 +23,14 @@ use skyzen::utils::{Json, State};
 use skyzen_services::{Db, Kv, Queue};
 
 use crate::clock::now_unix;
+use crate::config::ApiConfig;
 use crate::error::ApiError;
 use crate::extract::path_id;
+use crate::github::{GithubCall, GithubClient, GithubError, GithubOauth as _};
 use crate::problem::Outcome;
 use crate::respond::{Created, NoContent};
 use crate::skill_catalog;
+use crate::users;
 
 /// The longest ref flyco will pin a marketplace to.
 ///
@@ -58,6 +61,13 @@ impl Marketplace {
                 .expect("the built-in marketplace is a literal slug"),
             git_ref: None,
         }
+    }
+
+    /// Whether this entry names the shared built-in marketplace rather than a
+    /// user-added repository.
+    #[must_use]
+    pub fn is_built_in(&self) -> bool {
+        self.repo.as_str() == BUILT_IN_MARKETPLACE && self.git_ref.is_none()
     }
 }
 
@@ -172,18 +182,25 @@ pub async fn all(db: &Db, user: UserId) -> Result<Vec<Marketplace>, ApiError> {
 #[skyzen::openapi]
 async fn add_marketplace(
     State(user): State<CurrentUser>,
+    State(config): State<ApiConfig>,
+    State(github): State<GithubClient>,
     Json(request): Json<AddMarketplace>,
     db: Db,
     kv: Kv,
     queue: Queue,
 ) -> Outcome<Created<Json<MarketplaceView>>> {
-    add(&db, &kv, &queue, user.id, request)
+    add(&db, &config, &github, &kv, &queue, user.id, request)
         .await
         .map(|view| Created(Json(view)))
         .into()
 }
 
-/// Inserts the row, then asks the queue to read the repository.
+/// Verifies GitHub read access, inserts the row, then asks the queue to read
+/// the repository.
+///
+/// Costs 1 D1 read (user's GitHub grant), 1 GitHub subrequest (`GET /repos/{slug}`
+/// to verify read access), 1 D1 write (`marketplaces` insert), 1 KV read + 1 KV
+/// write (refresh claim), and 1 queue send.
 ///
 /// The read is asked for here rather than left to the first catalog request
 /// so that a marketplace added now is listed by the time the user looks:
@@ -191,12 +208,30 @@ async fn add_marketplace(
 /// request does.
 async fn add(
     db: &Db,
+    config: &ApiConfig,
+    github: &GithubClient,
     kv: &Kv,
     queue: &Queue,
     user: UserId,
     request: AddMarketplace,
 ) -> Result<MarketplaceView, ApiError> {
     let (repo, git_ref) = checked(&request)?;
+
+    // Verify the caller's GitHub account can actually read the repository
+    // before storing it or queuing a catalog refresh.
+    let token = users::github_token(db, config, github, user).await?;
+    github
+        .get_repo(&token, &repo)
+        .await
+        .map_err(|error| match error {
+            GithubError::Status {
+                call: GithubCall::Repository,
+                status: 401 | 403 | 404,
+                ..
+            } => ApiError::InvalidMarketplace("your GitHub account cannot read this repository"),
+            other => ApiError::from(other),
+        })?;
+
     let slug = repo.to_string();
     let row: Option<MarketplaceRow> = sql!(
         db,

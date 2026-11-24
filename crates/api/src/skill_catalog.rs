@@ -42,7 +42,7 @@ use crate::clock::now_unix;
 use crate::config::ApiConfig;
 use crate::error::ApiError;
 use crate::expiring;
-use crate::github::{GithubClient, GithubOauth, GithubToken, TreeListing};
+use crate::github::{GithubClient, GithubError, GithubOauth, GithubToken, TreeListing};
 use crate::marketplaces::{self, Marketplace};
 use crate::problem::Outcome;
 use crate::provisioning_queue::{self, ProvisioningJob};
@@ -69,10 +69,17 @@ const REFRESH_CLAIM_SECONDS: u64 = 10 * 60;
 
 /// The most files one skill directory may hold.
 ///
-/// Each one is a GitHub call, and a Worker's subrequest budget is what this
-/// protects; a skill is instructions and a few scripts, never two hundred
-/// files.
-const MAX_SKILL_FILES: usize = 200;
+/// Cloudflare Workers caps each invocation at 50 subrequests. Bundling a skill
+/// costs 1 `read_tree` plus 1 `read_file` per file (plus up to 1 token refresh
+/// and storage operations), so 40 files keeps every install strictly below the
+/// 50-subrequest ceiling.
+pub const MAX_SKILL_FILES: usize = 40;
+
+/// Hard ceiling on GitHub API subrequests during one marketplace refresh.
+///
+/// Cloudflare Workers caps each invocation at 50 subrequests; reserving 5 for
+/// token refresh, KV writes, and queue overhead leaves 45 for GitHub calls.
+pub const MAX_MARKETPLACE_SUBREQUESTS: usize = 45;
 
 /// The file that makes a directory a skill.
 const SKILL_FILE: &str = "SKILL.md";
@@ -124,8 +131,8 @@ struct StoredSkill {
 /// The document shape this build writes and accepts.
 const DOCUMENT_VERSION: u32 = 1;
 
-/// The KV key one marketplace's document lives under.
-fn document_key(marketplace: &Marketplace) -> String {
+/// The KV key the shared built-in marketplace document lives under.
+fn shared_document_key(marketplace: &Marketplace) -> String {
     format!(
         "skill-catalog:{}@{}",
         marketplace.repo,
@@ -133,8 +140,31 @@ fn document_key(marketplace: &Marketplace) -> String {
     )
 }
 
-/// The key that says a read is already on its way.
-fn claim_key(marketplace: &Marketplace) -> String {
+/// The KV key a user-scoped marketplace document lives under.
+///
+/// User-added marketplaces may be private repositories, so their cached
+/// metadata is isolated per user rather than shared globally. Per-user auth
+/// failures on the built-in marketplace also land here so one user's revoked
+/// token can never poison the shared built-in cache.
+fn user_document_key(user: UserId, marketplace: &Marketplace) -> String {
+    format!(
+        "skill-catalog:u:{user}:{}@{}",
+        marketplace.repo,
+        marketplace.git_ref.as_deref().unwrap_or("default")
+    )
+}
+
+/// The primary KV key one marketplace's document lives under for `user`.
+fn document_key(user: UserId, marketplace: &Marketplace) -> String {
+    if marketplace.is_built_in() {
+        shared_document_key(marketplace)
+    } else {
+        user_document_key(user, marketplace)
+    }
+}
+
+/// The key that says a shared built-in read is already on its way.
+fn shared_claim_key(marketplace: &Marketplace) -> String {
     format!(
         "skill-catalog-refresh:{}@{}",
         marketplace.repo,
@@ -142,13 +172,38 @@ fn claim_key(marketplace: &Marketplace) -> String {
     )
 }
 
-/// Reads one marketplace's document, if it is there and still current.
+/// The key that says a read for `user`'s marketplace is already on its way.
+fn claim_key(user: UserId, marketplace: &Marketplace) -> String {
+    if marketplace.is_built_in() {
+        shared_claim_key(marketplace)
+    } else {
+        format!(
+            "skill-catalog-refresh:u:{user}:{}@{}",
+            marketplace.repo,
+            marketplace.git_ref.as_deref().unwrap_or("default")
+        )
+    }
+}
+
+/// Reads one marketplace's document for `user`, if it is there and still current.
 async fn read_document(
     kv: &Kv,
+    user: UserId,
     marketplace: &Marketplace,
 ) -> Result<Option<MarketplaceDocument>, ApiError> {
+    if marketplace.is_built_in() {
+        let shared: Option<MarketplaceDocument> =
+            expiring::get(kv, &shared_document_key(marketplace)).await?;
+        if let Some(document) = shared.filter(|document| document.version == DOCUMENT_VERSION) {
+            return Ok(Some(document));
+        }
+        let personal: Option<MarketplaceDocument> =
+            expiring::get(kv, &user_document_key(user, marketplace)).await?;
+        return Ok(personal.filter(|document| document.version == DOCUMENT_VERSION));
+    }
+
     let document: Option<MarketplaceDocument> =
-        expiring::get(kv, &document_key(marketplace)).await?;
+        expiring::get(kv, &user_document_key(user, marketplace)).await?;
     Ok(document.filter(|document| document.version == DOCUMENT_VERSION))
 }
 
@@ -167,7 +222,7 @@ pub async fn ask_for_refresh(
     user: UserId,
     marketplace: &Marketplace,
 ) -> Result<bool, ApiError> {
-    let key = claim_key(marketplace);
+    let key = claim_key(user, marketplace);
     if expiring::get::<()>(kv, &key).await?.is_some() {
         return Ok(false);
     }
@@ -444,12 +499,57 @@ fn frontmatter_description(body: &str) -> String {
     String::new()
 }
 
+/// Tracks remaining GitHub subrequests within a single marketplace refresh.
+#[derive(Debug)]
+struct SubrequestBudget {
+    remaining: usize,
+}
+
+impl SubrequestBudget {
+    const fn new(limit: usize) -> Self {
+        Self { remaining: limit }
+    }
+
+    const fn try_spend(&mut self) -> bool {
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
+
+/// Distinguishes per-user authentication failures from repository/manifest
+/// failures so an unauthorized or revoked caller never poisons the shared
+/// built-in cache.
+#[derive(Debug)]
+enum ReadError {
+    Auth(String),
+    Marketplace(String),
+}
+
+impl ReadError {
+    fn from_github(error: GithubError) -> Self {
+        match error {
+            GithubError::Status {
+                status: 401 | 403, ..
+            } => Self::Auth(error.to_string()),
+            other => Self::Marketplace(other.to_string()),
+        }
+    }
+}
+
 /// Reads one marketplace and writes its document.
 ///
 /// The queue's side of the catalog. Every failure is recorded *in* the
 /// document rather than returned: "read, and GitHub refused" is an answer
 /// the picker shows, and a job that failed instead would be redelivered
 /// against a repository that is still not readable.
+///
+/// User-added marketplaces always write to user-scoped KV keys. For the shared
+/// built-in marketplace, a per-user authentication failure is written only to
+/// that user's private failure key (and releases the shared refresh claim) so
+/// one user's revoked token never poisons other users.
 ///
 /// # Errors
 ///
@@ -464,11 +564,38 @@ pub async fn refresh(
     marketplace: &Marketplace,
 ) -> Result<(), ApiError> {
     let read = read_marketplace(db, config, github, user, marketplace).await;
-    let (skills, failure, ttl) = match read {
-        Ok(skills) => (skills, None, TTL_SECONDS),
-        Err(refusal) => {
+    let (target_key, skills, failure, ttl, release_shared_claim) = match read {
+        Ok(skills) => (
+            document_key(user, marketplace),
+            skills,
+            None,
+            TTL_SECONDS,
+            false,
+        ),
+        Err(ReadError::Auth(refusal)) => {
+            tracing::warn!(
+                repo = %marketplace.repo,
+                %user,
+                %refusal,
+                "could not authenticate to read a marketplace"
+            );
+            (
+                user_document_key(user, marketplace),
+                Vec::new(),
+                Some(refusal),
+                FAILURE_TTL_SECONDS,
+                marketplace.is_built_in(),
+            )
+        }
+        Err(ReadError::Marketplace(refusal)) => {
             tracing::warn!(repo = %marketplace.repo, %refusal, "could not read a marketplace");
-            (Vec::new(), Some(refusal), FAILURE_TTL_SECONDS)
+            (
+                document_key(user, marketplace),
+                Vec::new(),
+                Some(refusal),
+                FAILURE_TTL_SECONDS,
+                false,
+            )
         }
     };
     let document = MarketplaceDocument {
@@ -477,7 +604,10 @@ pub async fn refresh(
         skills,
         failure,
     };
-    expiring::put(kv, &document_key(marketplace), &document, ttl).await?;
+    expiring::put(kv, &target_key, &document, ttl).await?;
+    if release_shared_claim {
+        let _ = expiring::take::<()>(kv, &shared_claim_key(marketplace)).await?;
+    }
     tracing::info!(
         repo = %marketplace.repo,
         skills = document.skills.len(),
@@ -487,43 +617,74 @@ pub async fn refresh(
     Ok(())
 }
 
-/// What a marketplace offers, or a sentence saying why flyco cannot tell.
+/// What a marketplace offers, or why flyco cannot read it.
 async fn read_marketplace(
     db: &Db,
     config: &ApiConfig,
     github: &impl GithubOauth,
     user: UserId,
     marketplace: &Marketplace,
-) -> Result<Vec<StoredSkill>, String> {
+) -> Result<Vec<StoredSkill>, ReadError> {
     let token = users::github_token(db, config, github, user)
         .await
-        .map_err(|error| error.to_string())?;
-    let git_ref = resolve_ref(github, &token, marketplace)
-        .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| ReadError::Auth(error.to_string()))?;
 
+    let mut budget = SubrequestBudget::new(MAX_MARKETPLACE_SUBREQUESTS);
+
+    // Always verify repository access with the caller's token, even when a ref
+    // is pinned, so private/unreadable repositories fail fast on access check.
+    if !budget.try_spend() {
+        return Err(ReadError::Marketplace(
+            "marketplace subrequest budget exhausted".to_owned(),
+        ));
+    }
+    let repo_info = github
+        .get_repo(&token, &marketplace.repo)
+        .await
+        .map_err(ReadError::from_github)?;
+    let git_ref = marketplace
+        .git_ref
+        .clone()
+        .unwrap_or_else(|| repo_info.default_branch.to_string());
+
+    if !budget.try_spend() {
+        return Err(ReadError::Marketplace(
+            "marketplace subrequest budget exhausted".to_owned(),
+        ));
+    }
     let tree = github
         .read_tree(&token, &marketplace.repo, &git_ref)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(ReadError::from_github)?;
     if tree.truncated {
-        return Err(format!(
+        return Err(ReadError::Marketplace(format!(
             "{} is too large for flyco to read as a marketplace",
             marketplace.repo
-        ));
+        )));
     }
 
+    if !budget.try_spend() {
+        return Err(ReadError::Marketplace(
+            "marketplace subrequest budget exhausted".to_owned(),
+        ));
+    }
     let manifest = github
         .read_file(&token, &marketplace.repo, &git_ref, MANIFEST_PATH)
         .await
-        .map_err(|_| {
-            format!(
+        .map_err(|error| match error {
+            GithubError::Status {
+                status: 401 | 403, ..
+            } => ReadError::Auth(error.to_string()),
+            _ => ReadError::Marketplace(format!(
                 "{} has no {MANIFEST_PATH}, so it is not a plugin marketplace",
                 marketplace.repo
-            )
+            )),
         })?;
-    let manifest: Manifest = serde_json::from_slice(&manifest)
-        .map_err(|error| format!("{MANIFEST_PATH} is not a marketplace manifest: {error}"))?;
+    let manifest: Manifest = serde_json::from_slice(&manifest).map_err(|error| {
+        ReadError::Marketplace(format!(
+            "{MANIFEST_PATH} is not a marketplace manifest: {error}"
+        ))
+    })?;
 
     // One tree per repository the manifest reaches into, read once and
     // shared by every plugin that points at it.
@@ -532,74 +693,24 @@ async fn read_marketplace(
     let plugin_root = manifest.metadata.plugin_root.clone();
 
     let mut skills: Vec<StoredSkill> = Vec::new();
+    let mut description_budget_warned = false;
     for plugin in &manifest.plugins {
         let Some(source) = plugin_source(plugin, plugin_root.as_deref(), &marketplace.repo) else {
             continue;
         };
-        let source_ref = match &source.git_ref {
-            Some(pinned) => pinned.clone(),
-            None if source.repo == marketplace.repo => git_ref.clone(),
-            None => match github.get_repo(&token, &source.repo).await {
-                Ok(repo) => repo.default_branch.to_string(),
-                Err(error) => {
-                    // One plugin flyco cannot open is not a marketplace it
-                    // cannot read: the rest of them still have skills.
-                    tracing::warn!(repo = %source.repo, %error, "skipped a plugin's repository");
-                    continue;
-                }
-            },
-        };
-
-        let key = format!("{}@{source_ref}", source.repo);
-        if !trees.iter().any(|(known, _)| *known == key) {
-            match github.read_tree(&token, &source.repo, &source_ref).await {
-                Ok(listing) if !listing.truncated => trees.push((key.clone(), listing)),
-                Ok(_) => {
-                    tracing::warn!(repo = %source.repo, "skipped a plugin repository too large to read");
-                    continue;
-                }
-                Err(error) => {
-                    tracing::warn!(repo = %source.repo, %error, "skipped a plugin's repository");
-                    continue;
-                }
-            }
-        }
-        let listing = trees
-            .iter()
-            .find(|(known, _)| *known == key)
-            .map(|(_, listing)| listing)
-            .expect("the tree was just read or already held");
-
-        for path in skill_paths(plugin, &source.root, listing) {
-            let marker = format!("{path}/{SKILL_FILE}");
-            if !listing
-                .entries
-                .iter()
-                .any(|entry| entry.is_file && entry.path == marker)
-            {
-                continue;
-            }
-            let Some(name) = path.rsplit('/').next().map(ToOwned::to_owned) else {
-                continue;
-            };
-            // The name becomes a directory on the machine, so a skill flyco
-            // could not install is not offered.
-            if skills::checked_name(&name).is_err() {
-                continue;
-            }
-            let body = github
-                .read_file(&token, &source.repo, &source_ref, &marker)
-                .await
-                .map_err(|error| error.to_string())?;
-            skills.push(StoredSkill {
-                plugin: plugin.name.clone(),
-                name,
-                description: frontmatter_description(&String::from_utf8_lossy(&body)),
-                repo: source.repo.to_string(),
-                git_ref: source_ref.clone(),
-                path,
-            });
-        }
+        collect_plugin_skills(
+            github,
+            &token,
+            marketplace,
+            &git_ref,
+            plugin,
+            &source,
+            &mut trees,
+            &mut budget,
+            &mut description_budget_warned,
+            &mut skills,
+        )
+        .await?;
     }
     // By name, not by the plugin that happens to carry it: the picker
     // lists a marketplace's skills, and which plugin groups them is
@@ -609,21 +720,118 @@ async fn read_marketplace(
     Ok(skills)
 }
 
-/// The ref a marketplace is read at: the one pinned, else the repository's
-/// default branch.
-async fn resolve_ref(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "reading one plugin shares the marketplace tree cache and subrequest budget"
+)]
+async fn collect_plugin_skills(
     github: &impl GithubOauth,
     token: &GithubToken,
     marketplace: &Marketplace,
-) -> Result<String, ApiError> {
-    match &marketplace.git_ref {
-        Some(pinned) => Ok(pinned.clone()),
-        None => Ok(github
-            .get_repo(token, &marketplace.repo)
-            .await?
-            .default_branch
-            .to_string()),
+    git_ref: &str,
+    plugin: &ManifestPlugin,
+    source: &PluginSource,
+    trees: &mut Vec<(String, TreeListing)>,
+    budget: &mut SubrequestBudget,
+    description_budget_warned: &mut bool,
+    skills: &mut Vec<StoredSkill>,
+) -> Result<(), ReadError> {
+    let source_ref = match &source.git_ref {
+        Some(pinned) => pinned.clone(),
+        None if source.repo == marketplace.repo => git_ref.to_owned(),
+        None => {
+            if !budget.try_spend() {
+                tracing::warn!(
+                    repo = %source.repo,
+                    limit = MAX_MARKETPLACE_SUBREQUESTS,
+                    "skipped an external plugin repository after reaching the subrequest ceiling"
+                );
+                return Ok(());
+            }
+            match github.get_repo(token, &source.repo).await {
+                Ok(repo) => repo.default_branch.to_string(),
+                Err(error) => {
+                    // One plugin flyco cannot open is not a marketplace it
+                    // cannot read: the rest of them still have skills.
+                    tracing::warn!(repo = %source.repo, %error, "skipped a plugin's repository");
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    let key = format!("{}@{source_ref}", source.repo);
+    if !trees.iter().any(|(known, _)| *known == key) {
+        if !budget.try_spend() {
+            tracing::warn!(
+                repo = %source.repo,
+                limit = MAX_MARKETPLACE_SUBREQUESTS,
+                "skipped reading an external plugin tree after reaching the subrequest ceiling"
+            );
+            return Ok(());
+        }
+        match github.read_tree(token, &source.repo, &source_ref).await {
+            Ok(listing) if !listing.truncated => trees.push((key.clone(), listing)),
+            Ok(_) => {
+                tracing::warn!(repo = %source.repo, "skipped a plugin repository too large to read");
+                return Ok(());
+            }
+            Err(error) => {
+                tracing::warn!(repo = %source.repo, %error, "skipped a plugin's repository");
+                return Ok(());
+            }
+        }
     }
+    let listing = trees
+        .iter()
+        .find(|(known, _)| *known == key)
+        .map(|(_, listing)| listing)
+        .expect("the tree was just read or already held");
+
+    for path in skill_paths(plugin, &source.root, listing) {
+        let marker = format!("{path}/{SKILL_FILE}");
+        if !listing
+            .entries
+            .iter()
+            .any(|entry| entry.is_file && entry.path == marker)
+        {
+            continue;
+        }
+        let Some(name) = path.rsplit('/').next().map(ToOwned::to_owned) else {
+            continue;
+        };
+        // The name becomes a directory on the machine, so a skill flyco
+        // could not install is not offered.
+        if skills::checked_name(&name).is_err() {
+            continue;
+        }
+        let description = if budget.try_spend() {
+            let body = github
+                .read_file(token, &source.repo, &source_ref, &marker)
+                .await
+                .map_err(ReadError::from_github)?;
+            frontmatter_description(&String::from_utf8_lossy(&body))
+        } else {
+            if !*description_budget_warned {
+                *description_budget_warned = true;
+                tracing::warn!(
+                    repo = %marketplace.repo,
+                    limit = MAX_MARKETPLACE_SUBREQUESTS,
+                    "omitted remaining skill descriptions after reaching the subrequest ceiling"
+                );
+            }
+            String::new()
+        };
+        skills.push(StoredSkill {
+            plugin: plugin.name.clone(),
+            name,
+            description,
+            repo: source.repo.to_string(),
+            git_ref: source_ref.clone(),
+            path,
+        });
+    }
+    Ok(())
 }
 
 // ── Routes ──
@@ -653,7 +861,7 @@ async fn catalog(db: &Db, kv: &Kv, queue: &Queue, user: UserId) -> Result<SkillC
     };
     for marketplace in marketplaces::all(db, user).await? {
         let repo = marketplace.repo.to_string();
-        let Some(document) = read_document(kv, &marketplace).await? else {
+        let Some(document) = read_document(kv, user, &marketplace).await? else {
             ask_for_refresh(kv, queue, user, &marketplace).await?;
             catalog.pending.push(repo);
             continue;
@@ -709,12 +917,11 @@ async fn install(
         .into_iter()
         .find(|candidate| candidate.repo.to_string() == request.marketplace.trim())
         .ok_or(ApiError::MarketplaceNotFound)?;
-    let document =
-        read_document(kv, &marketplace)
-            .await?
-            .ok_or_else(|| ApiError::SkillCatalogNotReady {
-                repo: marketplace.repo.to_string(),
-            })?;
+    let document = read_document(kv, user, &marketplace)
+        .await?
+        .ok_or_else(|| ApiError::SkillCatalogNotReady {
+            repo: marketplace.repo.to_string(),
+        })?;
     let skill = document
         .skills
         .iter()
@@ -772,7 +979,7 @@ async fn bundle(
         });
     }
     if files.len() > MAX_SKILL_FILES {
-        return Err(ApiError::InvalidSkill("a skill may hold at most 200 files"));
+        return Err(ApiError::InvalidSkill("a skill may hold at most 40 files"));
     }
     let total: u64 = files.iter().map(|entry| entry.size).sum();
     if total > skills::MAX_BUNDLE_BYTES as u64 {
@@ -786,6 +993,17 @@ async fn bundle(
         bodies.insert(relative, body);
     }
     write_archive(&bodies)
+}
+
+#[cfg(test)]
+pub(crate) async fn bundle_for_test(
+    github: &impl GithubOauth,
+    token: &GithubToken,
+    repo: &RepoSlug,
+    git_ref: &str,
+    path: &str,
+) -> Result<Vec<u8>, ApiError> {
+    bundle(github, token, repo, git_ref, path).await
 }
 
 /// Packs the files into a stored (uncompressed) zip.

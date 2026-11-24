@@ -236,3 +236,172 @@ async fn a_credential_that_does_not_resolve_spends_the_address_not_a_user(
         2
     );
 }
+
+#[skyzen::test]
+async fn rotating_fake_bearer_prefixes_cannot_bypass_ip_rate_limit_or_daily_budget(
+    ctx: TestContext,
+    _kv: Kv,
+    db: Db,
+) {
+    let mut limits = limits();
+    limits.public.per_minute = 2;
+    limits.public.per_day = 100;
+    let client = ctx.client(router_with(&db, limits).await);
+
+    // Three requests from one IP, each presenting a brand-new fake `fs_` token:
+    // the third hits the per-minute IP bound even though every token hash is new.
+    for nonce in 0..2 {
+        client
+            .get("/v1/me")
+            .header("cf-connecting-ip", "198.51.100.10")
+            .bearer(&format!("fs_forged-{nonce}"))
+            .send()
+            .await
+            .assert_status(401);
+    }
+    let throttled = client
+        .get("/v1/me")
+        .header("cf-connecting-ip", "198.51.100.10")
+        .bearer("fs_forged-2")
+        .send()
+        .await;
+    throttled.assert_status(429);
+    assert_eq!(
+        throttled.json::<Problem>().kind,
+        "https://flyco.dev/problems/rate-limited"
+    );
+    // Subsequent requests from the same IP with yet another fake token are
+    // refused pre-auth for the rest of the minute window.
+    client
+        .get("/v1/me")
+        .header("cf-connecting-ip", "198.51.100.10")
+        .bearer("fs_forged-3")
+        .send()
+        .await
+        .assert_status(429);
+
+    // Daily exhaustion blocks `ip:<address>` so rotating tokens cannot bypass it.
+    let mut daily_limits = self::limits();
+    daily_limits.public.per_minute = 1_000;
+    daily_limits.public.per_day = 2;
+    let daily_client = ctx.client(test_router_budgeted(
+        db.clone(),
+        Queue::new(InMemoryQueue::new()),
+        daily_limits,
+    ));
+    for nonce in 0..2 {
+        daily_client
+            .get("/v1/me")
+            .header("cf-connecting-ip", "198.51.100.11")
+            .bearer(&format!("fk_forged-{nonce}"))
+            .send()
+            .await
+            .assert_status(401);
+    }
+    let exhausted = daily_client
+        .get("/v1/me")
+        .header("cf-connecting-ip", "198.51.100.11")
+        .bearer("fk_forged-brand-new")
+        .send()
+        .await;
+    exhausted.assert_status(429);
+    assert_eq!(
+        exhausted.json::<Problem>().kind,
+        "https://flyco.dev/problems/request-budget-exhausted"
+    );
+}
+
+#[skyzen::test]
+async fn daemon_relay_and_host_routes_bill_verified_principals_and_reject_forged_host_attribution(
+    ctx: TestContext,
+    _kv: Kv,
+    db: Db,
+) {
+    let mut limits = limits();
+    limits.public.per_day = 1;
+    limits.daemon.per_day = 10;
+    limits.host.per_day = 10;
+    let client = ctx.client(router_with(&db, limits).await);
+
+    let user = seed_user(&db).await;
+    let session = crate::testing::seed_session(&db, &user).await;
+    let daemon_token = crate::daemon_tokens::issue(&db, user.id, session)
+        .await
+        .expect("mint daemon token")
+        .token;
+    let host = crate::testing::seed_host(&db, user.id).await;
+
+    // Multiple daemon relay requests succeed past `public.per_day = 1` because
+    // `RequireDaemon` attributes them to `Principal::Session(session)`.
+    for _ in 0..3 {
+        client
+            .post(&format!("/v1/sessions/{session}/relay/attach"))
+            .header("cf-connecting-ip", "198.51.100.20")
+            .bearer(&daemon_token)
+            .json(&flyco_core::wire::DaemonAttach {
+                protocol_version: flyco_core::WIRE_PROTOCOL_VERSION,
+            })
+            .send()
+            .await
+            .assert_status(200);
+    }
+    let now = clock::now_unix();
+    assert_eq!(
+        recorded(&db, &Principal::Session(session), now)
+            .await
+            .expect("read daemon ledger"),
+        1, // First request flushed immediately; requests 2..3 are buffered locally.
+    );
+    assert_eq!(
+        recorded(&db, &Principal::Address("198.51.100.20".to_owned()), now)
+            .await
+            .expect("read ip ledger"),
+        0,
+        "authenticated daemon relay traffic must not spend the public IP budget"
+    );
+
+    // Multiple host relay requests succeed past `public.per_day = 1` because
+    // `RequireHost` attributes them to `Principal::Host(host)`.
+    for _ in 0..3 {
+        client
+            .post(&format!("/v1/hosts/{host}/relay/attach"))
+            .header("cf-connecting-ip", "198.51.100.21")
+            .bearer(crate::testing::HOST_TOKEN)
+            .json(&flyco_provider::host::HostAttach {
+                facts: Box::new(crate::testing::host_facts()),
+            })
+            .send()
+            .await
+            .assert_status(200);
+    }
+    assert_eq!(
+        recorded(&db, &Principal::Host(host), now)
+            .await
+            .expect("read host ledger"),
+        1
+    );
+
+    // A forged `fh_` token on a public route carrying a victim host UUID in its
+    // path must never charge the victim host's budget.
+    let victim_host = flyco_core::HostId::generate();
+    client
+        .get(&format!("/v1/cli-sessions/{victim_host}?s=bogus"))
+        .header("cf-connecting-ip", "198.51.100.22")
+        .bearer("fh_forged-token")
+        .send()
+        .await
+        .assert_status(410);
+    assert_eq!(
+        recorded(&db, &Principal::Host(victim_host), now)
+            .await
+            .expect("read victim host ledger"),
+        0,
+        "unverified fh_ tokens must never bill a host principal"
+    );
+    assert_eq!(
+        recorded(&db, &Principal::Address("198.51.100.22".to_owned()), now)
+            .await
+            .expect("read attacker ip ledger"),
+        1
+    );
+}
