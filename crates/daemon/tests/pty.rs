@@ -84,7 +84,7 @@ async fn a_pty_relays_input_to_output() {
     terminal.write("hello\n").expect("write");
     output_until(&mut outputs, "hello").await;
 
-    terminal.shutdown().expect("stop");
+    terminal.shutdown().await.expect("stop");
     let _ = std::fs::remove_dir_all(&work);
 }
 
@@ -111,7 +111,7 @@ async fn a_harness_exit_reports_and_returns_the_shell() {
     terminal.write("still-here\n").expect("write");
     output_until(&mut outputs, "still-here").await;
 
-    terminal.shutdown().expect("stop");
+    terminal.shutdown().await.expect("stop");
     let _ = std::fs::remove_dir_all(&work);
 }
 
@@ -142,6 +142,32 @@ async fn a_second_launch_leaves_the_running_harness_alone() {
         "the ensure did not restart the TUI: {seen}"
     );
 
-    terminal.shutdown().expect("stop");
+    terminal.shutdown().await.expect("stop");
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[tokio::test]
+async fn print_from_tokio_runtime_does_not_panic_and_shutdown_does_not_deadlock_when_full() {
+    let work = workdir("full-buffer");
+    let (mut terminal, _outputs) =
+        Terminal::spawn(&script("fake-shell.sh"), &work).expect("start the stand-in shell");
+
+    // Fill the 256-slot output buffer from inside a Tokio worker thread
+    // without draining `_outputs`, and also launch a chatty foreground so
+    // the supervisor thread hits the full channel too.
+    for index in 0..300 {
+        terminal
+            .print(&format!("line-{index}\n"))
+            .expect("non-blocking print succeeds");
+    }
+    terminal
+        .launch_harness(sh("yes chatty"))
+        .expect("launch chatty foreground");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    tokio::time::timeout(Duration::from_secs(5), terminal.shutdown())
+        .await
+        .expect("shutdown must not deadlock when the output buffer is full")
+        .expect("shutdown succeeds");
     let _ = std::fs::remove_dir_all(&work);
 }

@@ -208,6 +208,7 @@ impl HostConfig {
             source,
         };
 
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
         if let Some(directory) = path.parent() {
             tokio::fs::create_dir_all(directory).await.map_err(write)?;
             tokio::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
@@ -215,21 +216,30 @@ impl HostConfig {
                 .map_err(write)?;
         }
 
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(MODE)
-            .open(path)
-            .await
-            .map_err(write)?;
-        file.write_all(text.as_bytes()).await.map_err(write)?;
-        file.flush().await.map_err(write)?;
-        // `mode` above applies only when the file is created, so a file that
-        // was already there is re-permissioned rather than trusted.
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(MODE))
-            .await
-            .map_err(write)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("host.toml");
+        let tmp_path = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+        let write_result = async {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(MODE)
+                .open(&tmp_path)
+                .await?;
+            file.write_all(text.as_bytes()).await?;
+            file.sync_all().await?;
+            drop(file);
+            tokio::fs::rename(&tmp_path, path).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(write(error));
+        }
         Ok(())
     }
 }

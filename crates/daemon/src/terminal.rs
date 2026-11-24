@@ -24,8 +24,11 @@
 //! The same ordering gives [`TerminalEvent::Exited`] its guarantee: it is
 //! sent only after the last byte the harness wrote has been read.
 
+use std::future::Future;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -132,7 +135,7 @@ pub trait TerminalSession: Send {
     /// # Errors
     ///
     /// Returns [`TerminalError`] if the child could not be stopped.
-    fn shutdown(&mut self) -> Result<(), TerminalError>;
+    fn shutdown(&mut self) -> impl Future<Output = Result<(), TerminalError>> + Send;
 }
 
 /// The PTY could not be used.
@@ -167,6 +170,8 @@ pub struct Terminal {
     /// channel so the line lands in order with real output.
     events: mpsc::Sender<TerminalEvent>,
     control: std::sync::mpsc::SyncSender<Supervision>,
+    /// Signals the supervisor thread to exit even while `events` is full.
+    stop: Arc<AtomicBool>,
     /// Joined on shutdown, so the child's reap is done before the PTY
     /// goes away.
     thread: Option<thread::JoinHandle<()>>,
@@ -213,16 +218,27 @@ impl Terminal {
 
         let (events, terminal_out) = mpsc::channel(OUTPUT_DEPTH);
         let (control, supervised) = std::sync::mpsc::sync_channel(64);
+        let stop = Arc::new(AtomicBool::new(false));
         let supervised_events = events.clone();
+        let supervised_stop = Arc::clone(&stop);
         let thread = thread::Builder::new()
             .name("flycod-terminal".to_owned())
-            .spawn(move || supervise(pane, &shell, &supervised_events, &supervised))
+            .spawn(move || {
+                supervise(
+                    pane,
+                    &shell,
+                    &supervised_events,
+                    &supervised,
+                    &supervised_stop,
+                );
+            })
             .map_err(|error| TerminalError::Pty(error.to_string()))?;
 
         Ok((
             Self {
                 events,
                 control,
+                stop,
                 thread: Some(thread),
             },
             terminal_out,
@@ -230,42 +246,69 @@ impl Terminal {
     }
 }
 
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.control.try_send(Supervision::Stop);
+    }
+}
+
+impl Terminal {
+    fn send_control(&self, message: Supervision, label: &'static str) -> Result<(), TerminalError> {
+        match self.control.try_send(message) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    kind = label,
+                    "terminal control queue is full; dropping message"
+                );
+                Ok(())
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(TerminalError::Stopped),
+        }
+    }
+}
+
 impl TerminalSession for Terminal {
     fn write(&mut self, data: &str) -> Result<(), TerminalError> {
-        self.control
-            .send(Supervision::Input(data.as_bytes().to_vec()))
-            .map_err(|_| TerminalError::Stopped)
+        self.send_control(Supervision::Input(data.as_bytes().to_vec()), "input")
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), TerminalError> {
-        self.control
-            .send(Supervision::Resize(PtySize {
+        self.send_control(
+            Supervision::Resize(PtySize {
                 rows,
                 cols,
                 ..INITIAL_SIZE
-            }))
-            .map_err(|_| TerminalError::Stopped)
+            }),
+            "resize",
+        )
     }
 
     fn launch_harness(&mut self, command: CommandBuilder) -> Result<(), TerminalError> {
-        self.control
-            .send(Supervision::Harness(command))
-            .map_err(|_| TerminalError::Stopped)
+        self.send_control(Supervision::Harness(command), "harness")
     }
 
     fn print(&mut self, text: &str) -> Result<(), TerminalError> {
-        self.events
-            .blocking_send(TerminalEvent::Output(text.to_owned()))
-            .map_err(|_| TerminalError::Stopped)
+        match self.events.try_send(TerminalEvent::Output(text.to_owned())) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("terminal output buffer is full; dropping diagnostic line");
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(TerminalError::Stopped),
+        }
     }
 
-    fn shutdown(&mut self) -> Result<(), TerminalError> {
+    async fn shutdown(&mut self) -> Result<(), TerminalError> {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.control.try_send(Supervision::Stop);
         if let Some(thread) = self.thread.take() {
-            // A dead supervisor closed the channel; the join still runs so
-            // the thread is reaped either way.
-            let _ = self.control.send(Supervision::Stop);
-            thread
-                .join()
+            tokio::task::spawn_blocking(move || thread.join())
+                .await
+                .map_err(|_| {
+                    TerminalError::Pty("the terminal shutdown task was cancelled".to_owned())
+                })?
                 .map_err(|_| TerminalError::Pty("the supervisor thread panicked".to_owned()))?;
         }
         Ok(())
@@ -370,17 +413,39 @@ enum Reading {
     Gone,
 }
 
+/// Sends one terminal event without blocking past a shutdown signal.
+fn send_event(
+    events: &mpsc::Sender<TerminalEvent>,
+    stop: &AtomicBool,
+    mut event: TerminalEvent,
+) -> bool {
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return false;
+        }
+        match events.try_send(event) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                event = returned;
+                thread::sleep(IDLE_POLL);
+            }
+        }
+    }
+}
+
 /// Reads one chunk into `events`.
 fn read_out(
     reader: &mut dyn Read,
     buf: &mut [u8],
     events: &mpsc::Sender<TerminalEvent>,
+    stop: &AtomicBool,
 ) -> Reading {
     match reader.read(buf) {
         Ok(0) | Err(_) => Reading::Quiet,
         Ok(n) => {
             let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
-            if events.blocking_send(TerminalEvent::Output(chunk)).is_ok() {
+            if send_event(events, stop, TerminalEvent::Output(chunk)) {
                 Reading::Chunk
             } else {
                 Reading::Gone
@@ -422,13 +487,18 @@ fn foreground_pane(
     shell: &CommandBuilder,
     size: PtySize,
     events: &mpsc::Sender<TerminalEvent>,
+    stop: &AtomicBool,
 ) -> Option<(Pane, Foreground)> {
     match Pane::open(command, size) {
         Ok(pane) => Some((pane, Foreground::Harness)),
         Err(error) => {
-            let _ = events.blocking_send(TerminalEvent::Output(format!(
-                "\r\nflycod: could not start the harness: {error}\r\n"
-            )));
+            let _ = send_event(
+                events,
+                stop,
+                TerminalEvent::Output(format!(
+                    "\r\nflycod: could not start the harness: {error}\r\n"
+                )),
+            );
             Pane::open(shell, size)
                 .ok()
                 .map(|pane| (pane, Foreground::Shell))
@@ -457,6 +527,7 @@ fn supervise(
     shell: &CommandBuilder,
     events: &mpsc::Sender<TerminalEvent>,
     control: &std::sync::mpsc::Receiver<Supervision>,
+    stop_flag: &AtomicBool,
 ) {
     let mut foreground = Foreground::Shell;
     let mut size = INITIAL_SIZE;
@@ -468,8 +539,12 @@ fn supervise(
     let drain = timeout(DRAIN);
 
     loop {
+        if stop_flag.load(Ordering::Acquire) {
+            let _ = pane.child.kill();
+            return;
+        }
         if readable(&pane.poll, &idle) {
-            match read_out(&mut *pane.reader, &mut buf, events) {
+            match read_out(&mut *pane.reader, &mut buf, events, stop_flag) {
                 Reading::Chunk => {}
                 Reading::Quiet => {
                     // A dead session's master can stay pollable (HUP
@@ -477,11 +552,14 @@ fn supervise(
                     // a pause that state is a busy loop.
                     thread::sleep(IDLE_POLL);
                 }
-                Reading::Gone => return,
+                Reading::Gone => {
+                    let _ = pane.child.kill();
+                    return;
+                }
             }
         }
 
-        let mut stop = false;
+        let mut stop = stop_flag.load(Ordering::Acquire);
         for message in control.try_iter() {
             match message {
                 Supervision::Input(bytes) => {
@@ -506,7 +584,7 @@ fn supervise(
                     if !reaped(&mut *child) {
                         pending.push(child);
                     }
-                    match foreground_pane(&command, shell, size, events) {
+                    match foreground_pane(&command, shell, size, events, stop_flag) {
                         Some((next, became)) => {
                             pane = next;
                             foreground = became;
@@ -536,13 +614,15 @@ fn supervise(
             // not overtake the last bytes it wrote. A quiet read — the
             // session ending — ends the drain as surely as the deadline.
             while readable(&pane.poll, &drain)
-                && read_out(&mut *pane.reader, &mut buf, events) == Reading::Chunk
-            {}
-            if foreground == Foreground::Harness
-                && events
-                    .blocking_send(TerminalEvent::Exited { code })
-                    .is_err()
+                && read_out(&mut *pane.reader, &mut buf, events, stop_flag) == Reading::Chunk
             {
+            }
+            if foreground == Foreground::Harness
+                && !send_event(events, stop_flag, TerminalEvent::Exited { code })
+            {
+                return;
+            }
+            if stop_flag.load(Ordering::Acquire) {
                 return;
             }
             match Pane::open(shell, size) {
@@ -623,7 +703,7 @@ impl TerminalSession for FakeTerminal {
             .map_err(|_| TerminalError::Stopped)
     }
 
-    fn shutdown(&mut self) -> Result<(), TerminalError> {
-        Ok(())
+    fn shutdown(&mut self) -> impl Future<Output = Result<(), TerminalError>> {
+        core::future::ready(Ok(()))
     }
 }

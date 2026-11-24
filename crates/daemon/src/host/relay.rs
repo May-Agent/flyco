@@ -141,7 +141,12 @@ async fn attach<A: HostTransport>(api: &A, facts: &HostFacts) -> Result<Attachme
 /// A revoked token is not one of them — it is answered with
 /// [`Stopped::Revoked`], because a machine that was offline when the
 /// command arrived learns its revocation from the refused attach.
-const FATAL_REFUSALS: &[&str] = &["missing-credential", "host-not-found", "host-removed"];
+const FATAL_REFUSALS: &[&str] = &[
+    "missing-credential",
+    "host-not-found",
+    "host-removed",
+    "request-budget-exhausted",
+];
 
 /// One finished job, on its way to the control plane.
 #[derive(Debug, Clone)]
@@ -186,6 +191,10 @@ struct Pump<J, A> {
     /// The wait the control plane named on the last refused batch,
     /// honoured by the reconnect that follows (issue #342).
     retry_hint: Option<Duration>,
+    /// Earliest instant the next `job-results` POST may be attempted after a
+    /// `429 Retry-After` refusal; persists across reconnects so re-attaching
+    /// never bypasses a rate-limit cooldown.
+    report_blocked_until: Option<tokio::time::Instant>,
 }
 
 /// Why one attachment ended.
@@ -219,6 +228,7 @@ where
         pending: VecDeque::new(),
         handled: HashSet::new(),
         retry_hint: None,
+        report_blocked_until: None,
     };
     // How far down the room's command log this machine has applied —
     // global across attachments, exactly as the log's sequences are.
@@ -322,23 +332,28 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
         finished: &mut mpsc::Receiver<(u64, ReportJobResult)>,
         applied: &mut u64,
     ) -> Result<Ended, WireError> {
-        // No separate acknowledgement cursor is kept here: a host's log
-        // rows are deleted by the `JobResult` frame that answers them,
-        // not by `ack_through` — every batch `flush` posts carries
-        // `applied` along for the non-job rows, and a `Revoked` ends the
-        // run either way.
-        let mut retry = tokio::time::interval(RESULT_RETRY);
-        // The first tick is immediate; an attach that just succeeded has
-        // nothing to retry yet.
-        retry.tick().await;
+        // How far the room has been told the command log is applied on this
+        // attachment. Starting at zero re-acknowledges on a fresh attach when
+        // `applied > 0`, and stops idle hosts from posting empty `HostFrames`
+        // once `applied` is already acknowledged.
+        let mut acked = 0_u64;
+        // Armed only when `outstanding` holds an unfiled job result whose
+        // report failed or is waiting out a `429 Retry-After` cooldown.
+        let mut retry_at: Option<tokio::time::Instant> = None;
 
         // A job that finished while the stream was down is reported the
-        // moment there is a stream again.
-        if !self.flush(attach, *applied).await {
+        // moment there is a stream again (unless still inside a 429 window).
+        if !self
+            .flush(attach, *applied, &mut acked, &mut retry_at)
+            .await?
+        {
             return Ok(Ended::Disconnected);
         }
 
         loop {
+            let retry_armed = !self.outstanding.is_empty() && retry_at.is_some();
+            let retry_deadline = retry_at.unwrap_or_else(tokio::time::Instant::now);
+
             tokio::select! {
                 event = attach.commands.next() => {
                     let Some(command) = event else {
@@ -390,15 +405,13 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
                         report,
                         filed: false,
                     });
-                    if !self.flush(attach, *applied).await {
+                    if !self.flush(attach, *applied, &mut acked, &mut retry_at).await? {
                         return Ok(Ended::Disconnected);
                     }
                 }
-                _ = retry.tick() => {
-                    // A control plane that was refusing reports may be
-                    // back, and the retry carries this stream's ack state
-                    // along with it.
-                    if !self.flush(attach, *applied).await {
+                () = tokio::time::sleep_until(retry_deadline), if retry_armed => {
+                    retry_at = None;
+                    if !self.flush(attach, *applied, &mut acked, &mut retry_at).await? {
                         return Ok(Ended::Disconnected);
                     }
                 }
@@ -457,17 +470,44 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
     /// untouched and answers `false`: the attach is dropped and the next
     /// epoch re-sends the whole tail, which the room deduplicates by
     /// sequence.
-    async fn flush(&mut self, attach: &mut Attachment, applied: u64) -> bool {
+    async fn flush(
+        &mut self,
+        attach: &mut Attachment,
+        applied: u64,
+        acked: &mut u64,
+        retry_at: &mut Option<tokio::time::Instant>,
+    ) -> Result<bool, WireError> {
+        let now = tokio::time::Instant::now();
+        if let Some(until) = self.report_blocked_until {
+            if now < until {
+                if !self.outstanding.is_empty() {
+                    *retry_at = Some(retry_at.map_or(until, |existing| existing.max(until)));
+                }
+                return Ok(true);
+            }
+            self.report_blocked_until = None;
+        }
+
         while let Some(finished) = self.outstanding.front_mut() {
             if !finished.filed {
                 if let Err(error) = self.api.report(finished.report.clone()).await {
+                    if error.kind() == Some("request-budget-exhausted") {
+                        return Err(WireError::ControlApi(error));
+                    }
+                    let wait = error.retry_after().unwrap_or(RESULT_RETRY);
+                    let next_try = tokio::time::Instant::now() + wait;
+                    if error.retry_after().is_some() {
+                        self.report_blocked_until = Some(next_try);
+                    }
+                    *retry_at = Some(next_try);
                     tracing::warn!(
                         %error,
+                        ?wait,
                         machine = %finished.report.job_id,
                         "a job result did not reach the control plane; \
                          its room will redeliver the job"
                     );
-                    return true;
+                    return Ok(true);
                 }
                 finished.filed = true;
             }
@@ -483,12 +523,14 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
                 },
             ));
         }
+        *retry_at = None;
 
-        if self.pending.is_empty() && applied == 0 {
-            return true;
+        if self.pending.is_empty() && applied <= *acked {
+            return Ok(true);
         }
-        // An empty batch is still a contact: it renews presence, and its
-        // `ack_through` is how the room learns a delivered command is done.
+        // An empty batch is sent only when `applied` has moved past `acked`
+        // so the room learns a delivered command is done without polling
+        // while idle.
         let batch = HostFrames {
             epoch: attach.epoch,
             from_seq: attach.next_seq,
@@ -500,14 +542,18 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
                 .collect(),
         };
         if let Err(error) = self.api.frames(&batch).await {
+            if error.kind() == Some("request-budget-exhausted") {
+                return Err(WireError::ControlApi(error));
+            }
             self.retry_hint = error.retry_after();
             tracing::warn!(
                 %error,
                 frames = batch.frames.len(),
                 "a frame batch did not reach the room; retrying it on the next attach"
             );
-            return false;
+            return Ok(false);
         }
+        *acked = (*acked).max(applied);
         attach.next_seq = attach
             .next_seq
             .saturating_add(u64::try_from(batch.frames.len()).unwrap_or(0));
@@ -516,7 +562,7 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
         for (seq, _) in self.pending.drain(..) {
             self.handled.remove(&seq);
         }
-        true
+        Ok(true)
     }
 }
 
@@ -975,5 +1021,246 @@ mod tests {
             stopped.expect("a revoked credential ends the run, not errors it"),
             Stopped::Revoked
         );
+    }
+
+    #[tokio::test]
+    async fn idle_host_does_not_post_empty_frames_after_ack() {
+        let mut harness = Harness::start().await;
+        harness.attached().await;
+
+        let machine = MachineId::generate();
+        harness.command(ControlToHost::Run {
+            job: stop_job(machine),
+        });
+        harness.performed.recv().await;
+        harness.job_gate.notify_one();
+        harness.filed.recv().await;
+        harness.report_gate.notify_one();
+
+        assert_eq!(
+            harness.room.next_frame().await,
+            HostToControl::JobResult {
+                job_id: machine,
+                outcome: JobOutcome::Done,
+            }
+        );
+
+        // Once the batch carrying `ack_through` has been confirmed, no
+        // further empty batches may be posted while the host is idle.
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_millis(300), harness.room.next())
+                .await
+                .is_err(),
+            "an idle host with acked == applied must not post empty frame batches"
+        );
+
+        harness.run.abort();
+    }
+
+    #[tokio::test]
+    async fn job_results_429_request_budget_exhausted_stops_relay() {
+        struct BudgetExhaustedApi {
+            transport: HttpHostApi,
+        }
+
+        impl JobResults for BudgetExhaustedApi {
+            fn report(
+                &self,
+                _report: ReportJobResult,
+            ) -> impl core::future::Future<Output = Result<(), ControlApiError>> + Send
+            {
+                core::future::ready(Err(ControlApiError::Refused {
+                    method: "POST",
+                    path: "/v1/hosts/job-results".to_owned(),
+                    status: 429,
+                    title: "Daily request budget exhausted".to_owned(),
+                    detail: "daily ceiling reached".to_owned(),
+                    kind: "https://flyco.dev/problems/request-budget-exhausted".to_owned(),
+                    retry_after_secs: core::num::NonZeroU32::new(3600),
+                }))
+            }
+        }
+
+        impl HostTransport for BudgetExhaustedApi {
+            fn attach(
+                &self,
+                facts: &HostFacts,
+            ) -> impl core::future::Future<
+                Output = Result<flyco_provider::host::HostAttached, ControlApiError>,
+            > + Send {
+                self.transport.attach(facts)
+            }
+
+            fn commands(
+                &self,
+                epoch: u64,
+                idle: core::time::Duration,
+            ) -> impl core::future::Future<
+                Output = Result<CommandStream<flyco_provider::host::HostCommand>, ControlApiError>,
+            > + Send {
+                self.transport.commands(epoch, idle)
+            }
+
+            fn frames(
+                &self,
+                batch: &flyco_provider::host::HostFrames,
+            ) -> impl core::future::Future<Output = Result<(), ControlApiError>> + Send
+            {
+                self.transport.frames(batch)
+            }
+        }
+
+        let mut room = Room::listen().await;
+        let host = HostId::generate();
+        let (performed_out, mut performed) = mpsc::unbounded_channel();
+        let job_gate = Arc::new(Notify::new());
+        let run = tokio::spawn(run(HostRelay {
+            host,
+            facts: facts(),
+            jobs: Arc::new(FakeJobs {
+                performed: performed_out,
+                outcome: Some(JobOutcome::Done),
+                gate: Arc::clone(&job_gate),
+            }),
+            api: BudgetExhaustedApi {
+                transport: HttpHostApi::new(room.base.clone(), host, TOKEN.to_owned()),
+            },
+        }));
+
+        assert!(matches!(room.next().await, Some(Seen::Attached { .. })));
+        assert!(matches!(room.next().await, Some(Seen::StreamOpened(_))));
+
+        room.directives
+            .send(Directive::Send(ControlToHost::Run {
+                job: stop_job(MachineId::generate()),
+            }))
+            .expect("send job");
+        performed.recv().await;
+        job_gate.notify_one();
+
+        let ended = tokio::time::timeout(core::time::Duration::from_secs(5), run)
+            .await
+            .expect("relay stopped on request-budget-exhausted")
+            .expect("relay did not panic");
+        match ended {
+            Err(crate::control::wire::WireError::ControlApi(api)) => {
+                assert_eq!(api.kind(), Some("request-budget-exhausted"));
+                assert_eq!(
+                    api.retry_after(),
+                    Some(core::time::Duration::from_secs(3600))
+                );
+            }
+            other => panic!("expected request-budget-exhausted error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_results_429_retry_after_waits_before_retrying() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct RateLimitedApi {
+            transport: HttpHostApi,
+            attempts: Arc<AtomicUsize>,
+        }
+
+        impl JobResults for RateLimitedApi {
+            fn report(
+                &self,
+                _report: ReportJobResult,
+            ) -> impl core::future::Future<Output = Result<(), ControlApiError>> + Send
+            {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return core::future::ready(Err(ControlApiError::Refused {
+                        method: "POST",
+                        path: "/v1/hosts/job-results".to_owned(),
+                        status: 429,
+                        title: "Too many requests".to_owned(),
+                        detail: "per-minute rate limit".to_owned(),
+                        kind: "https://flyco.dev/problems/rate-limited".to_owned(),
+                        retry_after_secs: core::num::NonZeroU32::new(1),
+                    }));
+                }
+                core::future::ready(Ok(()))
+            }
+        }
+
+        impl HostTransport for RateLimitedApi {
+            fn attach(
+                &self,
+                facts: &HostFacts,
+            ) -> impl core::future::Future<
+                Output = Result<flyco_provider::host::HostAttached, ControlApiError>,
+            > + Send {
+                self.transport.attach(facts)
+            }
+
+            fn commands(
+                &self,
+                epoch: u64,
+                idle: core::time::Duration,
+            ) -> impl core::future::Future<
+                Output = Result<CommandStream<flyco_provider::host::HostCommand>, ControlApiError>,
+            > + Send {
+                self.transport.commands(epoch, idle)
+            }
+
+            fn frames(
+                &self,
+                batch: &flyco_provider::host::HostFrames,
+            ) -> impl core::future::Future<Output = Result<(), ControlApiError>> + Send
+            {
+                self.transport.frames(batch)
+            }
+        }
+
+        let mut room = Room::listen().await;
+        let host = HostId::generate();
+        let (performed_out, mut performed) = mpsc::unbounded_channel();
+        let job_gate = Arc::new(Notify::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let run = tokio::spawn(run(HostRelay {
+            host,
+            facts: facts(),
+            jobs: Arc::new(FakeJobs {
+                performed: performed_out,
+                outcome: Some(JobOutcome::Done),
+                gate: Arc::clone(&job_gate),
+            }),
+            api: RateLimitedApi {
+                transport: HttpHostApi::new(room.base.clone(), host, TOKEN.to_owned()),
+                attempts: Arc::clone(&attempts),
+            },
+        }));
+
+        assert!(matches!(room.next().await, Some(Seen::Attached { .. })));
+        assert!(matches!(room.next().await, Some(Seen::StreamOpened(_))));
+
+        let machine = MachineId::generate();
+        room.directives
+            .send(Directive::Send(ControlToHost::Run {
+                job: stop_job(machine),
+            }))
+            .expect("send job");
+        performed.recv().await;
+        let started = tokio::time::Instant::now();
+        job_gate.notify_one();
+
+        assert_eq!(
+            tokio::time::timeout(core::time::Duration::from_secs(5), room.next_frame())
+                .await
+                .expect("retry succeeded after Retry-After"),
+            HostToControl::JobResult {
+                job_id: machine,
+                outcome: JobOutcome::Done,
+            }
+        );
+        assert!(
+            started.elapsed() >= core::time::Duration::from_millis(900),
+            "retry must honor Retry-After (1s), elapsed {:?}",
+            started.elapsed()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        run.abort();
     }
 }

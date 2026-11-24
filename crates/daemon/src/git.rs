@@ -27,7 +27,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Interval};
@@ -54,8 +54,18 @@ pub const TOKEN_VAR: &str = "FLYCO_GIT_TOKEN";
 /// environment rather than baked in here, so this string is safe to log,
 /// print, or write to a config file — which is precisely why it is the thing
 /// git sees.
-const CREDENTIAL_HELPER: &str = "!f() { test \"$1\" = get && printf 'username=x-access-token\\npassword=%s\\n' \
-     \"$FLYCO_GIT_TOKEN\"; }; f";
+///
+/// The helper also validates `protocol=https` and `host=github.com` from
+/// git's stdin query so even if invoked outside the host-scoped config key,
+/// the token is never presented to any other host or protocol (for example,
+/// an HTTPS submodule pointing at a third-party server).
+const CREDENTIAL_HELPER: &str = "!f() { test \"$1\" = get || return 0; p=; h=; \
+     while IFS='=' read -r k v; do \
+       case \"$k\" in protocol) p=\"$v\" ;; host) h=\"$v\" ;; '') break ;; esac; \
+     done; \
+     if [ \"$p\" = https ] && [ \"$h\" = github.com ]; then \
+       printf 'username=x-access-token\\npassword=%s\\n' \"$FLYCO_GIT_TOKEN\"; \
+     fi; }; f";
 
 /// Whether `workdir` already holds a git checkout.
 ///
@@ -201,7 +211,9 @@ async fn authenticated(
         .arg("-c")
         .arg("credential.helper=")
         .arg("-c")
-        .arg(format!("credential.helper={CREDENTIAL_HELPER}"))
+        .arg(format!(
+            "credential.https://github.com.helper={CREDENTIAL_HELPER}"
+        ))
         .args(args)
         .env(TOKEN_VAR, &access.token)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -555,16 +567,55 @@ impl WorkingTree for GitWorkdir {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(GitError::Spawn)?;
         let mut stdin = child.stdin.take().ok_or_else(|| GitError::Failed {
             command: "apply".to_owned(),
             detail: "stdin was not piped".to_owned(),
         })?;
-        stdin.write_all(patch).await.map_err(GitError::Spawn)?;
-        drop(stdin);
-        let output = child.wait_with_output().await.map_err(GitError::Spawn)?;
-        finished("apply".to_owned(), output).map(|_| ())
+        let mut stdout_pipe = child.stdout.take().ok_or_else(|| GitError::Failed {
+            command: "apply".to_owned(),
+            detail: "stdout was not piped".to_owned(),
+        })?;
+        let mut stderr_pipe = child.stderr.take().ok_or_else(|| GitError::Failed {
+            command: "apply".to_owned(),
+            detail: "stderr was not piped".to_owned(),
+        })?;
+
+        let write_stdin = async move {
+            let result = stdin.write_all(patch).await;
+            drop(stdin);
+            result
+        };
+        let read_stdout = async {
+            let mut buf = Vec::new();
+            stdout_pipe.read_to_end(&mut buf).await.map(|_| buf)
+        };
+        let read_stderr = async {
+            let mut buf = Vec::new();
+            stderr_pipe.read_to_end(&mut buf).await.map(|_| buf)
+        };
+        let (write_res, stdout_res, stderr_res) =
+            tokio::join!(write_stdin, read_stdout, read_stderr);
+
+        let status = child.wait().await.map_err(GitError::Spawn)?;
+        let stdout = stdout_res.map_err(GitError::Spawn)?;
+        let stderr = stderr_res.map_err(GitError::Spawn)?;
+        if let Err(error) = write_res
+            && (error.kind() != std::io::ErrorKind::BrokenPipe || status.success())
+        {
+            return Err(GitError::Spawn(error));
+        }
+        finished(
+            "apply".to_owned(),
+            std::process::Output {
+                status,
+                stdout,
+                stderr,
+            },
+        )
+        .map(|_| ())
     }
 }
 
@@ -1344,6 +1395,99 @@ mod tests {
         init(&scratch.0);
         let workdir = GitWorkdir::new(scratch.0.clone());
         assert!(workdir.snapshot().await.expect("snapshot").is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_helper_only_answers_https_github_com() {
+        use tokio::io::AsyncWriteExt as _;
+
+        async fn run_helper(op: &str, stdin_body: &str) -> String {
+            let script = super::CREDENTIAL_HELPER
+                .strip_prefix('!')
+                .expect("git shell helper starts with !");
+            let mut child = tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("{script} \"$1\""))
+                .arg("sh")
+                .arg(op)
+                .env(super::TOKEN_VAR, TOKEN)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn sh");
+            let mut stdin = child.stdin.take().expect("stdin");
+            stdin
+                .write_all(stdin_body.as_bytes())
+                .await
+                .expect("write stdin");
+            drop(stdin);
+            let output = child.wait_with_output().await.expect("wait");
+            assert!(
+                output.status.success(),
+                "helper exited non-zero: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        let github = run_helper("get", "protocol=https\nhost=github.com\n\n").await;
+        assert!(github.contains("username=x-access-token\n"));
+        assert!(github.contains(&format!("password={TOKEN}\n")));
+
+        for rejected in [
+            "protocol=https\nhost=evil.example.com\n\n",
+            "protocol=http\nhost=github.com\n\n",
+            "protocol=https\nhost=github.com.evil.com\n\n",
+            "protocol=https\nhost=sub.github.com\n\n",
+            "host=github.com\n\n",
+        ] {
+            let out = run_helper("get", rejected).await;
+            assert!(
+                out.is_empty(),
+                "helper must not leak token for `{rejected:?}`, got `{out}`"
+            );
+        }
+
+        assert_eq!(
+            run_helper("store", "protocol=https\nhost=github.com\n\n").await,
+            ""
+        );
+        assert_eq!(
+            run_helper("erase", "protocol=https\nhost=github.com\n\n").await,
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_handles_large_patches_without_pipe_deadlock() {
+        let scratch = Scratch::new();
+        let remote = origin(&scratch, "main");
+        let first = scratch.child("first");
+        clone_from(&remote, &repo_config("main"), &access(), &first)
+            .await
+            .expect("first clone");
+        // Larger than typical 64 KiB OS pipe buffers.
+        let large_body = "x".repeat(200 * 1024);
+        std::fs::write(first.join("big.txt"), &large_body).expect("write big file");
+        let snapshot = GitWorkdir::new(first)
+            .snapshot()
+            .await
+            .expect("snapshot")
+            .expect("dirty");
+
+        let second = scratch.child("second");
+        clone_from(&remote, &repo_config("main"), &access(), &second)
+            .await
+            .expect("second clone");
+        GitWorkdir::new(second.clone())
+            .apply(&snapshot.patch)
+            .await
+            .expect("apply large patch");
+        assert_eq!(
+            std::fs::read_to_string(second.join("big.txt")).expect("read big file"),
+            large_body
+        );
     }
 
     #[tokio::test]
