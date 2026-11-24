@@ -769,10 +769,15 @@ async fn a_spot_refusal_is_retried_as_on_demand_for_both_codes() {
 async fn the_on_demand_fallback_re_checks_the_pools_it_would_spend() {
     // The machine passed the spot check on `lowPriorityCores`; its family
     // quota is zero, so re-sending it as on-demand would fail later with an
-    // opaque error. Refuse it here, where the reason is nameable.
-    let mut azure = provider(provision_script(vec![spot_refusal(
-        SPOT_UNSUPPORTED_CODES[0],
-    )]));
+    // opaque error. Refuse it here, where the reason is nameable, and clean
+    // up the network/disk resources already allocated.
+    let mut azure = provider(provision_script(vec![
+        spot_refusal(SPOT_UNSUPPORTED_CODES[0]),
+        done(), // rollback VM
+        done(), // rollback NIC
+        done(), // rollback Public IP
+        done(), // rollback OS disk
+    ]));
 
     let error = azure
         .provision(&request(MachineId::generate(), NO_FAMILY_QUOTA_TYPE, true))
@@ -780,10 +785,18 @@ async fn the_on_demand_fallback_re_checks_the_pools_it_would_spend() {
         .and_then(Provisioning::ready)
         .expect_err("the on-demand pools cannot fund this machine");
     assert!(matches!(error, ProviderError::QuotaExceeded { .. }));
+    let vm_puts = (0..azure.transport().request_count())
+        .map(|i| azure.transport().request(i))
+        .filter(|req| req.method == Method::Put && req.url.contains("/virtualMachines/"))
+        .count();
+    assert_eq!(vm_puts, 1, "no second machine `PUT` is attempted");
+    let deletes = (0..azure.transport().request_count())
+        .map(|i| azure.transport().request(i))
+        .filter(|req| req.method == Method::Delete)
+        .count();
     assert_eq!(
-        azure.transport().request_count(),
-        MACHINE_PUT + 1,
-        "no second machine `PUT` is attempted"
+        deletes, 4,
+        "rollback cleans up VM, NIC, Public IP, and disk"
     );
 }
 
@@ -802,7 +815,13 @@ async fn a_spot_machine_that_azure_accepts_records_spot() {
 
 #[tokio::test]
 async fn a_refusal_that_is_not_about_spot_is_not_retried() {
-    let mut azure = provider(provision_script(vec![spot_refusal("SkuNotAvailable")]));
+    let mut azure = provider(provision_script(vec![
+        spot_refusal("SkuNotAvailable"),
+        done(), // rollback VM
+        done(), // rollback NIC
+        done(), // rollback Public IP
+        done(), // rollback OS disk
+    ]));
 
     let error = azure
         .provision(&request(MachineId::generate(), X64_TYPE, true))
@@ -810,10 +829,18 @@ async fn a_refusal_that_is_not_about_spot_is_not_retried() {
         .and_then(Provisioning::ready)
         .expect_err("a capacity failure is a failure");
     assert_eq!(error.code(), Some("SkuNotAvailable"));
+    let vm_puts = (0..azure.transport().request_count())
+        .map(|i| azure.transport().request(i))
+        .filter(|req| req.method == Method::Put && req.url.contains("/virtualMachines/"))
+        .count();
+    assert_eq!(vm_puts, 1, "there must be no second machine `PUT`");
+    let deletes = (0..azure.transport().request_count())
+        .map(|i| azure.transport().request(i))
+        .filter(|req| req.method == Method::Delete)
+        .count();
     assert_eq!(
-        azure.transport().request_count(),
-        MACHINE_PUT + 1,
-        "there must be no second machine `PUT`"
+        deletes, 4,
+        "rollback cleans up VM, NIC, Public IP, and disk"
     );
 }
 
@@ -1046,12 +1073,23 @@ async fn starting_posts_the_start_action() {
     )));
 }
 
+fn vm_record(size: &str) -> HttpResponse {
+    json(
+        200,
+        &serde_json::json!({
+            "properties": { "hardwareProfile": { "vmSize": size } }
+        })
+        .to_string(),
+    )
+}
+
 #[tokio::test]
 async fn resizing_deallocates_patches_the_size_and_starts_again() {
     let machine = provisioned(MachineId::generate());
     let mut azure = provider(vec![
         token(),
         json(200, POLICY),
+        vm_record(X64_TYPE),
         json(200, SKUS),
         json(200, USAGES),
         done(), // deallocate
@@ -1065,12 +1103,12 @@ async fn resizing_deallocates_patches_the_size_and_starts_again() {
         .expect("resize preserves the disk");
 
     let transport = azure.transport();
-    assert!(transport.request(4).url.ends_with(&format!(
+    assert!(transport.request(5).url.ends_with(&format!(
         "/virtualMachines/{}/deallocate?api-version=2024-11-01",
         names::machine(machine.id)
     )));
 
-    let patch = transport.request(5);
+    let patch = transport.request(6);
     assert_eq!(patch.method, Method::Patch);
     assert_eq!(
         body_of(&patch),
@@ -1079,7 +1117,7 @@ async fn resizing_deallocates_patches_the_size_and_starts_again() {
         })
     );
 
-    assert!(transport.request(6).url.ends_with(&format!(
+    assert!(transport.request(7).url.ends_with(&format!(
         "/virtualMachines/{}/start?api-version=2024-11-01",
         names::machine(machine.id)
     )));
@@ -1091,6 +1129,7 @@ async fn a_resize_to_a_type_with_no_quota_never_stops_the_machine() {
     let mut azure = provider(vec![
         token(),
         json(200, POLICY),
+        vm_record(X64_TYPE),
         json(200, SKUS),
         json(200, USAGES),
     ]);
@@ -1101,7 +1140,7 @@ async fn a_resize_to_a_type_with_no_quota_never_stops_the_machine() {
         .expect_err("a resize into a zero-quota family is refused");
     assert_eq!(
         azure.transport().request_count(),
-        4,
+        5,
         "nothing was deallocated, so the session is still running"
     );
 }
@@ -1115,6 +1154,7 @@ async fn a_failed_resize_operation_is_a_failure_whatever_the_machine_reports() {
     let mut azure = provider(vec![
         token(),
         json(200, POLICY),
+        vm_record(X64_TYPE),
         json(200, SKUS),
         json(200, USAGES),
         done(),
@@ -2693,4 +2733,122 @@ async fn a_cost_query_azure_answered_with_no_content_meters_nothing() {
         .expect("a 204 is an empty period, not an unreadable answer");
     assert_eq!(spend.spent, flyco_core::Usd::ZERO);
     assert_eq!(spend.period_start_unix, MONTH_START);
+}
+
+#[tokio::test]
+async fn a_nic_creation_failure_deletes_the_public_ip() {
+    let mut azure = provider(vec![
+        token(),
+        json(200, POLICY),
+        json(200, SKUS),
+        json(200, USAGES),
+        done(),                                       // vnet
+        done(),                                       // nsg
+        done(),                                       // public ip
+        spot_refusal("NetworkInterfaceLimitReached"), // nic PUT fails
+        done(),                                       // rollback DELETE public ip
+    ]);
+
+    let error = azure
+        .provision(&request(MachineId::generate(), X64_TYPE, false))
+        .await
+        .expect_err("NIC creation failure aborts provision");
+    assert_eq!(error.code(), Some("NetworkInterfaceLimitReached"));
+
+    let last = azure
+        .transport()
+        .request(azure.transport().request_count() - 1);
+    assert_eq!(last.method, Method::Delete);
+    assert!(last.url.contains("/publicIPAddresses/"));
+}
+
+#[tokio::test]
+async fn a_container_start_failure_cleans_up_the_job() {
+    let mut azure = provider(vec![
+        token(),
+        json(200, POLICY),
+        provider_registration("Registered"),
+        environment_record("Succeeded"),
+        done(),                               // PUT job
+        spot_refusal("ContainerAppJobError"), // POST job/start fails
+        json(200, r#"{"value":[]}"#),         // GET job/executions
+        done(),                               // DELETE job
+    ]);
+
+    let error = azure
+        .provision(&container_request(MachineId::generate(), CONTAINER_TYPE))
+        .await
+        .expect_err("container start failure aborts provision");
+    assert_eq!(error.code(), Some("ContainerAppJobError"));
+
+    let last = azure
+        .transport()
+        .request(azure.transport().request_count() - 1);
+    assert_eq!(last.method, Method::Delete);
+    assert!(last.url.contains("/providers/Microsoft.App/jobs/"));
+}
+
+#[tokio::test]
+async fn a_vm_provision_yields_a_continuation_and_resumes() {
+    let mut tail = vec![accepted_with_operation(None)];
+    tail.extend((0..POLLS_PER_INVOCATION).map(|_| operation("InProgress")));
+    let mut azure = provider(provision_script(tail));
+
+    let outcome = azure
+        .provision(&request(MachineId::generate(), X64_TYPE, false))
+        .await
+        .expect("VM build yields Pending");
+    let Provisioning::Pending {
+        machine,
+        continuation,
+    } = outcome
+    else {
+        panic!("expected Pending when VM PUT outlives POLLS_PER_INVOCATION");
+    };
+    assert_eq!(machine.state, MachineState::Provisioning);
+
+    let mut resumed = provider(vec![token(), operation("Succeeded")]);
+    let ready = resumed
+        .resume(&machine, &continuation)
+        .await
+        .and_then(Provisioning::ready)
+        .expect("resume completes VM provision");
+    assert_eq!(ready.state, MachineState::Running);
+    assert_eq!(ready.id, machine.id);
+}
+
+#[tokio::test]
+async fn resizing_across_cpu_architectures_is_refused_before_deallocating() {
+    let mut machine = provisioned(MachineId::generate());
+    machine.region = ARM64_REGION.to_owned();
+    let mut x64_sku = serde_json::from_str::<Value>(SKUS).expect("x64 skus")["value"][0].clone();
+    let mut arm_sku =
+        serde_json::from_str::<Value>(ARM64_SKUS).expect("arm64 skus")["value"][0].clone();
+    x64_sku["locations"] = serde_json::json!([ARM64_REGION]);
+    x64_sku["restrictions"] = serde_json::json!([]);
+    arm_sku["locations"] = serde_json::json!([ARM64_REGION]);
+    arm_sku["restrictions"] = serde_json::json!([]);
+    let first_x64 = x64_sku["name"].as_str().expect("name").to_owned();
+    let first_arm = arm_sku["name"].as_str().expect("name").to_owned();
+    let combined = serde_json::json!({ "value": [x64_sku, arm_sku] });
+    let mut azure = provider(vec![
+        token(),
+        json(200, NO_POLICY),
+        vm_record(&first_arm),
+        json(200, &combined.to_string()),
+    ]);
+
+    let error = azure
+        .resize(&machine, &first_x64)
+        .await
+        .expect_err("cross-architecture resize is unsupported");
+    assert!(matches!(error, ProviderError::Unsupported { .. }));
+    assert!(
+        !(0..azure.transport().request_count()).any(|i| azure
+            .transport()
+            .request(i)
+            .url
+            .contains("/deallocate")),
+        "VM must not be deallocated before architecture validation"
+    );
 }

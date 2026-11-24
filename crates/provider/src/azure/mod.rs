@@ -99,14 +99,46 @@ use flyco_core::machine::{
 use flyco_core::money::Usd;
 use flyco_core::{CloudSpend, MachineId};
 
+use serde::{Deserialize, Serialize};
+
 use crate::clock::{MonotonicClock, SystemClock, SystemTimer, Timer};
 use crate::http::{HttpRequest, HttpResponse, HttpTransport, Method};
 use crate::login_key::LoginKey;
-use crate::polling::{MAX_POLL_ATTEMPTS, POLLS_PER_INVOCATION, poll_delay};
+use crate::polling::{MAX_POLL_ATTEMPTS, POLLS_PER_INVOCATION, PageCursor, poll_delay};
 use crate::{
     CapacityMode, CloudProvider, Continuation, LiveTransport, Machine, ProviderError,
     ProvisionRequest, Provisioning, cloud_init, flycod,
 };
+
+/// Minimal view of an existing Azure VM returned by `GET`, used by `resize_vm`
+/// to read the current `vmSize` for architecture validation and same-pool
+/// quota subtraction before stopping the machine.
+#[derive(Debug, Deserialize)]
+struct ExistingVm {
+    #[serde(default)]
+    properties: ExistingVmProperties,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExistingVmProperties {
+    #[serde(default)]
+    hardware_profile: ExistingHardwareProfile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExistingHardwareProfile {
+    #[serde(default)]
+    vm_size: Option<String>,
+}
+
+/// Where an Azure VM provision got to when its invocation poll budget ran out.
+#[derive(Debug, Serialize, Deserialize)]
+struct VmCreateInProgress {
+    follow: Follow,
+    capacity_mode: CapacityMode,
+}
 
 use arm::{ErrorBody, Follow, OperationBody, OperationStatus, ProviderRegistration, api_version};
 use auth::{ServicePrincipal, TokenCache};
@@ -711,18 +743,28 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
             return Ok(policy.clone());
         }
 
-        let url = arm::subscription_url(
+        let initial = arm::subscription_url(
             self.subscription(),
             "providers/Microsoft.Authorization/policyAssignments",
             api_version::POLICY_ASSIGNMENTS,
         );
-        let response = self.send(HttpRequest::new(Method::Get, url)).await?;
-        if !response.is_success() {
-            return Err(refusal(&response));
+        let mut cursor = PageCursor::starting_at(&initial);
+        let mut next = Some(initial);
+        let mut assignments = Vec::new();
+        while let Some(url) = next {
+            let response = self.send(HttpRequest::new(Method::Get, url)).await?;
+            if !response.is_success() {
+                return Err(refusal(&response));
+            }
+            let page: AssignmentPage = response.json()?;
+            assignments.extend(page.value);
+            next = cursor.advance(page.next_link, "Azure policy assignments")?;
         }
 
-        let page: AssignmentPage = response.json()?;
-        let policy = RegionPolicy::from_page(&page);
+        let policy = RegionPolicy::from_page(&AssignmentPage {
+            value: assignments,
+            next_link: None,
+        });
         if let Some(regions) = policy.regions() {
             tracing::debug!(
                 allowed = regions.join(","),
@@ -941,11 +983,13 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
             .append_pair("api-version", api_version::SKUS)
             .append_pair("$filter", &format!("location eq '{region}'"))
             .finish();
-        let mut next = Some(format!(
+        let initial = format!(
             "{}/subscriptions/{}/providers/Microsoft.Compute/skus?{query}",
             arm::MANAGEMENT_BASE,
             self.subscription()
-        ));
+        );
+        let mut cursor = PageCursor::starting_at(&initial);
+        let mut next = Some(initial);
 
         let mut collected = Vec::new();
         while let Some(url) = next {
@@ -955,7 +999,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
             }
             let page: SkuPage = response.json()?;
             collected.extend(page.value.into_iter().filter(Sku::is_virtual_machine));
-            next = page.next_link;
+            next = cursor.advance(page.next_link, "Azure VM SKUs")?;
         }
         Ok(collected)
     }
@@ -1191,19 +1235,107 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
                 }],
             },
         };
-        self.send_and_await(
-            HttpRequest::new(
-                Method::Put,
-                self.resource_url(
-                    "Microsoft.Network/networkInterfaces",
-                    &names::network_interface(id),
-                    api_version::NETWORK,
-                ),
+        let nic_result = self
+            .send_and_await(
+                HttpRequest::new(
+                    Method::Put,
+                    self.resource_url(
+                        "Microsoft.Network/networkInterfaces",
+                        &names::network_interface(id),
+                        api_version::NETWORK,
+                    ),
+                )
+                .json_body(&interface)?,
             )
-            .json_body(&interface)?,
-        )
-        .await?;
+            .await;
+        if let Err(error) = nic_result {
+            // The Standard Static Public IP is billed by the hour even when
+            // unattached, so remove it when interface creation fails.
+            self.cleanup_resource(
+                "Microsoft.Network/publicIPAddresses",
+                &names::public_ip(id),
+                api_version::NETWORK,
+            )
+            .await;
+            return Err(error);
+        }
         Ok(())
+    }
+
+    /// Best-effort deletion of one ARM resource during provision rollback.
+    ///
+    /// Cleanup failures are logged rather than returned so the original
+    /// provisioning refusal is never masked.
+    async fn cleanup_resource(&mut self, provider_path: &str, name: &str, version: &str) {
+        let url = self.resource_url(provider_path, name, version);
+        if let Err(error) = self.delete_and_await(url).await {
+            tracing::warn!(
+                %error,
+                %provider_path,
+                %name,
+                "could not clean up an Azure resource after a failed provision"
+            );
+        }
+    }
+
+    /// Best-effort reverse-dependency cleanup of VM resources created before a
+    /// provisioning failure: VM, NIC, Public IP, and detached OS disk.
+    async fn cleanup_failed_vm(&mut self, id: MachineId) {
+        if let Err(error) = self.delete_and_await(self.machine_url(id)).await {
+            tracing::warn!(
+                %error,
+                machine = %id,
+                "could not delete a partially created Azure VM during rollback"
+            );
+        }
+        for (provider_path, name, version) in [
+            (
+                "Microsoft.Network/networkInterfaces",
+                names::network_interface(id),
+                api_version::NETWORK,
+            ),
+            (
+                "Microsoft.Network/publicIPAddresses",
+                names::public_ip(id),
+                api_version::NETWORK,
+            ),
+            (
+                "Microsoft.Compute/disks",
+                names::os_disk(id),
+                api_version::DISKS,
+            ),
+        ] {
+            self.cleanup_resource(provider_path, &name, version).await;
+        }
+    }
+
+    /// Best-effort cleanup of a Container Apps job created before execution
+    /// startup failed, preventing jobs holding `daemon-config` secrets from
+    /// leaking when `native_id` has not been persisted.
+    async fn cleanup_failed_job(&mut self, job: &str) {
+        if let Ok(live) = self.live_executions(job).await {
+            for record in live {
+                let execution = containers::Execution {
+                    job,
+                    name: &record.name,
+                };
+                if let Err(error) = self.stop_execution(&execution).await {
+                    tracing::warn!(
+                        %error,
+                        %job,
+                        execution = %record.name,
+                        "could not stop a live Azure Container Apps execution during rollback"
+                    );
+                }
+            }
+        }
+        if let Err(error) = self.delete_and_await(self.job_url(job)).await {
+            tracing::warn!(
+                %error,
+                %job,
+                "could not delete an Azure Container Apps job during rollback"
+            );
+        }
     }
 
     /// The URL of one machine's virtual machine resource.
@@ -1230,6 +1362,29 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
             .await
     }
 
+    /// Sends one VM `PUT` and follows its async operation for at most
+    /// [`POLLS_PER_INVOCATION`] polls.
+    async fn put_machine_budgeted(
+        &mut self,
+        url: String,
+        body: &bodies::VirtualMachine,
+    ) -> Result<Option<Follow>, ProviderError> {
+        let response = self
+            .send(HttpRequest::new(Method::Put, url).json_body(body)?)
+            .await?;
+        if !response.is_success() {
+            return Err(refusal(&response));
+        }
+        let follow = arm::follow(&response)?;
+        if follow == Follow::Finished {
+            return Ok(None);
+        }
+        match self.follow_operation(follow, POLLS_PER_INVOCATION).await? {
+            Followed::Done(_) => Ok(None),
+            Followed::Still(pending) => Ok(Some(pending)),
+        }
+    }
+
     /// Creates the machine, falling back to on-demand when spot is refused.
     ///
     /// The fallback re-checks quota, because the two markets are funded from
@@ -1243,17 +1398,15 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
         sku: &Sku,
         region: &str,
         quotas: &Quotas,
-    ) -> Result<CapacityMode, ProviderError> {
+    ) -> Result<(CapacityMode, Option<Follow>), ProviderError> {
         let url = self.machine_url(id);
         let asked_for_spot = body.properties.is_spot();
 
-        let attempt = self
-            .send_and_await(HttpRequest::new(Method::Put, url.clone()).json_body(&body)?)
-            .await;
+        let attempt = self.put_machine_budgeted(url.clone(), &body).await;
 
         match attempt {
-            Ok(()) if asked_for_spot => Ok(CapacityMode::Spot),
-            Ok(()) => Ok(CapacityMode::OnDemand),
+            Ok(pending) if asked_for_spot => Ok((CapacityMode::Spot, pending)),
+            Ok(pending) => Ok((CapacityMode::OnDemand, pending)),
             Err(error) if asked_for_spot && spot_unsupported(&error) => {
                 quotas.require_capacity_for(sku, region, CapacityMode::OnDemand)?;
                 tracing::info!(
@@ -1265,9 +1418,8 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
                     properties: body.properties.without_spot(),
                     ..body
                 };
-                self.send_and_await(HttpRequest::new(Method::Put, url).json_body(&on_demand)?)
-                    .await?;
-                Ok(CapacityMode::OnDemand)
+                let pending = self.put_machine_budgeted(url, &on_demand).await?;
+                Ok((CapacityMode::OnDemand, pending))
             }
             Err(error) => Err(error),
         }
@@ -1275,7 +1427,10 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
 
     /// Provisions a session as a virtual machine: the three gates, the
     /// workspace, the two network resources, then the machine.
-    async fn provision_vm(&mut self, request: &ProvisionRequest) -> Result<Machine, ProviderError> {
+    async fn provision_vm(
+        &mut self,
+        request: &ProvisionRequest,
+    ) -> Result<Provisioning, ProviderError> {
         let MachineSpec {
             region,
             machine_type,
@@ -1289,12 +1444,40 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
             CapacityMode::OnDemand
         };
         let (sku, quotas) = self.deployable_sku(region, machine_type, requested).await?;
-        self.ensure_workspace(region).await?;
+        // Build the VM body before creating any billable network resources so
+        // a render/architecture failure leaves nothing behind.
+        let body = self.machine_body(request, &sku)?;
 
+        self.ensure_workspace(region).await?;
         self.create_session_network(id, region).await?;
 
-        let body = self.machine_body(request, &sku)?;
-        let capacity_mode = self.create_machine(id, body, &sku, region, &quotas).await?;
+        let (capacity_mode, pending_follow) =
+            match self.create_machine(id, body, &sku, region, &quotas).await {
+                Ok(result) => result,
+                Err(error) => {
+                    self.cleanup_failed_vm(id).await;
+                    return Err(error);
+                }
+            };
+
+        let native_id = self.resource_id("Microsoft.Compute/virtualMachines", &names::machine(id));
+        if let Some(follow) = pending_follow {
+            return Ok(Provisioning::Pending {
+                machine: Machine {
+                    id,
+                    native_id,
+                    runtime: Runtime::Vm,
+                    region: region.clone(),
+                    state: MachineState::Provisioning,
+                    capacity_mode,
+                    address: Some(names::fqdn(id, region)),
+                },
+                continuation: Continuation::write(&VmCreateInProgress {
+                    follow,
+                    capacity_mode,
+                })?,
+            });
+        }
 
         tracing::info!(
             machine = %id,
@@ -1303,32 +1486,120 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
             capacity = ?capacity_mode,
             "provisioned an Azure machine"
         );
-        Ok(Machine {
+        Ok(Provisioning::Ready(Machine {
             id,
-            native_id: self.resource_id("Microsoft.Compute/virtualMachines", &names::machine(id)),
+            native_id,
             runtime: Runtime::Vm,
             region: region.clone(),
             state: MachineState::Running,
             capacity_mode,
             address: Some(names::fqdn(id, region)),
-        })
+        }))
+    }
+
+    /// Resumes an Azure VM creation whose async operation outlived one
+    /// invocation's poll budget.
+    async fn resume_vm(
+        &mut self,
+        machine: &Machine,
+        continuation: &Continuation,
+    ) -> Result<Provisioning, ProviderError> {
+        let VmCreateInProgress {
+            follow,
+            capacity_mode,
+        } = continuation.read()?;
+        match self.follow_operation(follow, POLLS_PER_INVOCATION).await {
+            Ok(Followed::Done(_)) => Ok(Provisioning::Ready(Machine {
+                state: MachineState::Running,
+                capacity_mode,
+                ..machine.clone()
+            })),
+            Ok(Followed::Still(pending)) => Ok(Provisioning::Pending {
+                machine: machine.clone(),
+                continuation: Continuation::write(&VmCreateInProgress {
+                    follow: pending,
+                    capacity_mode,
+                })?,
+            }),
+            Err(error) => {
+                self.cleanup_failed_vm(machine.id).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads the current `vmSize` of an existing virtual machine, if ARM
+    /// reports one.
+    async fn current_vm_size(&mut self, id: MachineId) -> Result<Option<String>, ProviderError> {
+        let response = self
+            .send(HttpRequest::new(Method::Get, self.machine_url(id)))
+            .await?;
+        if !response.is_success() {
+            return Err(refusal(&response));
+        }
+        let existing: ExistingVm = response.json()?;
+        Ok(existing.properties.hardware_profile.vm_size)
     }
 
     /// Deallocate, `PATCH` the size, start.
     ///
-    /// Always through a deallocation, even from a running machine: a size
-    /// the current hardware cluster does not offer needs one anyway, and a
-    /// deterministic sequence beats a conditional one that is only sometimes
-    /// exercised. The result is read from the operations, never from the
-    /// machine — a failed resize leaves the resource reporting the size it
-    /// was asked for while still running on the old one.
+    /// Validates CPU architecture compatibility and quota (subtracting the
+    /// running VM's own vCPUs from shared pools) before deallocating so an
+    /// incompatible or over-quota request never leaves a live session stopped.
     async fn resize_vm(
         &mut self,
         machine: &Machine,
         new_machine_type: &str,
     ) -> Result<Machine, ProviderError> {
-        self.deployable_sku(&machine.region, new_machine_type, machine.capacity_mode)
-            .await?;
+        let region = machine.region.clone();
+        let policy = self.region_policy().await?;
+        if !policy.allows(&region) {
+            return Err(ProviderError::Unavailable {
+                machine_type: new_machine_type.to_owned(),
+                region,
+                reason: policy.refusal(&machine.region),
+            });
+        }
+
+        let current_size = self.current_vm_size(machine.id).await?;
+        let skus = self.list_skus(&region).await?;
+        let target = skus
+            .iter()
+            .find(|sku| sku.name == new_machine_type)
+            .ok_or_else(|| ProviderError::Unavailable {
+                machine_type: new_machine_type.to_owned(),
+                region: region.clone(),
+                reason: "the subscription lists no such machine type in this region".to_owned(),
+            })?;
+
+        if let Availability::Unavailable { reason } = target.availability(&region) {
+            return Err(ProviderError::Unavailable {
+                machine_type: new_machine_type.to_owned(),
+                region,
+                reason,
+            });
+        }
+
+        let current_sku = current_size
+            .as_deref()
+            .and_then(|name| skus.iter().find(|sku| sku.name == name));
+        if let (Some(current_arch), Some(target_arch)) = (
+            current_sku.and_then(Sku::architecture),
+            target.architecture(),
+        ) && current_arch != target_arch
+        {
+            return Err(ProviderError::Unsupported {
+                provider: PROVIDER,
+                operation: "resize",
+                reason: "a virtual machine cannot be resized across CPU architectures",
+            });
+        }
+
+        let releasing = (machine.state == MachineState::Running)
+            .then_some(current_sku)
+            .flatten();
+        let quotas = self.read_quotas(&region).await?;
+        quotas.require_capacity_for_resize(target, releasing, &region, machine.capacity_mode)?;
 
         self.post_action(machine.id, "deallocate").await?;
 
@@ -1770,6 +2041,59 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
         })
     }
 
+    /// `PUT`s a Container Apps job definition, returning `Ok(Some(Pending))`
+    /// if a sibling delivery is already writing it or the operation outlives
+    /// one invocation's poll budget, or `Ok(None)` when the job is ready to
+    /// start.
+    async fn put_job_budgeted<B: serde::Serialize>(
+        &mut self,
+        id: MachineId,
+        job: &str,
+        body: &B,
+        pending: &Machine,
+    ) -> Result<Option<Provisioning>, ProviderError> {
+        let response = self
+            .send(HttpRequest::new(Method::Put, self.job_url(job)).json_body(body)?)
+            .await?;
+        if job_busy(&response) {
+            tracing::info!(
+                machine = %id,
+                %job,
+                "a sibling leg's write to this job is still under way; joining the build"
+            );
+            return Ok(Some(Provisioning::Pending {
+                machine: pending.clone(),
+                continuation: Continuation::write(&containers::StartInProgress {
+                    job: job.to_owned(),
+                    follow: None,
+                })?,
+            }));
+        }
+        if !response.is_success() {
+            return Err(refusal(&response));
+        }
+        let follow = arm::follow(&response)?;
+        if follow != Follow::Finished {
+            match self.follow_operation(follow, POLLS_PER_INVOCATION).await {
+                Ok(Followed::Done(_)) => {}
+                Ok(Followed::Still(_)) => {
+                    return Ok(Some(Provisioning::Pending {
+                        machine: pending.clone(),
+                        continuation: Continuation::write(&containers::StartInProgress {
+                            job: job.to_owned(),
+                            follow: None,
+                        })?,
+                    }));
+                }
+                Err(error) => {
+                    self.cleanup_failed_job(job).await;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     /// Provisions a session as one execution of a Container Apps job.
     ///
     /// Three writes deep, the same shape the virtual-machine path has: the
@@ -1804,56 +2128,37 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> AzureProvider<T, C, K> {
             size,
         )?;
 
-        // What the machine is before its execution has a name: enough to
-        // destroy it by, should the build be given up.
         let pending = Machine {
             id,
             native_id: job.clone(),
             runtime: Runtime::Container,
             region: region.clone(),
             state: MachineState::Provisioning,
-            // Container Apps sells no interruptible capacity, so a session
-            // that asked for spot holds ordinary capacity and is billed for
-            // it. Recorded rather than refused: what the machine actually
-            // holds is what the price follows, and there is nothing here for
-            // a user to act on.
             capacity_mode: CapacityMode::OnDemand,
-            // Nothing dials a container. Its daemon opens the connection to
-            // the control plane, and Container Apps gives a job no inbound
-            // address at all.
             address: None,
         };
 
-        let response = self
-            .send(HttpRequest::new(Method::Put, self.job_url(&job)).json_body(&body)?)
-            .await?;
-        if job_busy(&response) {
-            // A queue redelivery: a sibling leg's write to this same job is
-            // still being carried out, and Azure refuses a second write over
-            // it. This leg joins that build rather than failing on work its
-            // own delivery caused — the continuation that carries on waits
-            // the write out and reports the execution the sibling starts.
-            tracing::info!(
-                machine = %id,
-                %job,
-                "a sibling leg's write to this job is still under way; joining the build"
-            );
-            return Ok(Provisioning::Pending {
-                machine: pending,
-                continuation: Continuation::write(&containers::StartInProgress {
-                    job,
-                    follow: None,
-                })?,
-            });
+        if let Some(pending_result) = self.put_job_budgeted(id, &job, &body, &pending).await? {
+            return Ok(pending_result);
         }
-        if !response.is_success() {
-            return Err(refusal(&response));
-        }
-        self.await_operation(response).await?;
 
-        match self.begin_execution(&job).await? {
+        let started = match self.begin_execution(&job).await {
+            Ok(started) => started,
+            Err(error) => {
+                self.cleanup_failed_job(&job).await;
+                return Err(error);
+            }
+        };
+
+        match started {
             Started::Running(_) => {
-                let execution = self.converge_executions(&job).await?;
+                let execution = match self.converge_executions(&job).await {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        self.cleanup_failed_job(&job).await;
+                        return Err(error);
+                    }
+                };
                 tracing::info!(
                     machine = %id,
                     machine_type = %request.spec.machine_type,
@@ -2329,7 +2634,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> CloudProvider for AzureProvi
             ));
         }
         match request.spec.runtime {
-            Runtime::Vm => self.provision_vm(request).await.map(Provisioning::Ready),
+            Runtime::Vm => self.provision_vm(request).await,
             Runtime::Container => self.provision_container(request).await,
         }
     }
@@ -2340,9 +2645,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer> CloudProvider for AzureProvi
         continuation: &Continuation,
     ) -> Result<Provisioning, ProviderError> {
         match machine.runtime {
-            Runtime::Vm => Err(ProviderError::Malformed(
-                "an Azure virtual machine is built in one call and has nothing to resume",
-            )),
+            Runtime::Vm => self.resume_vm(machine, continuation).await,
             Runtime::Container => self.resume_container(machine, continuation).await,
         }
     }

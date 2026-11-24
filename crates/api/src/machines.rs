@@ -10,10 +10,11 @@
 
 use flyco_core::{
     AUTO_MIN_MEMORY_MIB, AUTO_MIN_VCPUS, AgentMachineView, BillingMinimum, ClientEvent,
-    CloudProviderKind, ControlToDaemon, CurrentUser, DEFAULT_DISK_GIB, MachineCapacity,
-    MachineCatalog, MachineCatalogEntry, MachineChoice, MachineDefault, MachineId, MachineSpec,
-    MachineState, MachineView, OsFamily, ProviderAccountId, RegionLocation, ResizeMachine, Runtime,
-    SessionId, SessionMachine, StopReason, Usd, UserId, auto_linux_choice, curate,
+    CloudProviderKind, ControlToDaemon, CpuArchitecture, CurrentUser, DEFAULT_DISK_GIB,
+    MachineCapacity, MachineCatalog, MachineCatalogEntry, MachineChoice, MachineDefault, MachineId,
+    MachineSpec, MachineState, MachineView, OsFamily, ProviderAccountId, RegionLocation,
+    ResizeMachine, Runtime, SessionId, SessionMachine, StopReason, Usd, UserId, auto_linux_choice,
+    curate,
 };
 use serde::Deserialize;
 use skyzen::extract::Query;
@@ -276,6 +277,69 @@ fn resize_filter(row: &MachineRow) -> CatalogFilter {
     }
 }
 
+/// Whether `entry` matches the running machine's CPU architecture.
+///
+/// Resizing across architectures (x86-64 ↔ arm64) is refused by every cloud
+/// VM provider and would stop the running machine before failing. When the
+/// current machine's architecture is known from the account's cached catalog,
+/// only entries with that same architecture are offered.
+fn matches_resize_architecture(
+    entry: &MachineCatalogEntry,
+    current_architecture: Option<CpuArchitecture>,
+) -> bool {
+    current_architecture.is_none_or(|arch| {
+        entry
+            .lineage
+            .as_ref()
+            .is_some_and(|lineage| lineage.architecture == arch)
+    })
+}
+
+/// Looks up the CPU architecture of `row`'s current machine type from the
+/// account's cached catalog document, if present.
+async fn current_machine_architecture(
+    kv: &Kv,
+    row: &MachineRow,
+) -> Result<Option<CpuArchitecture>, ApiError> {
+    let Some(document) = catalog::read(kv, row.provider_account_id).await? else {
+        return Ok(None);
+    };
+    Ok(document
+        .entries()
+        .find(|entry| {
+            entry.machine_type == row.machine_type
+                && entry.region.eq_ignore_ascii_case(&row.region)
+                && entry.runtime == row.runtime
+        })
+        .and_then(|entry| entry.lineage.as_ref().map(|lineage| lineage.architecture)))
+}
+
+/// Every catalog entry `row` is allowed to resize into (same account, region,
+/// runtime, and CPU architecture).
+async fn resize_entries(
+    db: &Db,
+    config: &ApiConfig,
+    github: &impl GithubOauth,
+    kv: &Kv,
+    user: UserId,
+    row: &MachineRow,
+) -> Result<Vec<MachineCatalogEntry>, ApiError> {
+    let current_arch = current_machine_architecture(kv, row).await?;
+    let mut entries = catalog(
+        db,
+        config,
+        github,
+        kv,
+        Refresh::ReadOnly,
+        user,
+        &resize_filter(row),
+    )
+    .await?
+    .entries;
+    entries.retain(|entry| matches_resize_architecture(entry, current_arch));
+    Ok(entries)
+}
+
 /// Every type this session's machine can become.
 ///
 /// # Errors
@@ -291,17 +355,7 @@ pub(crate) async fn resize_catalog(
     session: SessionId,
 ) -> Result<Vec<MachineCatalogEntry>, ApiError> {
     let row = load(db, user, session).await?;
-    Ok(catalog(
-        db,
-        config,
-        github,
-        kv,
-        Refresh::ReadOnly,
-        user,
-        &resize_filter(&row),
-    )
-    .await?
-    .entries)
+    resize_entries(db, config, github, kv, user, &row).await
 }
 
 /// Resolves a requested type against the catalog the session may move within.
@@ -314,20 +368,11 @@ async fn offered(
     row: &MachineRow,
     machine_type: &str,
 ) -> Result<MachineCatalogEntry, ApiError> {
-    catalog(
-        db,
-        config,
-        github,
-        kv,
-        Refresh::ReadOnly,
-        user,
-        &resize_filter(row),
-    )
-    .await?
-    .entries
-    .into_iter()
-    .find(|entry| entry.machine_type == machine_type)
-    .ok_or_else(|| ApiError::MachineTypeNotOffered(machine_type.to_owned()))
+    resize_entries(db, config, github, kv, user, row)
+        .await?
+        .into_iter()
+        .find(|entry| entry.machine_type == machine_type)
+        .ok_or_else(|| ApiError::MachineTypeNotOffered(machine_type.to_owned()))
 }
 
 /// Moves a session's machine to another type and tells everyone watching.
@@ -1883,5 +1928,38 @@ mod tests {
             ..entry("build.lexo.cool", None)
         };
         assert!(on_the_agents_authority(&owned).is_ok());
+    }
+
+    #[test]
+    fn resize_architecture_filter_blocks_cross_architecture_targets() {
+        use flyco_core::machine::{CpuArchitecture, MachineLineage};
+
+        let mut x86 = entry("m7i.large", None);
+        x86.lineage = Some(MachineLineage {
+            architecture: CpuArchitecture::X8664,
+            family: "m".to_owned(),
+            generation: Some(7),
+        });
+        let mut arm = entry("m7g.large", None);
+        arm.lineage = Some(MachineLineage {
+            architecture: CpuArchitecture::Arm64,
+            family: "m".to_owned(),
+            generation: Some(7),
+        });
+        let unknown = entry("custom.large", None);
+
+        assert!(super::matches_resize_architecture(
+            &x86,
+            Some(CpuArchitecture::X8664)
+        ));
+        assert!(!super::matches_resize_architecture(
+            &arm,
+            Some(CpuArchitecture::X8664)
+        ));
+        assert!(!super::matches_resize_architecture(
+            &unknown,
+            Some(CpuArchitecture::X8664)
+        ));
+        assert!(super::matches_resize_architecture(&arm, None));
     }
 }

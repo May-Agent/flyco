@@ -32,7 +32,7 @@ use crate::ProviderError;
 use crate::azure::arm::RETRY_AFTER_HEADER;
 use crate::clock::{MonotonicClock, Timer};
 use crate::http::{HttpRequest, HttpResponse, HttpTransport, Method};
-use crate::polling::poll_delay;
+use crate::polling::{PageCursor, poll_delay};
 
 /// The unauthenticated retail-prices endpoint.
 pub const RETAIL_PRICES_URL: &str = "https://prices.azure.com/api/retail/prices";
@@ -468,7 +468,9 @@ async fn read_containers<T: HttpTransport, K: Timer>(
 ) -> Result<Option<ContainerPrices>, ProviderError> {
     let mut vcpu_hourly = None;
     let mut gib_hourly = None;
-    let mut next = Some(container_url(region));
+    let initial = container_url(region);
+    let mut cursor = PageCursor::starting_at(&initial);
+    let mut next = Some(initial);
 
     while let Some(url) = next {
         let page = read_page(transport, timer, &url, "Container Apps pricing").await?;
@@ -479,7 +481,7 @@ async fn read_containers<T: HttpTransport, K: Timer>(
                 _ => {}
             }
         }
-        next = page.next_page_link;
+        next = cursor.advance(page.next_page_link, "Azure Container Apps pricing")?;
     }
 
     Ok(vcpu_hourly
@@ -586,7 +588,9 @@ async fn read_storage<T: HttpTransport, K: Timer>(
     region: &str,
 ) -> Result<StoragePricing, ProviderError> {
     let mut tiers = Vec::new();
-    let mut next = Some(storage_url(region));
+    let initial = storage_url(region);
+    let mut cursor = PageCursor::starting_at(&initial);
+    let mut next = Some(initial);
     while let Some(url) = next {
         let page = read_page(transport, timer, &url, "Standard SSD pricing").await?;
         for row in &page.items {
@@ -604,7 +608,7 @@ async fn read_storage<T: HttpTransport, K: Timer>(
                 ),
             });
         }
-        next = page.next_page_link;
+        next = cursor.advance(page.next_page_link, "Azure Standard SSD pricing")?;
     }
     tiers.sort_by_key(|tier| tier.capacity_gib);
     if tiers.is_empty() {
@@ -622,7 +626,9 @@ async fn read_region<T: HttpTransport, K: Timer>(
     region: &str,
 ) -> Result<Vec<(String, MachinePrices)>, ProviderError> {
     let mut folded: Vec<(String, MachinePrices)> = Vec::new();
-    let mut next = Some(price_url(region));
+    let initial = price_url(region);
+    let mut cursor = PageCursor::starting_at(&initial);
+    let mut next = Some(initial);
 
     while let Some(url) = next {
         let page = read_page(transport, timer, &url, "a region's machine prices").await?;
@@ -648,7 +654,7 @@ async fn read_region<T: HttpTransport, K: Timer>(
             }
         }
 
-        next = page.next_page_link;
+        next = cursor.advance(page.next_page_link, "Azure retail VM prices")?;
     }
 
     Ok(folded)

@@ -48,7 +48,7 @@
 pub mod script;
 mod wire;
 
-pub use script::render;
+pub use script::{RenderedScript, render};
 pub use wire::{ControlToHost, HostAttach, HostAttached, HostCommand, HostFrames, HostToControl};
 
 use flyco_core::host::HostFacts;

@@ -439,6 +439,10 @@ pub struct InstanceStatus {
     /// `PROVISIONING`, `STAGING`, `RUNNING`, `STOPPING`, `TERMINATED`, …
     #[serde(default)]
     pub status: String,
+    /// Full zonal URL of the instance's current machine type, e.g.
+    /// `.../zones/us-central1-a/machineTypes/e2-standard-2`.
+    #[serde(rename = "machineType", default)]
+    pub machine_type: String,
     /// Its interfaces, which is where the external address is.
     #[serde(rename = "networkInterfaces", default)]
     pub network_interfaces: Vec<InstanceInterface>,
@@ -461,6 +465,23 @@ pub struct InstanceAccessConfig {
 }
 
 impl InstanceStatus {
+    /// The short machine-type name (`e2-standard-2`) from `machineType`, when
+    /// reported.
+    #[must_use]
+    pub fn machine_type_name(&self) -> Option<&str> {
+        let name = self.machine_type.rsplit('/').next()?;
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Whether the instance is currently consuming vCPU quota in its region.
+    ///
+    /// Stopped (`TERMINATED` / `STOPPED`) instances release compute and spend
+    /// no regional vCPU quota.
+    #[must_use]
+    pub fn consumes_quota(&self) -> bool {
+        !matches!(self.status.as_str(), "TERMINATED" | "STOPPED")
+    }
+
     /// The address the daemon bootstrap reaches this machine on.
     #[must_use]
     pub fn address(&self) -> Option<String> {

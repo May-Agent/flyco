@@ -61,7 +61,9 @@ impl Quotas {
             .map(|(_, usage, limit)| (whole(*usage), whole(*limit)))
     }
 
-    /// Refuses unless `vcpus` more virtual CPUs fit under `metric`.
+    /// Refuses unless `vcpus` virtual CPUs fit under `metric` after releasing
+    /// `releasing_vcpus` from the same pool (non-zero when resizing a running
+    /// instance in place).
     ///
     /// A quota the region does not publish is not treated as unlimited: it
     /// is a metric name this driver got wrong, and provisioning against it
@@ -72,7 +74,13 @@ impl Quotas {
     ///
     /// Returns [`ProviderError::QuotaExceeded`] when the headroom is not
     /// there, or [`ProviderError::Unavailable`] when the quota is unknown.
-    pub fn require(&self, metric: &str, region: &str, vcpus: u32) -> Result<(), ProviderError> {
+    pub fn require_after_release(
+        &self,
+        metric: &str,
+        region: &str,
+        vcpus: u32,
+        releasing_vcpus: u32,
+    ) -> Result<(), ProviderError> {
         let Some((used, limit)) = self.get(metric) else {
             return Err(ProviderError::Unavailable {
                 machine_type: metric.to_owned(),
@@ -81,7 +89,8 @@ impl Quotas {
             });
         };
 
-        if used.saturating_add(vcpus) <= limit {
+        let effective_used = used.saturating_sub(releasing_vcpus);
+        if effective_used.saturating_add(vcpus) <= limit {
             return Ok(());
         }
 
@@ -90,9 +99,19 @@ impl Quotas {
             quota: metric.to_owned(),
             region: region.to_owned(),
             limit,
-            used,
+            used: effective_used,
             requested: vcpus,
         })
+    }
+
+    /// Refuses unless `vcpus` more virtual CPUs fit under `metric`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::QuotaExceeded`] when the headroom is not
+    /// there, or [`ProviderError::Unavailable`] when the quota is unknown.
+    pub fn require(&self, metric: &str, region: &str, vcpus: u32) -> Result<(), ProviderError> {
+        self.require_after_release(metric, region, vcpus, 0)
     }
 
     /// Refuses unless the pool that funds this capacity mode covers one more
@@ -107,10 +126,28 @@ impl Quotas {
         region: &str,
         mode: CapacityMode,
     ) -> Result<(), ProviderError> {
-        if mode.is_spot() {
-            return self.require(PREEMPTIBLE_CPUS_QUOTA, region, vcpus);
-        }
-        self.require(CPUS_QUOTA, region, vcpus)
+        self.require_capacity_for_resize(vcpus, 0, region, mode)
+    }
+
+    /// Refuses unless the pool that funds `mode` covers `target_vcpus` once
+    /// `releasing_vcpus` from the currently running VM are freed.
+    ///
+    /// # Errors
+    ///
+    /// Returns whichever check fails.
+    pub fn require_capacity_for_resize(
+        &self,
+        target_vcpus: u32,
+        releasing_vcpus: u32,
+        region: &str,
+        mode: CapacityMode,
+    ) -> Result<(), ProviderError> {
+        let metric = if mode.is_spot() {
+            PREEMPTIBLE_CPUS_QUOTA
+        } else {
+            CPUS_QUOTA
+        };
+        self.require_after_release(metric, region, target_vcpus, releasing_vcpus)
     }
 }
 
@@ -211,5 +248,20 @@ mod tests {
         assert!(!is_up(&region(include_str!(
             "../../fixtures/gcp/region_down.json"
         ))));
+    }
+
+    #[test]
+    fn resize_subtracts_the_running_vms_own_vcpus_from_the_pool() {
+        let quotas = quotas(); // CPUS: 2 used / 8 limit
+        // Requesting 8 new vCPUs fails (2 + 8 > 8), but resizing a running
+        // 2-vCPU VM to 8 vCPUs succeeds ((2 - 2) + 8 <= 8).
+        assert!(
+            quotas
+                .require_capacity_for(8, "us-central1", CapacityMode::OnDemand)
+                .is_err()
+        );
+        quotas
+            .require_capacity_for_resize(8, 2, "us-central1", CapacityMode::OnDemand)
+            .expect("releasing the running VM's 2 vCPUs makes room for 8");
     }
 }

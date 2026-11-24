@@ -67,7 +67,7 @@ use super::{
 use crate::clock::{MonotonicClock, Timer, WallClock};
 use crate::host::CONFIG_ENV;
 use crate::http::{HttpRequest, HttpResponse, HttpTransport, Method};
-use crate::polling::{MAX_POLL_ATTEMPTS, poll_delay};
+use crate::polling::{MAX_POLL_ATTEMPTS, POLLS_PER_INVOCATION, PageCursor, poll_delay};
 use crate::{CapacityMode, Machine, ProviderError, ProvisionRequest};
 
 /// The Cloud Run Admin API's base URL.
@@ -838,10 +838,13 @@ pub fn refusal(project: &str, response: &HttpResponse) -> ProviderError {
 }
 
 /// What a create found when it asked Cloud Run for the job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum JobCreation {
     /// The job did not exist and now does.
     Created,
+    /// The job creation operation is still running past this invocation's poll
+    /// budget; carry on from this operation URL.
+    Pending(String),
     /// A job of that name was already there, which on an at-least-once
     /// queue means this create is a redelivery.
     AlreadyExisted,
@@ -867,6 +870,22 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
         .await
     }
 
+    /// Reads a Cloud Run resource, returning `Ok(None)` when the resource is
+    /// already gone (`404`).
+    async fn read_run_optional<R: serde::de::DeserializeOwned>(
+        &mut self,
+        url: String,
+    ) -> Result<Option<R>, ProviderError> {
+        let response = self.send(HttpRequest::new(Method::Get, url)).await?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if !response.is_success() {
+            return Err(refusal(self.project(), &response));
+        }
+        Ok(Some(response.json()?))
+    }
+
     /// Sends a mutating Cloud Run request and answers with the operation it
     /// started, without waiting for it.
     async fn start_run_operation(
@@ -884,16 +903,37 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
         self.await_run_operation(operation).await
     }
 
-    /// Follows a Cloud Run operation to `done`.
+    /// Sends a Cloud Run request where `404` means the target is already gone,
+    /// otherwise following the returned operation to `done`.
+    async fn send_run_or_gone_and_await(
+        &mut self,
+        request: HttpRequest,
+    ) -> Result<(), ProviderError> {
+        let response = self.send(request).await?;
+        if response.status == 404 {
+            return Ok(());
+        }
+        if !response.is_success() {
+            return Err(refusal(self.project(), &response));
+        }
+        let operation: Operation = response.json()?;
+        self.await_run_operation(operation).await
+    }
+
+    /// Follows a Cloud Run operation for up to `budget` polls.
     ///
-    /// `done` alone is not success here either: the failure is inside the
-    /// finished operation, exactly as it is on Compute Engine.
-    async fn await_run_operation(&mut self, started: Operation) -> Result<(), ProviderError> {
+    /// Returns `Ok(None)` when `done` without error, or `Ok(Some(poll_url))`
+    /// when the operation is still running after `budget` polls.
+    pub(super) async fn follow_run_operation(
+        &mut self,
+        started: Operation,
+        budget: usize,
+    ) -> Result<Option<String>, ProviderError> {
         let mut operation = started;
 
-        for attempt in 0..MAX_POLL_ATTEMPTS {
+        for attempt in 0..budget {
             if operation.done {
-                return operation.failure().map_or(Ok(()), Err);
+                return operation.failure().map_or(Ok(None), Err);
             }
             if operation.name.is_empty() {
                 return Err(ProviderError::Malformed(
@@ -908,9 +948,32 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
             operation = self.read_run(url).await?;
         }
 
-        Err(ProviderError::Rejected(format!(
-            "a Cloud Run operation was still running after {MAX_POLL_ATTEMPTS} polls"
-        )))
+        if operation.done {
+            return operation.failure().map_or(Ok(None), Err);
+        }
+        if operation.name.is_empty() {
+            return Err(ProviderError::Malformed(
+                "Cloud Run started an operation without naming it, so it cannot be followed",
+            ));
+        }
+        Ok(Some(operation.poll_url()))
+    }
+
+    /// Follows a Cloud Run operation to `done`.
+    ///
+    /// `done` alone is not success here either: the failure is inside the
+    /// finished operation, exactly as it is on Compute Engine.
+    async fn await_run_operation(&mut self, started: Operation) -> Result<(), ProviderError> {
+        if self
+            .follow_run_operation(started, MAX_POLL_ATTEMPTS)
+            .await?
+            .is_some()
+        {
+            return Err(ProviderError::Rejected(format!(
+                "a Cloud Run operation was still running after {MAX_POLL_ATTEMPTS} polls"
+            )));
+        }
+        Ok(())
     }
 
     /// The job body for one provisioning request.
@@ -956,7 +1019,8 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
         }
     }
 
-    /// Creates the job, and says whether it was already there.
+    /// Creates the job, and says whether it was already there or is still
+    /// creating beyond this invocation's poll budget.
     async fn create_job(
         &mut self,
         region: &str,
@@ -973,8 +1037,10 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
 
         if response.is_success() {
             let operation: Operation = response.json()?;
-            self.await_run_operation(operation).await?;
-            return Ok(JobCreation::Created);
+            return Ok(self
+                .follow_run_operation(operation, POLLS_PER_INVOCATION)
+                .await?
+                .map_or(JobCreation::Created, JobCreation::Pending));
         }
 
         let error = refusal(self.project(), &response);
@@ -997,6 +1063,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
     ) -> Result<Option<String>, ProviderError> {
         let base = format!("{}/executions", job_url(self.project(), region, job));
         let mut next: Option<String> = None;
+        let mut cursor = PageCursor::new();
 
         loop {
             let url = next.as_ref().map_or_else(
@@ -1009,7 +1076,9 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
                 },
             );
 
-            let page: ExecutionPage = self.read_run(url).await?;
+            let Some(page) = self.read_run_optional::<ExecutionPage>(url).await? else {
+                return Ok(None);
+            };
             if let Some(live) = page
                 .executions
                 .iter()
@@ -1018,7 +1087,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
             {
                 return Ok(Some(live));
             }
-            next = page.next_page_token.filter(|token| !token.is_empty());
+            next = cursor.advance(page.next_page_token, "Cloud Run job executions")?;
             if next.is_none() {
                 return Ok(None);
             }
@@ -1048,18 +1117,21 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
     /// against a task that is still writing its `workdir-patch` would lose
     /// the session's work.
     ///
-    /// An execution that has already finished is left alone. That is not a
-    /// swallowed failure — it is the read that precedes the write: a task
-    /// that hit its timeout or died on its own is already stopped, and
-    /// asking Cloud Run to cancel it would refuse a `deallocate` that has
-    /// nothing left to do.
+    /// An execution that has already finished or is already gone (`404`) is
+    /// left alone so a `deallocate` or `destroy` still completes cleanly.
     async fn cancel_execution(
         &mut self,
         region: &str,
         handle: &Handle,
     ) -> Result<(), ProviderError> {
         let url = execution_url(self.project(), region, &handle.job, &handle.execution);
-        let execution: Execution = self.read_run(url.clone()).await?;
+        let Some(execution) = self.read_run_optional::<Execution>(url.clone()).await? else {
+            tracing::debug!(
+                execution = %handle.execution,
+                "the execution no longer exists, so there was nothing to cancel"
+            );
+            return Ok(());
+        };
         if !execution.is_live() {
             tracing::debug!(
                 execution = %handle.execution,
@@ -1068,7 +1140,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
             return Ok(());
         }
 
-        self.send_run_and_await(
+        self.send_run_or_gone_and_await(
             HttpRequest::new(Method::Post, format!("{url}:cancel"))
                 .json_body(&CancelExecutionRequest {})?,
         )
@@ -1112,7 +1184,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
     pub(super) async fn provision_job(
         &mut self,
         request: &ProvisionRequest,
-    ) -> Result<Machine, ProviderError> {
+    ) -> Result<crate::Provisioning, ProviderError> {
         let region = &request.spec.region;
         let size = Self::offered_size(&request.spec.machine_type, region)?;
         if Tier::of(region).is_none() {
@@ -1128,6 +1200,26 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
 
         let execution = match self.create_job(region, &job, &body).await? {
             JobCreation::Created => self.run_job(region, &job).await?,
+            JobCreation::Pending(operation_url) => {
+                return Ok(crate::Provisioning::Pending {
+                    machine: Machine {
+                        id: request.machine,
+                        native_id: job.clone(),
+                        runtime: Runtime::Container,
+                        region: region.clone(),
+                        state: MachineState::Provisioning,
+                        capacity_mode: CapacityMode::OnDemand,
+                        address: None,
+                    },
+                    continuation: crate::Continuation::write(
+                        &super::GcpContinuation::CloudRunJob {
+                            operation_url,
+                            region: region.clone(),
+                            job,
+                        },
+                    )?,
+                });
+            }
             JobCreation::AlreadyExisted => match self.live_execution(region, &job).await? {
                 Some(live) => {
                     tracing::info!(
@@ -1148,7 +1240,44 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
             %region,
             "provisioned a Cloud Run job"
         );
-        Ok(Self::container_machine(request.machine, region, &handle))
+        Ok(crate::Provisioning::Ready(Self::container_machine(
+            request.machine,
+            region,
+            &handle,
+        )))
+    }
+
+    /// Resumes a Cloud Run job creation that outlived one invocation's poll
+    /// budget, then starts its execution once created.
+    pub(super) async fn resume_job(
+        &mut self,
+        machine: &Machine,
+        operation_url: String,
+        region: String,
+        job: String,
+    ) -> Result<crate::Provisioning, ProviderError> {
+        let current: Operation = self.read_run(operation_url).await?;
+        if let Some(poll_url) = self
+            .follow_run_operation(current, POLLS_PER_INVOCATION)
+            .await?
+        {
+            return Ok(crate::Provisioning::Pending {
+                machine: machine.clone(),
+                continuation: crate::Continuation::write(&super::GcpContinuation::CloudRunJob {
+                    operation_url: poll_url,
+                    region,
+                    job,
+                })?,
+            });
+        }
+        let execution = match self.live_execution(&region, &job).await? {
+            Some(live) => live,
+            None => self.run_job(&region, &job).await?,
+        };
+        let handle = Handle { job, execution };
+        Ok(crate::Provisioning::Ready(Self::container_machine(
+            machine.id, &region, &handle,
+        )))
     }
 
     /// Stop, resize the definition, start — which is what a resize is on a
@@ -1256,7 +1385,8 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
     ///
     /// In that order, and the cancel comes first for the reason it does in a
     /// resize: a task still flushing its transcript is a session losing its
-    /// last turn.
+    /// last turn. Both calls treat `404` as already gone so an expired
+    /// execution never blocks deleting the job and its stored daemon config.
     pub(super) async fn destroy_job(
         &mut self,
         machine: &Machine,
@@ -1264,13 +1394,41 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
     ) -> Result<(), ProviderError> {
         let region = machine.region.clone();
         self.cancel_execution(&region, handle).await?;
-        self.send_run_and_await(HttpRequest::new(
+        self.send_run_or_gone_and_await(HttpRequest::new(
             Method::Delete,
             job_url(self.project(), &region, &handle.job),
         ))
         .await?;
 
         tracing::info!(machine = %machine.id, "destroyed a Cloud Run job");
+        Ok(())
+    }
+
+    /// Destroys a Cloud Run job whose build was given up before an execution
+    /// name was recorded (`native_id` names only the job).
+    pub(super) async fn destroy_pending_job(
+        &mut self,
+        machine: &Machine,
+        job: &str,
+    ) -> Result<(), ProviderError> {
+        let region = machine.region.clone();
+        if let Some(execution) = self.live_execution(&region, job).await? {
+            self.cancel_execution(
+                &region,
+                &Handle {
+                    job: job.to_owned(),
+                    execution,
+                },
+            )
+            .await?;
+        }
+        self.send_run_or_gone_and_await(HttpRequest::new(
+            Method::Delete,
+            job_url(self.project(), &region, job),
+        ))
+        .await?;
+
+        tracing::info!(machine = %machine.id, "destroyed a pending Cloud Run job");
         Ok(())
     }
 }
