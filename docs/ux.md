@@ -807,9 +807,9 @@ leaving the draft in the field.
 Same component as the home composer. Its row carries what a running
 session still has a say over, as the official composers do, left to right:
 
-- the **machine**, `D4ps_v6 · $0.17/hr · spot` (or `D4ps_v6 · Stopped`),
-  which opens the machine's own popover — the one card for the one
-  machine a session has, §9.4;
+- the **machine**, `D4ps_v6` showing cores and memory (or `Stopped`),
+  with price, spot/on-demand, and region inside the machine's own
+  popover — the one card for the one machine a session has, §9.4;
 - the **budget**, `$1.20 / $10`, which opens the budget slider of §9.1;
 - the **goal** chip, only where the running harness said it takes one —
   `Target` opens a small panel that states the condition and sets it,
@@ -1279,7 +1279,7 @@ Pre-1.0, the API changes to fit the product; no compatibility shims.
 
 ## 12. Delivery order
 
-Each item is one issue, one branch, one PR to `dev`, deployed to
+Each item is one issue, one branch, one PR to `main`, deployed to
 `dev.flyco.dev` on merge.
 
 1. Design system, shell, home (composer, chips, session list, readiness

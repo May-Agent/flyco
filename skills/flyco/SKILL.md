@@ -1,19 +1,20 @@
 ---
 name: flyco
-description: Drive Flyco cloud coding sessions through the `flyco` CLI. Use when offloading a task to a cloud-hosted Claude Code or Codex session — creating, messaging, watching, approving, and stopping sessions — or when a job needs a full remote machine rather than local edits. Covers the agent surface (`flyco run`, `flyco session …`); the interactive TUI path is for humans only.
+description: Drive Flyco cloud coding sessions through the `flyco` CLI. Use when offloading a task to a cloud-hosted Claude Code, Codex, Devin, or Antigravity session — creating, messaging, watching, approving, handing off, and stopping sessions — or when a job needs a full remote machine rather than local edits. Covers the agent surface (`flyco run`, `flyco session …`); the interactive ACP/SSE path is for humans only.
 ---
 
 # Flyco
 
-Flyco runs Claude Code and Codex sessions on cloud machines. The `flyco` CLI is the whole surface: REST for commands, one SSE stream for push, JSON everywhere a pipe is involved.
+Flyco runs Claude Code, Codex, Devin, and Antigravity sessions on cloud machines. The `flyco` CLI is the whole surface: REST for commands, one SSE stream for push, JSON everywhere a pipe is involved.
 
 ## When to use flyco
 
 - The task wants a dedicated machine — a full checkout, long-running builds, services, a real shell — rather than local edits.
 - The work should outlive this agent's context: a session persists on disk and can be resumed later.
-- Two harnesses exist: `--harness claude` (Claude Code) or `--harness codex` (Codex). Pick per task; both run the harness's real agent, not an emulation.
+- Four harnesses exist: `--harness claude` (Claude Code), `--harness codex` (Codex), `--harness devin` (Devin), or `--harness antigravity` (Antigravity). Pick per task; all four run the harness's real agent, not an emulation.
 - **`flyco run` vs `flyco session`**: `run` is the one-shot — create, stream the turn's events as JSONL, exit when the turn ends. `session …` is the primitive set for anything multi-step: create once, then `send`, `exec`, `wait`, `approve` over the session's life. Prefer `run` for fire-and-forget tasks; drop to `session` when you need to inspect, steer mid-turn, or reuse the machine.
-- The human path (`flyco claude`, `flyco codex`, `flyco resume`, bare `flyco`) opens a native TUI bridged to a terminal. It requires a TTY and is **not for agents** — do not invoke it.
+- **`flyco handoff`**: sends a local harness session's working state (model-written summary, `git diff --binary` patch, and transcript) to a fresh cloud session (`--from`, `--session`, `--harness`, `-m/--message`, `--no-summary`, `--include-untracked`, plus the session-spec flags).
+- The human path (`flyco claude`, `flyco codex`, `flyco devin`, `flyco antigravity`, `flyco resume`, bare `flyco`) opens an interactive terminal session over the same control-plane ACP/SSE stream used by the Web PWA. It requires a TTY and is **not for agents** — do not invoke it.
 
 ## Auth
 
@@ -32,7 +33,7 @@ A credential is an `fk_` API key, minted in Flyco's Settings. Provide it one of 
 
 ## Commands
 
-All agent commands share the session-spec flags where noted: `--repo owner/name` (required), `--branch`, `-p/--prompt` or `--prompt-file` (a prompt is required — a session is born with a goal; `-` or piped stdin reads it), `--budget DOLLARS` (required), `--machine/--account/--region` (all three together, or omit for automatic placement), `--spot`/`--on-demand`, `--disk GIB`, `--model`, `--effort`, `--permission-mode`, `--env KEY=VALUE` (repeatable), `--idempotency-key KEY`.
+All agent commands share the session-spec flags where noted: `--repo owner/name` (required, repeatable — each checkout sits side by side), `--branch` (branch for the first `--repo`), `-p/--prompt` or `--prompt-file` (a prompt is required — a session is born with a goal; `-` or piped stdin reads it), `--budget DOLLARS` (required), `--machine/--account/--region` (all three together, or omit for automatic placement), `--runtime vm|container` (optional with `--machine`/`--account`/`--region`), `--spot`/`--on-demand`, `--disk GIB`, `--model`, `--effort`, `--permission-mode` (`default`, `accept-edits`, `plan`, `dont-ask`, `auto`, `bypass-permissions`), `--env KEY=VALUE` (repeatable), `--idempotency-key KEY`.
 
 ### flyco run — one prompt, one session, one turn
 
@@ -60,7 +61,7 @@ flyco session send <id> -m "also update the README"   # or -f file, --stdin / pi
 flyco session exec <id> -- cargo test -p api          # exit code = remote status
 flyco session events <id> [--after N] [--follow]
 flyco session wait <id> --for idle,approval,failed [--timeout 10m]
-flyco session set <id> --budget 10 --permission-mode accept-edits
+flyco session set <id> --title "…" --budget 10 --model … --effort … --permission-mode accept-edits --computer-use
 flyco session approvals <id> --pending
 flyco session approve <id> <approval> --allow|--deny
 flyco session diff <id>            # working tree vs base branch
@@ -84,7 +85,7 @@ Discovery: `flyco catalog`, `flyco repos`, `flyco branches <o/n>`, `flyco harnes
 - **Recorded history** (catch-up pages): `{"seq":N,"event":{…},"at_unix":…}` — a `StoredEvent`; `event` is untyped so variants newer than this build still pass through.
 - **Live** (the SSE tail): `{"session":"ses_…","seq":N|null,"at_unix":…,"event":{…}}` — a `SessionEvent` envelope; `seq` is null for live-only events that are never recorded (terminal output, machine connection changes).
 
-Every consumer reads `.event`; the `type` field inside it discriminates. The schema source of truth is `ClientEvent` in `flyco_core::wire` — treat unknown variants as pass-through, never as errors.
+Every consumer reads `.event`; the `type` field inside it discriminates. The schema source of truth is `ClientEvent` in `flyco_core::wire` — treat unknown variants as pass-through, never as errors. For Antigravity sessions running a swarm, read-only `swarm_updated` (`ClientEvent::SwarmUpdated`) events carry the latest swarm snapshot (goal, threads, member roster) and batched message-board posts (`SwarmBoardMessage`).
 
 ## Lifecycle etiquette
 
