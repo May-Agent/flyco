@@ -1,5 +1,8 @@
 {
   "allowManagedMcpServersOnly": true,
+  "allowManagedPermissionRulesOnly": true,
+  "disableSideloadFlags": true,
+  "autoMemoryEnabled": false,
   "allowedMcpServers": [
     {
       "serverUrl": "https://mcp.deepwiki.com/mcp"
@@ -8,8 +11,8 @@
       "serverCommand": [
         "/usr/local/bin/flycod",
         "mcp",
-        "--config",
-        "/etc/flyco/flycod.toml"
+        "--socket",
+        "/var/lib/flyco/run/mcp.sock"
       ]
     },
     {
@@ -19,5 +22,36 @@
         "@modelcontextprotocol/server-git"
       ]
     }
-  ]
+  ],
+  "permissions": {
+    "deny": [
+      "Read(//etc/flycod/**)",
+      "Edit(//etc/flycod/**)",
+      "Write(//etc/flycod/**)",
+      "Read(//var/lib/flyco/transcripts/**)",
+      "Edit(//var/lib/flyco/transcripts/**)",
+      "Write(//var/lib/flyco/transcripts/**)",
+      "Edit(//etc/claude-code/**)",
+      "Write(//etc/claude-code/**)",
+      "Edit(//var/lib/flyco/codex/**)",
+      "Write(//var/lib/flyco/codex/**)",
+      "Edit(//var/lib/flyco/devin-config/**)",
+      "Write(//var/lib/flyco/devin-config/**)",
+      "Edit(//var/lib/flyco/sidecar/**)",
+      "Write(//var/lib/flyco/sidecar/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/flycod hook pre-tool-use"
+          }
+        ]
+      }
+    ]
+  }
 }

@@ -1,7 +1,8 @@
 //! The `flycod` binary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use flyco_core::{DriverKind, ProvisioningStage};
@@ -14,8 +15,10 @@ use flyco_daemon::harness::claude::ClaudeCodeHarness;
 use flyco_daemon::harness::claude::store::{JsonlTranscriptStore, TranscriptStore};
 use flyco_daemon::harness::{Harness as _, HarnessSession, StartRequest, Started};
 use flyco_daemon::host;
-use flyco_daemon::mcp::FlycoTools;
+use flyco_daemon::mcp::{FlycoTools, RepoTrees, spawn_desktop_watcher};
+use flyco_daemon::mcp_broker::{self, BrokerClient, McpBootstrap, McpBrokerHandle};
 use flyco_daemon::mount::{FlycoServer, Mount};
+use flyco_daemon::privilege::{AgentUser, PrivilegeError, chown_path, chown_tree};
 use flyco_daemon::repl;
 use flyco_daemon::skills;
 use rmcp::ServiceExt as _;
@@ -37,22 +40,25 @@ enum Command {
     /// Run the daemon: start the harness and drive it.
     Run {
         /// Path to the TOML configuration.
-        ///
-        /// Kept after loading rather than dropped: it is what the harness
-        /// is told to pass to the `flycod mcp` it launches, so the second
-        /// process reads the same session and the same daemon token.
         #[arg(long, value_name = "PATH")]
         config: PathBuf,
+        /// Unprivileged OS user that agent-controlled processes (harnesses,
+        /// `!` shells, PTYs, desktop) drop privileges to. Defaults to `flyco`
+        /// when `flycod` runs as root, or no switch when running unprivileged.
+        #[arg(long, value_name = "USER")]
+        agent_user: Option<String>,
     },
-    /// Serve flyco's tools to the harness over stdio (MCP).
-    ///
-    /// Launched by the coding harness, not by the machine: it is a second
-    /// process beside `flycod run`, sharing only the configuration file and
-    /// the session's daemon token.
+    /// Serve flyco's tools to the harness over stdio (MCP), proxying
+    /// control-plane calls through `flycod run`'s local Unix-socket broker.
     Mcp {
-        /// Path to the TOML configuration.
+        /// Path to `flycod run`'s local MCP broker Unix socket.
         #[arg(long, value_name = "PATH")]
-        config: PathBuf,
+        socket: PathBuf,
+    },
+    /// Managed hook entrypoints invoked by coding harnesses.
+    Hook {
+        #[command(subcommand)]
+        command: HookCommand,
     },
     /// Print a complete, valid configuration to stdout.
     ExampleConfig,
@@ -72,6 +78,12 @@ enum Command {
         #[command(subcommand)]
         command: HostCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// Claude Code managed `PreToolUse` backstop (exits `2` to block).
+    PreToolUse,
 }
 
 #[derive(Debug, Subcommand)]
@@ -128,6 +140,8 @@ enum Failure {
     #[error(transparent)]
     Mount(#[from] flyco_daemon::mount::MountError),
     #[error(transparent)]
+    Privilege(#[from] PrivilegeError),
+    #[error(transparent)]
     Skills(#[from] skills::SkillError),
     /// Boxed: `HostError` is wide enough that carrying it inline would make
     /// every `Result` in this binary a hundred-plus bytes.
@@ -135,12 +149,12 @@ enum Failure {
     Host(Box<host::HostError>),
     #[error("could not write to stdout")]
     Stdout(#[source] std::io::Error),
-    /// `flycod mcp` was pointed at a configuration with no control plane.
-    #[error(
-        "`flycod mcp` needs a [control_plane] in its config: every tool it serves \
-         reads or changes this session in the control plane"
-    )]
-    NoControlPlane,
+    /// The local MCP broker Unix socket could not be bound.
+    #[error("could not start flyco's local MCP broker")]
+    McpBroker(#[source] std::io::Error),
+    /// `flycod mcp` could not bootstrap against `flycod run`'s broker socket.
+    #[error("could not bootstrap `flycod mcp` over the daemon broker socket")]
+    McpBootstrap(#[from] flyco_daemon::control::ControlApiError),
     /// The MCP client never completed the handshake.
     ///
     /// Boxed because the SDK's initialization error carries the whole
@@ -190,7 +204,17 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    match Box::pin(run(Cli::parse())).await {
+    let cli = Cli::parse();
+    if matches!(
+        cli.command,
+        Command::Hook {
+            command: HookCommand::PreToolUse,
+        }
+    ) {
+        return ExitCode::from(flyco_daemon::hook::run_pre_tool_use());
+    }
+
+    match Box::pin(run(cli)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(failure) => {
             tracing::error!(error = %failure, "flycod stopped");
@@ -228,9 +252,14 @@ async fn run(cli: Cli) -> Result<(), Failure> {
         }
         Command::Codespace => Ok(flyco_daemon::codespace::bootstrap().await?),
         Command::Host { command } => run_host(command).await,
-        Command::Mcp { config } => serve_mcp(DaemonConfig::load(&config)?).await,
-        Command::Run { config: path } => {
+        Command::Hook { .. } => unreachable!("handled before async runtime dispatch"),
+        Command::Mcp { socket } => serve_mcp(socket).await,
+        Command::Run {
+            config: path,
+            agent_user,
+        } => {
             let mut config = DaemonConfig::load(&path)?;
+            let agent = AgentUser::resolve(agent_user.as_deref())?;
             // One daemon per session per machine — every spawn path
             // included. `postStart` fires on each codespace start and a
             // unit restarts on failure, and two daemons for one session
@@ -251,6 +280,7 @@ async fn run(cli: Cli) -> Result<(), Failure> {
                 session = %config.session,
                 harness = ?config.harness,
                 workdir = ?config.workdir,
+                agent_user = ?agent.as_ref().map(|user| &user.name),
                 "starting flycod"
             );
             // The checkout is what the harness is started *in*, so it lands
@@ -269,7 +299,7 @@ async fn run(cli: Cli) -> Result<(), Failure> {
             }
             report_failure_to(
                 api.as_ref(),
-                Box::pin(check_out(&config, api.as_ref())).await,
+                Box::pin(check_out(&config, api.as_ref(), agent.as_ref())).await,
             )
             .await?;
             // The owner's skills land before the harness is built: a
@@ -277,20 +307,50 @@ async fn run(cli: Cli) -> Result<(), Failure> {
             // and a running one must never watch it change mid-turn. A
             // developer machine has no control plane and installs nothing.
             if let Some(api) = api.as_ref() {
-                report_failure_to(Some(api), install_skills(&config, api).await).await?;
+                report_failure_to(
+                    Some(api),
+                    install_skills(&config, api, agent.as_ref()).await,
+                )
+                .await?;
             }
+            // Start the local Unix-socket MCP broker before spawning any
+            // harness so `flycod mcp --socket <PATH>` (running under the
+            // unprivileged agent UID) never reads `/etc/flycod/config.toml`.
+            let broker_socket = mcp_socket_path(&config);
+            let desktop_socket = desktop_socket_path(&config);
+            let _mcp_broker: Option<McpBrokerHandle> = if let Some(api) = api.as_ref() {
+                let bootstrap = McpBootstrap {
+                    session: config.session,
+                    workdir: config.workdir.clone(),
+                    machine_origin: config.machine_origin,
+                    desktop_socket: desktop_socket.clone(),
+                };
+                Some(
+                    mcp_broker::spawn(
+                        broker_socket.clone(),
+                        bootstrap,
+                        api.clone(),
+                        agent.as_ref(),
+                    )
+                    .map_err(Failure::McpBroker)?,
+                )
+            } else {
+                None
+            };
             // Every server this session may reach: flyco's own, launched as
-            // a second `flycod mcp` against this same file, and the ones
-            // the user registered. Built once here because both harnesses
-            // are given the identical set.
+            // a second `flycod mcp --socket ...` against the broker above,
+            // and the ones the user registered. Built once here because both
+            // harnesses are given the identical set.
             let mount = Mount::new(
-                FlycoServer::of(&path)?,
+                FlycoServer::of_socket(&broker_socket)?,
                 core::mem::take(&mut config.mcp_servers),
                 config.computer.enabled,
             );
             let driven = match config.harness {
-                DriverKind::ClaudeCode => Box::pin(drive_claude_code(config, mount)).await,
-                DriverKind::Acp => Box::pin(drive_acp(config, mount)).await,
+                DriverKind::ClaudeCode => {
+                    Box::pin(drive_claude_code(config, mount, agent, desktop_socket)).await
+                }
+                DriverKind::Acp => Box::pin(drive_acp(config, mount, agent, desktop_socket)).await,
             };
             report_failure_to(api.as_ref(), driven).await
         }
@@ -336,8 +396,37 @@ async fn report_failure_to<T>(
 /// reasoning as [`conversation_to_continue`]. A bundle that arrived but
 /// cannot be unpacked is the opposite case: the failure names the skill,
 /// and the user can act on it.
-async fn install_skills(config: &DaemonConfig, api: &HttpControlApi) -> Result<(), Failure> {
-    let targets = skills::targets(config);
+/// Path for the session's local MCP broker Unix socket.
+///
+/// On a provisioned machine (`transcript_dir == /var/lib/flyco/transcripts`),
+/// uses the canonical `/var/lib/flyco/run/mcp.sock` that provisioned Codex and
+/// Devin registries point to. On developer machines / tests, places a
+/// session-scoped socket beside the transcript directory.
+fn mcp_socket_path(config: &DaemonConfig) -> PathBuf {
+    if config.transcript_dir == Path::new(flyco_provider::flycod::TRANSCRIPT_DIR) {
+        PathBuf::from(flyco_provider::flycod::MCP_SOCKET_PATH)
+    } else {
+        config
+            .transcript_dir
+            .join(format!("flycod-{}.mcp.sock", config.session))
+    }
+}
+
+/// Path for the session's desktop IPC Unix socket.
+fn desktop_socket_path(config: &DaemonConfig) -> PathBuf {
+    if config.transcript_dir == Path::new(flyco_provider::flycod::TRANSCRIPT_DIR) {
+        PathBuf::from("/var/lib/flyco/run").join(format!("flycod-{}.desktop.sock", config.session))
+    } else {
+        flyco_daemon::desktop::ipc::socket_path(config.session)
+    }
+}
+
+async fn install_skills(
+    config: &DaemonConfig,
+    api: &HttpControlApi,
+    agent: Option<&AgentUser>,
+) -> Result<(), Failure> {
+    let targets = skills::targets(config, agent);
     if targets.is_empty() {
         return Ok(());
     }
@@ -441,7 +530,19 @@ async fn conversation_to_continue(config: &mut DaemonConfig, api: &HttpControlAp
 ///
 /// A daemon with no `[[repos]]` is a developer machine pointed at a
 /// checkout that already exists, and clones nothing.
-async fn check_out(config: &DaemonConfig, api: Option<&HttpControlApi>) -> Result<(), Failure> {
+async fn check_out(
+    config: &DaemonConfig,
+    api: Option<&HttpControlApi>,
+    agent: Option<&AgentUser>,
+) -> Result<(), Failure> {
+    tokio::fs::create_dir_all(&config.workdir)
+        .await
+        .map_err(flyco_daemon::git::GitError::Spawn)?;
+    if let Some(user) = agent
+        && user.needs_uid_switch()
+    {
+        chown_path(&config.workdir, Some(user.uid), Some(user.gid))?;
+    }
     if config.repos.is_empty() {
         tracing::info!(
             workdir = %config.workdir.display(),
@@ -498,6 +599,12 @@ async fn check_out(config: &DaemonConfig, api: Option<&HttpControlApi>) -> Resul
             )
             .await?;
         }
+        if let Some(user) = agent.cloned() {
+            let owned = checkout.clone();
+            tokio::task::spawn_blocking(move || chown_tree(&owned, &user))
+                .await
+                .map_err(Failure::McpStopped)??;
+        }
     }
     if let Some(api) = api
         && let Some(view) = &handoff
@@ -535,41 +642,38 @@ async fn run_host(command: HostCommand) -> Result<(), Failure> {
     }
 }
 
-/// Serves flyco's tools to the harness until it closes the pipe.
-///
-/// Everything this answers comes from the control plane, so a configuration
-/// without one has nothing to serve: on a developer machine the REPL is how
-/// a session is driven, and there is no session in a control plane for the
-/// tools to act on. Refusing here says so once, rather than answering every
-/// tool call with the same failure.
-async fn serve_mcp(config: DaemonConfig) -> Result<(), Failure> {
-    let Some(control_plane) = config.control_plane.clone() else {
-        return Err(Failure::NoControlPlane);
-    };
-    let api = HttpControlApi::new(
-        control_plane.url,
-        config.session,
-        control_plane.daemon_token,
-    );
+/// Serves flyco's tools to the harness until it closes the pipe, proxying all
+/// control-plane calls over `flycod run`'s local Unix-socket broker so the
+/// unprivileged agent user never reads `/etc/flycod/config.toml`.
+async fn serve_mcp(socket: PathBuf) -> Result<(), Failure> {
+    let client = BrokerClient::new(socket);
+    let bootstrap = client.bootstrap().await?;
     let tools = FlycoTools::new(
-        api,
-        flyco_daemon::mcp::RepoTrees::over(&config.workdir, &config.repos),
-        config.machine_origin,
-        // The desktop's agent socket exists only while the session's
-        // flag is on, which is also the condition the `computer_*` tools
-        // are listed under.
-        config
-            .computer
-            .enabled
-            .then(|| flyco_daemon::desktop::ipc::socket_path(config.session)),
+        client,
+        RepoTrees::discover(bootstrap.workdir),
+        bootstrap.machine_origin,
+        Some(bootstrap.desktop_socket),
     );
+    let watcher_state = tools.desktop_watcher_state();
 
-    tracing::info!(session = %config.session, "serving flyco's MCP tools over stdio");
+    tracing::info!(session = %bootstrap.session, "serving flyco's MCP tools over stdio");
     let service = tools
         .serve(stdio())
         .await
         .map_err(|error| Failure::Mcp(Box::new(error)))?;
-    service.waiting().await.map_err(Failure::McpStopped)?;
+    let watcher = watcher_state.map(|(desktop_socket, last_live)| {
+        spawn_desktop_watcher(
+            desktop_socket,
+            last_live,
+            service.peer().clone(),
+            Duration::from_millis(500),
+        )
+    });
+    let outcome = service.waiting().await.map_err(Failure::McpStopped);
+    if let Some(handle) = watcher {
+        handle.abort();
+    }
+    outcome?;
     Ok(())
 }
 
@@ -580,14 +684,19 @@ async fn serve_mcp(config: DaemonConfig) -> Result<(), Failure> {
 /// a control plane keeps its transcript there, which is what lets it resume
 /// onto another machine. Which one a run took is logged, because "why is
 /// nothing reaching the browser" has exactly one cheap answer.
-async fn drive_claude_code(config: DaemonConfig, mount: Mount) -> Result<(), Failure> {
+async fn drive_claude_code(
+    config: DaemonConfig,
+    mount: Mount,
+    agent: Option<AgentUser>,
+    desktop_socket: PathBuf,
+) -> Result<(), Failure> {
     let Some(control_plane) = config.control_plane.clone() else {
         tracing::info!(
             "no [control_plane] in the config: driving this session from stdin. \
              Transcripts stay in `transcript_dir` and no browser can reach the session."
         );
         let store = JsonlTranscriptStore::new(config.transcript_dir.clone());
-        let started = start(&config, mount, store).await?;
+        let started = start(&config, mount, store, agent).await?;
         repl::run(started.session, started.outputs).await?;
         return Ok(());
     };
@@ -599,10 +708,20 @@ async fn drive_claude_code(config: DaemonConfig, mount: Mount) -> Result<(), Fai
     let ControlPlaneConfig { url, daemon_token } = control_plane;
     let api = HttpControlApi::new(url, config.session, daemon_token);
 
-    let started = start(&config, mount, RemoteTranscriptStore::new(api.clone())).await?;
-    let (terminal, terminal_out) =
-        flyco_daemon::terminal::Terminal::spawn(&config.terminal.shell, &config.workdir)?;
-    let (desktop, desktop_out) = flyco_daemon::desktop::spawn(&config.computer, config.session);
+    let started = start(
+        &config,
+        mount,
+        RemoteTranscriptStore::new(api.clone()),
+        agent.clone(),
+    )
+    .await?;
+    let (terminal, terminal_out) = flyco_daemon::terminal::Terminal::spawn_as(
+        &config.terminal.shell,
+        &config.workdir,
+        agent.clone(),
+    )?;
+    let (desktop, desktop_out) =
+        flyco_daemon::desktop::spawn_at(&config.computer, desktop_socket, agent.clone());
     Box::pin(wire::run(SessionRelay {
         session_id: config.session,
         deadlines: wire::Deadlines::default(),
@@ -613,11 +732,14 @@ async fn drive_claude_code(config: DaemonConfig, mount: Mount) -> Result<(), Fai
         terminal_out,
         desktop,
         desktop_out,
-        tui: flyco_daemon::tui::HarnessTui::resolve(&config).await,
-        // The composer's `!` commands run in the same workspace the agent
-        // works in, as the same user this daemon runs as.
-        shell: config.shell.runner(config.workdir.clone()),
-        repos: repos_of(&config).await,
+        tui: flyco_daemon::tui::HarnessTui::resolve(&config, agent.clone()).await,
+        // The composer's `!` commands run in the same workspace as the agent,
+        // under the unprivileged agent user.
+        shell: config
+            .shell
+            .runner(config.workdir.clone())
+            .with_agent(agent.clone()),
+        repos: repos_of(&config, agent).await,
         workspace: workspace_of(&config),
         github: config.github.clone(),
         disk: flyco_daemon::spot::HostDisk,
@@ -639,21 +761,28 @@ async fn drive_claude_code(config: DaemonConfig, mount: Mount) -> Result<(), Fai
 /// Drives an ACP session — Codex, Devin, or any other agent the `[acp]`
 /// table names — reporting to a control plane if the configuration names
 /// one and to the terminal otherwise.
-async fn drive_acp(config: DaemonConfig, mount: Mount) -> Result<(), Failure> {
-    let harness = AcpHarness::new(config.acp().clone(), mount);
+async fn drive_acp(
+    config: DaemonConfig,
+    mount: Mount,
+    agent: Option<AgentUser>,
+    desktop_socket: PathBuf,
+) -> Result<(), Failure> {
+    let harness = AcpHarness::new(config.acp().clone(), mount).with_agent(agent.clone());
     let started = harness
         .start(StartRequest {
             workdir: config.workdir.clone(),
             resume_session_id: config.resume_session_id.clone(),
         })
         .await?;
-    Box::pin(report(config, started)).await
+    Box::pin(report(config, started, agent, desktop_socket)).await
 }
 
 /// Hands a started session to the control plane or the REPL.
 async fn report<S: HarnessSession + 'static>(
     config: DaemonConfig,
     started: Started<S>,
+    agent: Option<AgentUser>,
+    desktop_socket: PathBuf,
 ) -> Result<(), Failure> {
     let Some(control_plane) = config.control_plane.clone() else {
         tracing::info!(
@@ -670,9 +799,13 @@ async fn report<S: HarnessSession + 'static>(
     );
     let ControlPlaneConfig { url, daemon_token } = control_plane;
     let api = HttpControlApi::new(url, config.session, daemon_token);
-    let (terminal, terminal_out) =
-        flyco_daemon::terminal::Terminal::spawn(&config.terminal.shell, &config.workdir)?;
-    let (desktop, desktop_out) = flyco_daemon::desktop::spawn(&config.computer, config.session);
+    let (terminal, terminal_out) = flyco_daemon::terminal::Terminal::spawn_as(
+        &config.terminal.shell,
+        &config.workdir,
+        agent.clone(),
+    )?;
+    let (desktop, desktop_out) =
+        flyco_daemon::desktop::spawn_at(&config.computer, desktop_socket, agent.clone());
     Box::pin(wire::run(SessionRelay {
         session_id: config.session,
         deadlines: wire::Deadlines::default(),
@@ -683,11 +816,14 @@ async fn report<S: HarnessSession + 'static>(
         terminal_out,
         desktop,
         desktop_out,
-        tui: flyco_daemon::tui::HarnessTui::resolve(&config).await,
-        // The composer's `!` commands run in the same workspace the agent
-        // works in, as the same user this daemon runs as.
-        shell: config.shell.runner(config.workdir.clone()),
-        repos: repos_of(&config).await,
+        tui: flyco_daemon::tui::HarnessTui::resolve(&config, agent.clone()).await,
+        // The composer's `!` commands run in the same workspace as the agent,
+        // under the unprivileged agent user.
+        shell: config
+            .shell
+            .runner(config.workdir.clone())
+            .with_agent(agent.clone()),
+        repos: repos_of(&config, agent).await,
         workspace: workspace_of(&config),
         github: config.github.clone(),
         disk: flyco_daemon::spot::HostDisk,
@@ -736,8 +872,8 @@ fn workspace_of(config: &DaemonConfig) -> flyco_daemon::workdir::Workspace {
 /// under the `None` key the wire uses for it. A developer machine pointed
 /// at a directory that is not a checkout watches nothing: `git status`
 /// would only say so forever.
-async fn repos_of(config: &DaemonConfig) -> flyco_daemon::git::GitRepos {
-    let mut repos = flyco_daemon::git::GitRepos::new(config.workdir.clone());
+async fn repos_of(config: &DaemonConfig, agent: Option<AgentUser>) -> flyco_daemon::git::GitRepos {
+    let mut repos = flyco_daemon::git::GitRepos::new(config.workdir.clone()).with_agent(agent);
     if config.repos.is_empty() {
         if flyco_daemon::git::has_checkout(&config.workdir).await {
             repos.watch(None, config.workdir.clone());
@@ -856,13 +992,15 @@ async fn start<S: TranscriptStore>(
     config: &DaemonConfig,
     mount: Mount,
     store: S,
+    agent: Option<AgentUser>,
 ) -> Result<Started<impl flyco_daemon::harness::HarnessSession + use<S>>, Failure> {
     let harness = ClaudeCodeHarness::new(
         config.claude().clone(),
         config.sidecar().clone(),
         mount,
         store,
-    );
+    )
+    .with_agent(agent);
     Ok(harness
         .start(StartRequest {
             workdir: config.workdir.clone(),

@@ -52,6 +52,7 @@ hex.workspace = true
 # volumes. Parsing `df` output would be the same fact, read out of a table
 # whose columns are a locale away from moving.
 rustix.workspace = true
+libc.workspace = true
 # Codex's `auth.json` stamps `last_refresh` as an RFC 3339 instant, so the
 # daemon needs a calendar to write one. `parsing` is the other direction:
 # an eviction notice publishes its deadline as an instant too — RFC 1123 on

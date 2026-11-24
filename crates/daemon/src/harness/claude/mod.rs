@@ -62,6 +62,7 @@ use self::store::{StoreError, TranscriptStore};
 use super::{Harness, HarnessSession, SessionOutput, StartRequest, Started, ToolApproval};
 use crate::config::ClaudeConfig;
 use crate::mount::{Mount, MountError, MountedServer};
+use crate::privilege::AgentUser;
 
 /// How long a clean shutdown may take before the child is killed.
 ///
@@ -140,6 +141,7 @@ pub struct ClaudeCodeHarness<S> {
     sidecar: SidecarConfig,
     mount: Mount,
     store: S,
+    agent: Option<AgentUser>,
 }
 
 impl<S: TranscriptStore> ClaudeCodeHarness<S> {
@@ -151,7 +153,15 @@ impl<S: TranscriptStore> ClaudeCodeHarness<S> {
             sidecar,
             mount,
             store,
+            agent: None,
         }
+    }
+
+    /// Configures the unprivileged agent user the sidecar and Claude CLI run as.
+    #[must_use]
+    pub fn with_agent(mut self, agent: Option<AgentUser>) -> Self {
+        self.agent = agent;
+        self
     }
 }
 
@@ -174,7 +184,7 @@ impl<S: TranscriptStore> Harness for ClaudeCodeHarness<S> {
         // or on the command line; the CLI accepts one or the other.
         let managed = self.claude.managed_dir.is_some();
         sidecar::prepare(&self.sidecar).await?;
-        let mut child = sidecar::spawn(&self.sidecar)?;
+        let mut child = sidecar::spawn_as(&self.sidecar, self.agent.as_ref())?;
 
         let mut stdin = child
             .stdin

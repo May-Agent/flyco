@@ -71,6 +71,11 @@ fn checked_name(name: &str) -> Result<String, ApiError> {
     if trimmed.is_empty() {
         return Err(ApiError::InvalidMcpServer("a name is required"));
     }
+    if trimmed.eq_ignore_ascii_case("flyco") {
+        return Err(ApiError::InvalidMcpServer(
+            "`flyco` is reserved for flyco's built-in MCP server",
+        ));
+    }
     // The name becomes part of the tool identifier the harness exposes
     // (`mcp__<server>__<tool>`), so anything outside this set would produce
     // tools the model cannot address.
@@ -100,7 +105,11 @@ pub(crate) async fn mounts(db: &Db, user: UserId) -> Result<Vec<McpServerMount>,
     )
     .fetch_all()
     .await?;
-    Ok(rows.into_iter().map(Into::into).collect())
+    Ok(rows
+        .into_iter()
+        .filter(|row| !row.name.eq_ignore_ascii_case("flyco"))
+        .map(Into::into)
+        .collect())
 }
 
 /// Lists the caller's registered MCP servers.
@@ -272,4 +281,25 @@ pub fn routes() -> Vec<RouteNode> {
             .delete(delete_mcp_server),
     ))
     .into_route_nodes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_name;
+    use crate::error::ApiError;
+
+    #[test]
+    fn checked_name_rejects_reserved_flyco_case_insensitively() {
+        for reserved in ["flyco", "FLYCO", "Flyco", "  fLyCo  "] {
+            assert!(
+                matches!(checked_name(reserved), Err(ApiError::InvalidMcpServer(_))),
+                "{reserved:?} must be rejected as reserved"
+            );
+        }
+        assert_eq!(checked_name("deepwiki").expect("valid name"), "deepwiki");
+        assert_eq!(
+            checked_name("flyco-extra").expect("valid name"),
+            "flyco-extra"
+        );
+    }
 }

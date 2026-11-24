@@ -47,6 +47,7 @@ use flyco_core::{DriverKind, SkillMount};
 
 use crate::config::DaemonConfig;
 use crate::control::{ControlApi, ControlApiError};
+use crate::privilege::AgentUser;
 
 /// The mode unpacked files are left at: the agent reads a skill, and
 /// nobody — the daemon included, until the next start rewrites it — edits
@@ -98,8 +99,8 @@ pub struct Target {
 /// agent home and no injected config there is no directory to install
 /// into.
 #[must_use]
-pub fn targets(config: &DaemonConfig) -> Vec<Target> {
-    let home = agent_home();
+pub fn targets(config: &DaemonConfig, agent: Option<&AgentUser>) -> Vec<Target> {
+    let home = agent.map(|user| user.home.clone()).or_else(agent_home);
     let mut dirs = Vec::new();
 
     // Claude Code's global skills directory.

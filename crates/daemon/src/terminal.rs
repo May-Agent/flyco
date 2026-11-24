@@ -26,7 +26,10 @@
 
 use std::future::Future;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::Path;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -39,6 +42,8 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fd::{AsFd, BorrowedFd};
 use rustix::io::fcntl_dupfd_cloexec;
 use tokio::sync::mpsc;
+
+use crate::privilege::{AgentUser, chown_path, drop_in_pre_exec};
 
 /// How many output chunks may wait for a room that is not there.
 const OUTPUT_DEPTH: usize = 256;
@@ -203,7 +208,7 @@ impl core::fmt::Debug for Terminal {
 }
 
 impl Terminal {
-    /// Spawns `shell` in `workdir` on a new PTY.
+    /// Spawns `shell` in `workdir` on a new PTY as the current user.
     ///
     /// # Errors
     ///
@@ -213,8 +218,23 @@ impl Terminal {
         shell: &Path,
         workdir: &Path,
     ) -> Result<(Self, mpsc::Receiver<TerminalEvent>), TerminalError> {
+        Self::spawn_as(shell, workdir, None)
+    }
+
+    /// Spawns `shell` in `workdir` on a new PTY, dropping privileges to `agent`
+    /// (for both the shell and any harness TUI launched later) when `Some`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminalError::Pty`] if the PTY cannot be opened or the
+    /// shell cannot be spawned.
+    pub fn spawn_as(
+        shell: &Path,
+        workdir: &Path,
+        agent: Option<AgentUser>,
+    ) -> Result<(Self, mpsc::Receiver<TerminalEvent>), TerminalError> {
         let shell = foreground_command(shell, workdir);
-        let pane = Pane::open(&shell, INITIAL_SIZE)?;
+        let pane = Pane::open(&shell, INITIAL_SIZE, agent.as_ref())?;
 
         let (events, terminal_out) = mpsc::channel(OUTPUT_DEPTH);
         let (control, supervised) = std::sync::mpsc::sync_channel(64);
@@ -227,6 +247,7 @@ impl Terminal {
                 supervise(
                     pane,
                     &shell,
+                    agent.as_ref(),
                     &supervised_events,
                     &supervised,
                     &supervised_stop,
@@ -325,6 +346,48 @@ fn foreground_command(program: &Path, workdir: &Path) -> CommandBuilder {
     command
 }
 
+/// Non-blocking wait result for a [`PaneChild`].
+enum ChildExit {
+    Running,
+    Exited(Option<i32>),
+}
+
+/// A child living on a PTY slave: either spawned directly through
+/// `portable_pty` (developer-machine mode) or via `std::process::Command` with
+/// an explicit `pre_exec` privilege drop to [`AgentUser`].
+enum PaneChild {
+    Pty(Box<dyn Child + Send + Sync>),
+    Std(std::process::Child),
+}
+
+impl PaneChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Pty(child) => child.kill(),
+            Self::Std(child) => child.kill(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<ChildExit> {
+        match self {
+            Self::Pty(child) => Ok(child.try_wait()?.map_or(ChildExit::Running, |status| {
+                ChildExit::Exited(exit_code(&status))
+            })),
+            Self::Std(child) => Ok(child.try_wait()?.map_or(ChildExit::Running, |status| {
+                ChildExit::Exited(std_exit_code(status))
+            })),
+        }
+    }
+}
+
+fn std_exit_code(status: std::process::ExitStatus) -> Option<i32> {
+    if status.signal().is_some() {
+        None
+    } else {
+        status.code()
+    }
+}
+
 /// One foreground: a PTY pair, the child living on its slave, and a dup
 /// of the master the supervisor polls.
 ///
@@ -340,19 +403,38 @@ struct Pane {
     reader: Box<dyn Read + Send>,
     /// A pollable dup of the master's fd.
     poll: rustix::fd::OwnedFd,
-    child: Box<dyn Child + Send + Sync>,
+    child: PaneChild,
 }
 
 impl Pane {
-    /// Opens a PTY at `size` and spawns `command` on it.
-    fn open(command: &CommandBuilder, size: PtySize) -> Result<Self, TerminalError> {
+    /// Opens a PTY at `size` and spawns `command` on it, dropping privileges
+    /// to `agent` when present.
+    fn open(
+        command: &CommandBuilder,
+        size: PtySize,
+        agent: Option<&AgentUser>,
+    ) -> Result<Self, TerminalError> {
         let pair = NativePtySystem::default()
             .openpty(size)
             .map_err(|error| TerminalError::Pty(error.to_string()))?;
-        let child = pair
-            .slave
-            .spawn_command(command.clone())
-            .map_err(|error| TerminalError::Pty(error.to_string()))?;
+        let child = if let Some(user) = agent {
+            let tty_name = pair.master.tty_name().ok_or_else(|| {
+                TerminalError::Pty("the PTY master reported no slave path".to_owned())
+            })?;
+            if user.needs_uid_switch() {
+                chown_path(&tty_name, Some(user.uid), Some(user.gid))
+                    .map_err(|error| TerminalError::Pty(error.to_string()))?;
+                std::fs::set_permissions(&tty_name, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|error| TerminalError::Pty(error.to_string()))?;
+            }
+            spawn_pty_as_agent(&tty_name, command, user)?
+        } else {
+            let child = pair
+                .slave
+                .spawn_command(command.clone())
+                .map_err(|error| TerminalError::Pty(error.to_string()))?;
+            PaneChild::Pty(child)
+        };
         // The child holds the slave as its stdio and controlling tty;
         // our copy would only delay the master's hangup.
         drop(pair.slave);
@@ -381,6 +463,87 @@ impl Pane {
             child,
         })
     }
+}
+
+/// Spawns `builder` on `tty_name` after establishing a new session, dropping
+/// privileges to `agent`, and taking `tty_name` as the controlling terminal.
+fn spawn_pty_as_agent(
+    tty_name: &Path,
+    builder: &CommandBuilder,
+    agent: &AgentUser,
+) -> Result<PaneChild, TerminalError> {
+    let command_line = builder.get_argv();
+    let Some((program, args)) = command_line.split_first() else {
+        return Err(TerminalError::Pty("empty terminal command".to_owned()));
+    };
+    let slave_in = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(tty_name)
+        .map_err(|error| TerminalError::Pty(error.to_string()))?;
+    let slave_out = slave_in
+        .try_clone()
+        .map_err(|error| TerminalError::Pty(error.to_string()))?;
+    let slave_err = slave_in
+        .try_clone()
+        .map_err(|error| TerminalError::Pty(error.to_string()))?;
+
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    if let Some(cwd) = builder.get_cwd() {
+        cmd.current_dir(cwd);
+    }
+    let extra_env: Vec<(String, String)> = builder
+        .iter_extra_env_as_str()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    let env = agent.sanitized_env(std::env::vars_os(), extra_env);
+    cmd.env_clear().envs(env);
+    cmd.stdin(Stdio::from(slave_in))
+        .stdout(Stdio::from(slave_out))
+        .stderr(Stdio::from(slave_err));
+
+    let controlling_tty = builder.get_controlling_tty();
+    let drop_spec = agent.drop_spec();
+    // SAFETY: `pre_exec` invokes only async-signal-safe POSIX/Linux syscalls
+    // (`signal`, `sigprocmask`, `setsid`, `setgroups`/`setgid`/`setuid`,
+    // `prctl`, `ioctl(TIOCSCTTY)`).
+    unsafe {
+        cmd.pre_exec(move || {
+            for signo in [
+                libc::SIGCHLD,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTERM,
+                libc::SIGALRM,
+            ] {
+                libc::signal(signo, libc::SIG_DFL);
+            }
+            let empty_set: libc::sigset_t = std::mem::zeroed();
+            libc::sigprocmask(
+                libc::SIG_SETMASK,
+                &raw const empty_set,
+                std::ptr::null_mut(),
+            );
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            drop_in_pre_exec(drop_spec)?;
+            if controlling_tty {
+                #[allow(clippy::cast_lossless)]
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+
+    let child = cmd
+        .spawn()
+        .map_err(|error| TerminalError::Pty(error.to_string()))?;
+    Ok(PaneChild::Std(child))
 }
 
 /// The `poll` timeout as a kernel `timespec`.
@@ -467,13 +630,13 @@ enum Foreground {
 
 /// Kills `child` and gives it [`REAP`] to die; `false` if it is still not
 /// reapable and must join the pending list instead.
-fn reaped(child: &mut dyn Child) -> bool {
+fn reaped(child: &mut PaneChild) -> bool {
     let _ = child.kill();
     let deadline = Instant::now() + REAP;
     while Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return true,
-            Ok(None) => thread::sleep(REAP_POLL),
+            Ok(ChildExit::Exited(_)) | Err(_) => return true,
+            Ok(ChildExit::Running) => thread::sleep(REAP_POLL),
         }
     }
     false
@@ -485,11 +648,12 @@ fn reaped(child: &mut dyn Child) -> bool {
 fn foreground_pane(
     command: &CommandBuilder,
     shell: &CommandBuilder,
+    agent: Option<&AgentUser>,
     size: PtySize,
     events: &mpsc::Sender<TerminalEvent>,
     stop: &AtomicBool,
 ) -> Option<(Pane, Foreground)> {
-    match Pane::open(command, size) {
+    match Pane::open(command, size, agent) {
         Ok(pane) => Some((pane, Foreground::Harness)),
         Err(error) => {
             let _ = send_event(
@@ -499,7 +663,7 @@ fn foreground_pane(
                     "\r\nflycod: could not start the harness: {error}\r\n"
                 )),
             );
-            Pane::open(shell, size)
+            Pane::open(shell, size, agent)
                 .ok()
                 .map(|pane| (pane, Foreground::Shell))
         }
@@ -525,6 +689,7 @@ fn exit_code(status: &ExitStatus) -> Option<i32> {
 fn supervise(
     mut pane: Pane,
     shell: &CommandBuilder,
+    agent: Option<&AgentUser>,
     events: &mpsc::Sender<TerminalEvent>,
     control: &std::sync::mpsc::Receiver<Supervision>,
     stop_flag: &AtomicBool,
@@ -533,7 +698,7 @@ fn supervise(
     let mut size = INITIAL_SIZE;
     // Killed children that outlived their reap deadline; still polled so
     // the process table stays clean.
-    let mut pending: Vec<Box<dyn Child + Send + Sync>> = Vec::new();
+    let mut pending: Vec<PaneChild> = Vec::new();
     let mut buf = [0_u8; 4096];
     let idle = timeout(IDLE_POLL);
     let drain = timeout(DRAIN);
@@ -581,10 +746,10 @@ fn supervise(
                     // the master and writer along with it rather than
                     // leaving a revoked pair half-held.
                     let Pane { mut child, .. } = pane;
-                    if !reaped(&mut *child) {
+                    if !reaped(&mut child) {
                         pending.push(child);
                     }
-                    match foreground_pane(&command, shell, size, events, stop_flag) {
+                    match foreground_pane(&command, shell, agent, size, events, stop_flag) {
                         Some((next, became)) => {
                             pane = next;
                             foreground = became;
@@ -600,14 +765,14 @@ fn supervise(
             return;
         }
 
-        pending.retain_mut(|child| child.try_wait().ok().flatten().is_none());
+        pending.retain_mut(|child| matches!(child.try_wait(), Ok(ChildExit::Running)));
 
         // A wait that fails is a child we can no longer see — reported as
         // a lost foreground rather than silently ignored.
         let exited = match pane.child.try_wait() {
-            Ok(Some(status)) => Some(exit_code(&status)),
+            Ok(ChildExit::Exited(code)) => Some(code),
             Err(_) => Some(None),
-            Ok(None) => None,
+            Ok(ChildExit::Running) => None,
         };
         if let Some(code) = exited {
             // Drain what the child left before saying so: `Exited` must
@@ -625,7 +790,7 @@ fn supervise(
             if stop_flag.load(Ordering::Acquire) {
                 return;
             }
-            match Pane::open(shell, size) {
+            match Pane::open(shell, size, agent) {
                 Ok(next) => {
                     pane = next;
                     foreground = Foreground::Shell;
@@ -705,5 +870,46 @@ impl TerminalSession for FakeTerminal {
 
     fn shutdown(&mut self) -> impl Future<Output = Result<(), TerminalError>> {
         core::future::ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use super::{Terminal, TerminalEvent, TerminalSession as _};
+    use crate::privilege::{AgentUser, current_egid, current_euid};
+
+    #[tokio::test]
+    async fn spawn_as_sanitizes_pty_environment_and_runs_shell() {
+        let agent = AgentUser {
+            name: "flyco-pty-test".to_owned(),
+            uid: current_euid(),
+            gid: current_egid(),
+            home: PathBuf::from("/tmp/flyco-pty-home"),
+            shell: PathBuf::from("/bin/sh"),
+        };
+        let (mut term, mut events) =
+            Terminal::spawn_as(Path::new("/bin/sh"), &std::env::temp_dir(), Some(agent))
+                .expect("spawn PTY with agent user");
+        term.write("printf 'PTY_HOME=%s\\n' \"$HOME\"\n")
+            .expect("write command");
+
+        let mut output = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !output.contains("PTY_HOME=/tmp/flyco-pty-home") {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for PTY output: {output:?}"
+            );
+            if let Ok(Some(TerminalEvent::Output(chunk))) =
+                tokio::time::timeout(remaining, events.recv()).await
+            {
+                output.push_str(&chunk);
+            }
+        }
+        term.shutdown().await.expect("clean shutdown");
     }
 }

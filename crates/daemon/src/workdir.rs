@@ -246,7 +246,7 @@ impl Workspace {
 
         let mut child = Command::new("git")
             .current_dir(directory)
-            .args(["check-ignore", "-z", "--stdin"])
+            .args(["-c", "safe.directory=*", "check-ignore", "-z", "--stdin"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

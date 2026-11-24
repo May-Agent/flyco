@@ -5,12 +5,16 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=flyco
-Group=flyco
+User=root
+Group=root
+# Only the five capabilities required for dual-UID separation: dropping to the
+# unprivileged `flyco` agent user (`SETUID`/`SETGID`) and managing ownership of
+# agent workspaces, credentials, and PTYs (`CHOWN`/`FOWNER`/`DAC_OVERRIDE`).
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
 WorkingDirectory=/srv/flyco/work
-Environment=HOME=/home/flyco
+Environment=HOME=/var/lib/flyco/daemon-home
 Environment=PATH=/home/flyco/.bun/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/usr/local/bin/flycod run --config /etc/flycod/config.toml
+ExecStart=/usr/local/bin/flycod run --config /etc/flycod/config.toml --agent-user flyco
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
@@ -18,8 +22,8 @@ PrivateTmp=true
 ProtectHome=read-only
 ProtectSystem=strict
 # /etc/claude-code is Claude Code's managed-policy directory: the daemon
-# writes the MCP allowlist there on every start, and ProtectSystem=strict
-# makes the rest of /etc read-only, which is the point.
+# writes the managed policy there on every start (`0755`/`0644` root-owned),
+# and ProtectSystem=strict makes the rest of /etc read-only.
 ReadWritePaths=/home/flyco /srv/flyco /var/lib/flyco /etc/claude-code
 
 [Install]

@@ -26,7 +26,8 @@ use tokio::sync::mpsc;
 /// report is what these tests are about.
 fn mount() -> Mount {
     Mount::new(
-        FlycoServer::of(Path::new("/etc/flyco/flycod.toml")).expect("this test binary has a path"),
+        FlycoServer::of_socket(Path::new("/var/lib/flyco/run/mcp.sock"))
+            .expect("this test binary has a path"),
         Vec::new(),
         false,
     )

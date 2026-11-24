@@ -45,15 +45,20 @@ use aither_acp::{
     RequestPermissionResult, SessionNewParams, SessionNotification, SessionResumeParams,
     SessionSetConfigOptionParams, SessionSetModeParams, TextContent,
 };
-use aither_mcp::protocol::{JsonRpcError, JsonRpcNotification};
+use aither_mcp::protocol::{
+    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError,
+};
+use aither_mcp::transport::{BidirectionalTransport, Transport};
 use flyco_core::{ApprovalId, ContextUsage, HarnessEvent, ModelChoice, PermissionMode};
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 use tokio::sync::{mpsc, oneshot};
 
 use self::normalize::Normalizer;
 use super::{Harness, HarnessSession, SessionOutput, StartRequest, Started, ToolApproval};
 use crate::config::{AcpConfig, AcpMethodCall};
 use crate::mount::{Mount, MountState, MountedServer};
+use crate::privilege::{AgentUser, chown_path};
 
 /// Capacity of the driver's command channel.
 const CHANNEL_DEPTH: usize = 256;
@@ -178,6 +183,7 @@ pub enum AcpError {
 pub struct AcpHarness {
     config: AcpConfig,
     mount: Mount,
+    agent: Option<AgentUser>,
 }
 
 impl AcpHarness {
@@ -185,7 +191,18 @@ impl AcpHarness {
     /// session may reach.
     #[must_use]
     pub const fn new(config: AcpConfig, mount: Mount) -> Self {
-        Self { config, mount }
+        Self {
+            config,
+            mount,
+            agent: None,
+        }
+    }
+
+    /// Configures the unprivileged agent user the ACP process runs as.
+    #[must_use]
+    pub fn with_agent(mut self, agent: Option<AgentUser>) -> Self {
+        self.agent = agent;
+        self
     }
 }
 
@@ -195,7 +212,8 @@ impl Harness for AcpHarness {
 
     async fn start(self, request: StartRequest) -> Result<Started<Self::Session>, AcpError> {
         let config = self.config;
-        materialize_files(&config).await?;
+        let agent = self.agent;
+        materialize_files(&config, agent.as_ref()).await?;
         tokio::fs::create_dir_all(&request.workdir)
             .await
             .map_err(|source| AcpError::Workdir {
@@ -204,7 +222,14 @@ impl Harness for AcpHarness {
             })?;
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let connected = connect(&config, &request, events_tx.clone(), &self.mount).await?;
+        let connected = connect(
+            &config,
+            &request,
+            events_tx.clone(),
+            &self.mount,
+            agent.as_ref(),
+        )
+        .await?;
 
         let replaying = connected.client.handler().replaying.clone();
         let opened = match open_session(
@@ -297,6 +322,136 @@ struct Connected {
     initialized: aither_acp::InitializeResult,
 }
 
+/// Minimal newline-delimited JSON-RPC transport backed by a `tokio::process::Child`,
+/// used when dropping privileges to [`AgentUser`] before spawning an ACP agent.
+struct TokioChildTransport {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+    read_buf: Vec<u8>,
+}
+
+impl TokioChildTransport {
+    fn spawn(
+        program: &str,
+        args: &[&str],
+        env: &BTreeMap<String, String>,
+        cwd: &std::path::Path,
+        agent: &AgentUser,
+    ) -> std::io::Result<Self> {
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(args)
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
+        agent.apply_tokio_command(&mut cmd, env.clone());
+        let mut child = cmd.spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("ACP child stdin was not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("ACP child stdout was not piped"))?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout: tokio::io::BufReader::new(stdout),
+            read_buf: Vec::new(),
+        })
+    }
+
+    async fn write_line(&mut self, value: &impl serde::Serialize) -> Result<(), McpError> {
+        let mut bytes = serde_json::to_vec(value)
+            .map_err(|error| McpError::Transport(format!("encode ACP message: {error}")))?;
+        bytes.push(b'\n');
+        self.stdin
+            .write_all(&bytes)
+            .await
+            .map_err(|error| McpError::Transport(format!("write ACP stdin: {error}")))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|error| McpError::Transport(format!("flush ACP stdin: {error}")))?;
+        Ok(())
+    }
+
+    async fn read_message(&mut self) -> Result<Option<JsonRpcMessage>, McpError> {
+        loop {
+            self.read_buf.clear();
+            let n = self
+                .stdout
+                .read_until(b'\n', &mut self.read_buf)
+                .await
+                .map_err(|error| McpError::Transport(format!("read ACP stdout: {error}")))?;
+            if n == 0 {
+                return Ok(None);
+            }
+            let line = std::str::from_utf8(&self.read_buf)
+                .map_err(|error| McpError::Transport(format!("ACP stdout is not UTF-8: {error}")))?
+                .trim();
+            if line.is_empty() {
+                continue;
+            }
+            let msg = serde_json::from_str::<JsonRpcMessage>(line)
+                .map_err(|error| McpError::Transport(format!("invalid ACP JSON-RPC: {error}")))?;
+            return Ok(Some(msg));
+        }
+    }
+}
+
+impl Transport for TokioChildTransport {
+    async fn request(&mut self, req: JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
+        let wanted = req.id.clone();
+        self.write_line(&req).await?;
+        while let Some(msg) = self.read_message().await? {
+            if let JsonRpcMessage::Response(response) = msg
+                && response.id == wanted
+            {
+                return Ok(response);
+            }
+        }
+        Err(McpError::Transport(
+            "ACP child closed before answering".to_owned(),
+        ))
+    }
+
+    async fn notify(&mut self, notif: JsonRpcNotification) -> Result<(), McpError> {
+        self.write_line(&notif).await
+    }
+
+    async fn close(&mut self) -> Result<(), McpError> {
+        let _ = self.stdin.shutdown().await;
+        let _ = self.child.kill().await;
+        Ok(())
+    }
+
+    async fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        if let Ok(Some(status)) = self.child.try_wait() {
+            return Some(status);
+        }
+        let _ = self.child.kill().await;
+        self.child.wait().await.ok()
+    }
+}
+
+impl BidirectionalTransport for TokioChildTransport {
+    async fn recv(&mut self) -> Result<Option<JsonRpcMessage>, McpError> {
+        self.read_message().await
+    }
+
+    async fn respond(&mut self, response: JsonRpcResponse) -> Result<(), McpError> {
+        self.write_line(&response).await
+    }
+
+    async fn send_request(&mut self, req: JsonRpcRequest) -> Result<(), McpError> {
+        self.write_line(&req).await
+    }
+}
+
 /// Spawns the agent, runs the handshake, and refuses mounts the agent
 /// cannot speak.
 ///
@@ -308,6 +463,7 @@ async fn connect(
     request: &StartRequest,
     events: mpsc::UnboundedSender<AgentEvent>,
     mount: &Mount,
+    agent: Option<&AgentUser>,
 ) -> Result<Connected, AcpError> {
     let handler = AgentHandler {
         events,
@@ -315,26 +471,43 @@ async fn connect(
     };
     let program = config.program.to_string_lossy().into_owned();
     let args: Vec<&str> = config.args.iter().map(String::as_str).collect();
-    let (client, connection) = AcpClient::spawn(
-        &program,
-        &args,
-        config.env.clone(),
-        request.workdir.clone(),
-        handler.clone(),
-    )
-    .map_err(|error| AcpError::Spawn {
-        program: program.clone(),
-        detail: error.to_string(),
-    })?;
+    let (client, connection_task) = if let Some(user) = agent {
+        let transport =
+            TokioChildTransport::spawn(&program, &args, &config.env, &request.workdir, user)
+                .map_err(|error| AcpError::Spawn {
+                    program: program.clone(),
+                    detail: error.to_string(),
+                })?;
+        let (client, connection) = AcpClient::connect(transport, handler.clone());
+        let closed = handler.events.clone();
+        let task = tokio::spawn(async move {
+            connection.await;
+            let _ = closed.send(AgentEvent::Closed);
+        });
+        (client, task)
+    } else {
+        let (client, connection) = AcpClient::spawn(
+            &program,
+            &args,
+            config.env.clone(),
+            request.workdir.clone(),
+            handler.clone(),
+        )
+        .map_err(|error| AcpError::Spawn {
+            program: program.clone(),
+            detail: error.to_string(),
+        })?;
+        let closed = handler.events.clone();
+        let task = tokio::spawn(async move {
+            connection.await;
+            let _ = closed.send(AgentEvent::Closed);
+        });
+        (client, task)
+    };
     let client = client.with_client_info(Implementation {
         name: "flycod".to_owned(),
         title: None,
         version: env!("CARGO_PKG_VERSION").to_owned(),
-    });
-    let closed = handler.events.clone();
-    let connection_task = tokio::spawn(async move {
-        connection.await;
-        let _ = closed.send(AgentEvent::Closed);
     });
 
     let initialized = match client.initialize().await {
@@ -720,13 +893,30 @@ async fn apply_model(
     Ok(())
 }
 
-/// Writes every `[acp.files]` entry, mode `0600`.
+/// Whether an `[acp.files]` entry is a managed policy document (non-secret
+/// MCP registry) rather than a credential file.
+fn is_managed_policy_file(path: &std::path::Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("config.toml" | "mcp_config.json")
+    )
+}
+
+/// Writes every `[acp.files]` entry.
 ///
-/// These files exist to carry credentials — Codex's `auth.json`, Devin's
-/// `credentials.toml`, a managed MCP registry — so the mode is not a
-/// choice, and the parent directories are created rather than required.
-async fn materialize_files(config: &AcpConfig) -> Result<(), AcpError> {
+/// Under dual-UID isolation (`agent.is_some()`):
+/// - Managed policy files (`config.toml`, `mcp_config.json`) are written
+///   daemon-owned `0644` inside `0755` daemon-owned directories so the agent
+///   can read them but cannot modify or unlink them.
+/// - Credential files (`auth.json`, `credentials.toml`) are written
+///   daemon-owned `0640` with group `agent.gid` so the agent can read its
+///   own harness credential without being able to overwrite or leak it to
+///   other users.
+///
+/// Without a separate agent user (developer machine), every file is `0600`.
+async fn materialize_files(config: &AcpConfig, agent: Option<&AgentUser>) -> Result<(), AcpError> {
     for file in &config.files {
+        let managed_policy = is_managed_policy_file(&file.path);
         if let Some(parent) = file.path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -734,6 +924,25 @@ async fn materialize_files(config: &AcpConfig) -> Result<(), AcpError> {
                     path: parent.to_owned(),
                     source,
                 })?;
+            if managed_policy && agent.is_some() {
+                tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755))
+                    .await
+                    .map_err(|source| AcpError::File {
+                        path: parent.to_owned(),
+                        source,
+                    })?;
+            } else if !managed_policy
+                && let Some(user) = agent
+                && user.needs_uid_switch()
+                && parent.starts_with(flyco_provider::flycod::DEVIN_DATA_HOME)
+            {
+                chown_path(parent, Some(user.uid), Some(user.gid)).map_err(|error| {
+                    AcpError::File {
+                        path: parent.to_owned(),
+                        source: std::io::Error::other(error),
+                    }
+                })?;
+            }
         }
         tokio::fs::write(&file.path, &file.contents)
             .await
@@ -741,12 +950,26 @@ async fn materialize_files(config: &AcpConfig) -> Result<(), AcpError> {
                 path: file.path.clone(),
                 source,
             })?;
-        tokio::fs::set_permissions(&file.path, std::fs::Permissions::from_mode(0o600))
+        let mode = match (agent, managed_policy) {
+            (Some(_), true) => 0o644,
+            (Some(_), false) => 0o640,
+            (None, _) => 0o600,
+        };
+        tokio::fs::set_permissions(&file.path, std::fs::Permissions::from_mode(mode))
             .await
             .map_err(|source| AcpError::File {
                 path: file.path.clone(),
                 source,
             })?;
+        if !managed_policy
+            && let Some(user) = agent
+            && user.needs_uid_switch()
+        {
+            chown_path(&file.path, None, Some(user.gid)).map_err(|error| AcpError::File {
+                path: file.path.clone(),
+                source: std::io::Error::other(error),
+            })?;
+        }
     }
     Ok(())
 }
