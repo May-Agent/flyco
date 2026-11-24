@@ -2,9 +2,10 @@
 //!
 //! Two surfaces share this crate:
 //!
-//! * **The human path** (`flyco claude`, `flyco codex`, `flyco resume`)
-//!   provisions a session and bridges the local terminal to the harness's
-//!   native TUI running inside the session's machine PTY.
+//! * **The human path** (`flyco claude`, `flyco codex`, `flyco devin`,
+//!   `flyco antigravity`, `flyco resume`) provisions or resumes a session and
+//!   attaches the local terminal directly to the control-plane ACP/SSE
+//!   conversation interface.
 //! * **The agent path** (`flyco session …`, `flyco run`, the discovery
 //!   commands) is a faithful projection of the control-plane REST API —
 //!   JSON-first, non-interactive, and versioned by `/v1` rather than by
@@ -13,11 +14,11 @@
 //! Both ride REST for commands and one SSE stream (`GET /v1/events`) for
 //! push. There is no WebSocket anywhere in the system.
 
-pub mod bridge;
 pub mod cli;
 pub mod client;
 pub mod creds;
 pub mod follow;
+pub mod interactive;
 pub mod out;
 pub mod pick;
 

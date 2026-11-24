@@ -84,7 +84,7 @@ pub enum Command {
         #[arg(long, value_name = "DURATION", value_parser = parse_duration)]
         timeout: Option<std::time::Duration>,
     },
-    /// Open a Claude Code TUI on a new session, bridged to this terminal.
+    /// Start an interactive Claude Code session over the control-plane ACP/SSE stream.
     Claude {
         /// `owner/name`; asked for when omitted on a TTY.
         #[arg(id = "target_repo", value_name = "REPO")]
@@ -93,7 +93,7 @@ pub enum Command {
         #[command(flatten)]
         spec: SessionSpec,
     },
-    /// Open a Codex TUI on a new session, bridged to this terminal.
+    /// Start an interactive Codex session over the control-plane ACP/SSE stream.
     Codex {
         /// `owner/name`; asked for when omitted on a TTY.
         #[arg(id = "target_repo", value_name = "REPO")]
@@ -102,7 +102,7 @@ pub enum Command {
         #[command(flatten)]
         spec: SessionSpec,
     },
-    /// Open a Devin TUI on a new session, bridged to this terminal.
+    /// Start an interactive Devin session over the control-plane ACP/SSE stream.
     Devin {
         /// `owner/name`; asked for when omitted on a TTY.
         #[arg(id = "target_repo", value_name = "REPO")]
@@ -111,7 +111,7 @@ pub enum Command {
         #[command(flatten)]
         spec: SessionSpec,
     },
-    /// Open an Antigravity session, bridged to this terminal.
+    /// Start an interactive Antigravity session over the control-plane ACP/SSE stream.
     Antigravity {
         /// `owner/name`; asked for when omitted on a TTY.
         #[arg(id = "target_repo", value_name = "REPO")]
@@ -154,8 +154,8 @@ pub enum Command {
         #[command(flatten)]
         spec: SessionSpec,
     },
-    /// Re-attach to an existing session's TUI — re-entering its
-    /// conversation — re-provisioning the machine when it was away.
+    /// Re-attach to an existing session over the control-plane ACP/SSE stream,
+    /// re-provisioning its machine when it was away.
     Resume {
         /// The session to re-enter; picked interactively when omitted.
         id: Option<String>,

@@ -1,6 +1,6 @@
 [package]
 name = "flyco-cli"
-description = "flyco: the flyco terminal client — native harness TUIs for humans, a --json surface for agents"
+description = "flyco: the flyco terminal client — interactive ACP/SSE sessions for humans, a --json surface for agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
