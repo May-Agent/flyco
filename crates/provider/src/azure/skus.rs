@@ -370,7 +370,9 @@ impl Quotas {
             .map(|(_, used, limit)| (*used, *limit))
     }
 
-    /// Refuses unless `vcpus` more virtual CPUs fit under `quota`.
+    /// Refuses unless `vcpus` virtual CPUs fit under `quota` after releasing
+    /// `releasing_vcpus` from the same pool (non-zero when resizing a running
+    /// VM in place).
     ///
     /// A quota the region does not list is not treated as unlimited: it is
     /// a name the driver got wrong, and provisioning against it would fail
@@ -380,7 +382,13 @@ impl Quotas {
     ///
     /// Returns [`ProviderError::QuotaExceeded`] when the headroom is not
     /// there, or [`ProviderError::Unavailable`] when the quota is unknown.
-    pub fn require(&self, quota: &str, region: &str, vcpus: u32) -> Result<(), ProviderError> {
+    pub fn require_after_release(
+        &self,
+        quota: &str,
+        region: &str,
+        vcpus: u32,
+        releasing_vcpus: u32,
+    ) -> Result<(), ProviderError> {
         let Some((used, limit)) = self.get(quota) else {
             return Err(ProviderError::Unavailable {
                 machine_type: quota.to_owned(),
@@ -393,7 +401,8 @@ impl Quotas {
         if limit < 0 {
             return Ok(());
         }
-        if used.saturating_add(i64::from(vcpus)) <= limit {
+        let effective_used = used.saturating_sub(i64::from(releasing_vcpus)).max(0);
+        if effective_used.saturating_add(i64::from(vcpus)) <= limit {
             return Ok(());
         }
 
@@ -402,9 +411,19 @@ impl Quotas {
             quota: quota.to_owned(),
             region: region.to_owned(),
             limit: u32::try_from(limit).unwrap_or(u32::MAX),
-            used: u32::try_from(used).unwrap_or(u32::MAX),
+            used: u32::try_from(effective_used).unwrap_or(u32::MAX),
             requested: vcpus,
         })
+    }
+
+    /// Refuses unless `vcpus` more virtual CPUs fit under `quota`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError::QuotaExceeded`] when the headroom is not
+    /// there, or [`ProviderError::Unavailable`] when the quota is unknown.
+    pub fn require(&self, quota: &str, region: &str, vcpus: u32) -> Result<(), ProviderError> {
+        self.require_after_release(quota, region, vcpus, 0)
     }
 
     /// Refuses unless the pools that fund this capacity mode cover one more
@@ -427,18 +446,48 @@ impl Quotas {
         region: &str,
         mode: CapacityMode,
     ) -> Result<(), ProviderError> {
+        self.require_capacity_for_resize(sku, None, region, mode)
+    }
+
+    /// Refuses unless the pools that fund `mode` cover `sku` once `releasing`
+    /// (the currently running VM's SKU, if any) is deallocated.
+    ///
+    /// For Spot, both SKUs share `lowPriorityCores`. For On-Demand, both
+    /// share regional `cores`, and the family pool only releases vCPUs when
+    /// `releasing` belongs to the same family as `sku`.
+    ///
+    /// # Errors
+    ///
+    /// Returns whichever check fails first.
+    pub fn require_capacity_for_resize(
+        &self,
+        sku: &Sku,
+        releasing: Option<&Sku>,
+        region: &str,
+        mode: CapacityMode,
+    ) -> Result<(), ProviderError> {
         let vcpus = sku.vcpus().ok_or(ProviderError::Malformed(
             "an Azure VM SKU reported no vCPU count",
         ))?;
+        let releasing_vcpus = releasing.and_then(Sku::vcpus).unwrap_or(0);
 
         if mode.is_spot() {
-            return self.require(LOW_PRIORITY_CORES_QUOTA, region, vcpus);
+            return self.require_after_release(
+                LOW_PRIORITY_CORES_QUOTA,
+                region,
+                vcpus,
+                releasing_vcpus,
+            );
         }
 
         if let Some(family) = &sku.family {
-            self.require(family, region, vcpus)?;
+            let same_family_release = releasing
+                .and_then(|current| current.family.as_deref())
+                .filter(|current_family| current_family.eq_ignore_ascii_case(family))
+                .map_or(0, |_| releasing_vcpus);
+            self.require_after_release(family, region, vcpus, same_family_release)?;
         }
-        self.require(REGIONAL_CORES_QUOTA, region, vcpus)
+        self.require_after_release(REGIONAL_CORES_QUOTA, region, vcpus, releasing_vcpus)
     }
 }
 

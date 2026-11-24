@@ -217,18 +217,25 @@ pub struct RunInstances {
     /// Ownership tags, on the instance and on the volume it creates.
     #[serde(rename = "TagSpecification")]
     pub tag_specification: Vec<TagSpecification>,
+    /// Deterministic idempotency token so at-least-once queue redeliveries do
+    /// not launch duplicate EC2 instances.
+    #[serde(rename = "ClientToken", skip_serializing_if = "Option::is_none")]
+    pub client_token: Option<String>,
 }
 
 impl RunInstances {
     /// The same machine, requested as ordinary on-demand capacity.
     ///
-    /// The market options come off as a unit, which is the whole of the
-    /// difference: everything else about the instance — its image, its
-    /// volume, its user data — is identical, and that is what makes the
-    /// fallback a retry rather than a second, different machine.
+    /// The market options come off as a unit, and the `ClientToken` is updated
+    /// so EC2 does not reject the on-demand fallback with
+    /// `IdempotentParameterMismatch`.
     #[must_use]
-    pub const fn without_spot(mut self) -> Self {
+    pub fn without_spot(mut self) -> Self {
         self.instance_market_options = None;
+        if let Some(token) = self.client_token.take() {
+            let base = token.strip_suffix("-spot").unwrap_or(&token);
+            self.client_token = Some(format!("{base}-ondemand"));
+        }
         self
     }
 
@@ -260,8 +267,9 @@ pub struct Ebs {
     /// `gp3`, the general-purpose tier.
     #[serde(rename = "VolumeType")]
     pub volume_type: &'static str,
-    /// Always `false`, which is this driver's `Detach`: terminating the
-    /// instance leaves the disk, and destroying deletes it explicitly.
+    /// Set to `true` on launch so terminating or rolling back the instance
+    /// removes its root EBS volume automatically while stop/start and
+    /// persistent Spot `stop` interruptions preserve it.
     #[serde(rename = "DeleteOnTermination")]
     pub delete_on_termination: bool,
 }
@@ -429,6 +437,11 @@ pub struct Instance {
     /// was asked for.
     #[serde(rename = "instanceLifecycle", default)]
     pub instance_lifecycle: Option<String>,
+    /// Persistent spot request id (`sir-…`), when the instance was fulfilled
+    /// by a Spot request. Must be cancelled before terminating the instance
+    /// so EC2 does not automatically launch a replacement.
+    #[serde(rename = "spotInstanceRequestId", default)]
+    pub spot_instance_request_id: Option<String>,
     /// Public DNS name, once one exists.
     #[serde(rename = "dnsName", default)]
     pub dns_name: Option<String>,
@@ -469,6 +482,28 @@ impl Instance {
             .iter()
             .find(|mapping| mapping.device_name == root)
             .map(|mapping| mapping.ebs.volume_id.as_str())
+    }
+
+    /// Whether the root EBS volume is configured to be deleted automatically
+    /// when the instance is terminated.
+    #[must_use]
+    pub fn root_volume_deletes_on_termination(&self) -> bool {
+        let Some(root) = self.root_device_name.as_deref() else {
+            return false;
+        };
+        self.block_device_mapping
+            .item
+            .iter()
+            .find(|mapping| mapping.device_name == root)
+            .is_some_and(|mapping| mapping.ebs.delete_on_termination)
+    }
+
+    /// The Spot Instance Request id (`sir-…`), when present and non-empty.
+    #[must_use]
+    pub fn spot_request_id(&self) -> Option<&str> {
+        self.spot_instance_request_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
     }
 
     /// The address the daemon bootstrap reaches it on.
@@ -515,6 +550,9 @@ pub struct AttachedEbs {
     /// `vol-…`.
     #[serde(rename = "volumeId")]
     pub volume_id: String,
+    /// Whether terminating the instance deletes this volume automatically.
+    #[serde(rename = "deleteOnTermination", default)]
+    pub delete_on_termination: bool,
 }
 
 /// Where an instance is in its lifecycle.
@@ -585,6 +623,14 @@ impl InstanceAction {
             instance_id: vec![instance.to_owned()],
         }
     }
+}
+
+/// Body of `CancelSpotInstanceRequests`.
+#[derive(Debug, Clone, Serialize)]
+pub struct CancelSpotInstanceRequests {
+    /// The Spot Instance Request ids (`sir-…`) to cancel.
+    #[serde(rename = "SpotInstanceRequestId")]
+    pub spot_instance_request_id: Vec<String>,
 }
 
 /// Body of `ModifyInstanceAttribute`, setting the instance type.

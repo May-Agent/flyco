@@ -12,24 +12,51 @@
 //! produces, and a quoting mistake in it is a container name that becomes
 //! another command on somebody's real hardware.
 
+use core::fmt;
+
 use askama::Template;
 use base64::Engine as _;
 
 use super::{CONFIG_ENV, ContainerJob};
 use crate::{ProviderError, flycod};
 
-/// Renders the script for one job.
+/// One rendered container job: the non-secret shell script and the optional
+/// env-file payload piped to the child process's standard input.
+///
+/// Keeping the two apart ensures `FLYCO_DAEMON_CONFIG` never enters
+/// `/bin/sh -c` argv (visible in `/proc/<pid>/cmdline`).
+#[derive(Clone, PartialEq, Eq)]
+pub struct RenderedScript {
+    /// The POSIX shell commands to run. Contains no credentials.
+    pub script: String,
+    /// Env-file contents (`KEY=VALUE\n`) piped to stdin for
+    /// `podman run --env-file /dev/stdin`.
+    pub stdin: Option<String>,
+}
+
+impl fmt::Debug for RenderedScript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RenderedScript")
+            .field("script", &self.script)
+            .field("has_stdin", &self.stdin.is_some())
+            .finish()
+    }
+}
+
+/// Renders the script and optional stdin env-file for one job.
 ///
 /// Every interpolated value is shell-quoted before it reaches the template,
 /// so a container name or an image reference cannot become another command.
+/// Credentials for [`ContainerJob::Create`] are returned in
+/// [`RenderedScript::stdin`] rather than interpolated into the script text.
 ///
 /// # Errors
 ///
 /// Returns [`ProviderError::Malformed`] if the daemon configuration or the
 /// template itself would not render, both of which are flyco's own bug
 /// rather than anything the host did.
-pub fn render(job: &ContainerJob) -> Result<String, ProviderError> {
-    let rendered = match job {
+pub fn render(job: &ContainerJob) -> Result<RenderedScript, ProviderError> {
+    let (rendered, stdin) = match job {
         ContainerJob::Create {
             container,
             volume,
@@ -39,39 +66,50 @@ pub fn render(job: &ContainerJob) -> Result<String, ProviderError> {
         } => {
             let config = flycod::render(bootstrap)
                 .map_err(|_| ProviderError::Malformed("the flycod configuration did not render"))?;
-            CreateScript {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(config);
+            let script = CreateScript {
                 container: quote(container),
                 volume: quote(volume),
                 workdir: quote(flycod::WORKDIR),
                 image: quote(image),
                 machine: quote(&machine.to_string()),
                 session: quote(&bootstrap.session.to_string()),
-                config_env: CONFIG_ENV,
-                config_base64: base64::engine::general_purpose::STANDARD.encode(config),
             }
-            .render()
+            .render();
+            (script, Some(format!("{CONFIG_ENV}={encoded}\n")))
         }
-        ContainerJob::Stop { container } => StopScript {
-            container: quote(container),
-        }
-        .render(),
-        ContainerJob::Start { container } => StartScript {
-            container: quote(container),
-        }
-        .render(),
+        ContainerJob::Stop { container } => (
+            StopScript {
+                container: quote(container),
+            }
+            .render(),
+            None,
+        ),
+        ContainerJob::Start { container } => (
+            StartScript {
+                container: quote(container),
+            }
+            .render(),
+            None,
+        ),
         ContainerJob::Remove {
             container,
             volume,
             keep_volume,
-        } => RemoveScript {
-            container: quote(container),
-            volume: quote(volume),
-            keep_volume: *keep_volume,
-        }
-        .render(),
+        } => (
+            RemoveScript {
+                container: quote(container),
+                volume: quote(volume),
+                keep_volume: *keep_volume,
+            }
+            .render(),
+            None,
+        ),
     };
 
-    rendered.map_err(|_| ProviderError::Malformed("a podman script template did not render"))
+    let script = rendered
+        .map_err(|_| ProviderError::Malformed("a podman script template did not render"))?;
+    Ok(RenderedScript { script, stdin })
 }
 
 /// POSIX-quotes one value for the host's shell.
@@ -88,8 +126,6 @@ struct CreateScript {
     image: String,
     machine: String,
     session: String,
-    config_env: &'static str,
-    config_base64: String,
 }
 
 #[derive(Template)]
@@ -146,47 +182,59 @@ mod tests {
 
     #[test]
     fn creating_mounts_the_sessions_volume_at_the_checkout() {
-        let script = render(&create()).expect("render");
-        assert!(script.contains("podman run"));
+        let rendered = render(&create()).expect("render");
+        assert!(rendered.script.contains("podman run"));
         assert!(
-            script.contains(&format!(":{}", flycod::WORKDIR)),
-            "the volume must be mounted where the checkout lives: {script}"
+            rendered.script.contains(&format!(":{}", flycod::WORKDIR)),
+            "the volume must be mounted where the checkout lives: {}",
+            rendered.script
         );
         assert!(
-            script.contains("podman volume"),
-            "the volume has to exist before the container mounts it: {script}"
+            rendered.script.contains("podman volume"),
+            "the volume has to exist before the container mounts it: {}",
+            rendered.script
         );
     }
 
     #[test]
     fn the_daemon_token_never_reaches_the_command_line() {
-        let script = render(&create()).expect("render");
-
-        let (command_lines, heredoc): (Vec<&str>, Vec<&str>) = script
-            .lines()
-            .partition(|line| !line.starts_with(CONFIG_ENV));
+        let rendered = render(&create()).expect("render");
 
         assert!(
-            command_lines.iter().all(|line| !line.contains(TOKEN)),
-            "the token must not appear in any podman argument"
+            !rendered.script.contains(TOKEN),
+            "the token must not appear in the script"
         );
-        assert_eq!(heredoc.len(), 1, "the config rides one env-file line");
-        assert!(heredoc[0].starts_with(CONFIG_ENV));
         assert!(
-            !heredoc[0].contains(TOKEN),
+            !rendered.script.contains(CONFIG_ENV),
+            "the encoded daemon config must ride stdin, never the shell script argv"
+        );
+        assert!(
+            !format!("{rendered:?}").contains(CONFIG_ENV),
+            "Debug must not expose the env-file payload"
+        );
+        let stdin = rendered
+            .stdin
+            .as_deref()
+            .expect("create pipes env on stdin");
+        let lines: Vec<&str> = stdin.lines().collect();
+        assert_eq!(lines.len(), 1, "the config rides one env-file line");
+        assert!(lines[0].starts_with(&format!("{CONFIG_ENV}=")));
+        assert!(
+            !lines[0].contains(TOKEN),
             "the config is base64, so even the env-file line is not the token verbatim"
         );
     }
 
     #[test]
     fn a_hostile_container_name_cannot_become_another_command() {
-        let script = render(&ContainerJob::Stop {
+        let rendered = render(&ContainerJob::Stop {
             container: "flyco-x; rm -rf /".to_owned(),
         })
         .expect("render");
 
-        assert!(script.contains("'flyco-x; rm -rf /'"));
-        assert!(!script.contains("podman stop flyco-x; rm"));
+        assert!(rendered.script.contains("'flyco-x; rm -rf /'"));
+        assert!(!rendered.script.contains("podman stop flyco-x; rm"));
+        assert!(rendered.stdin.is_none());
     }
 
     #[test]
@@ -200,17 +248,26 @@ mod tests {
         };
 
         let kept = render(&removal(true)).expect("render");
-        assert!(kept.contains("podman rm"));
+        assert!(kept.script.contains("podman rm"));
         assert!(
-            !kept.contains("podman volume rm"),
-            "a machine destroyed with its disk kept must not lose the work on it: {kept}"
+            !kept.script.contains("podman volume rm"),
+            "a machine destroyed with its disk kept must not lose the work on it: {}",
+            kept.script
         );
 
         let released = render(&removal(false)).expect("render");
-        assert!(released.contains("podman volume rm"));
         assert!(
-            released.contains(&volume),
-            "the volume being released has to be named: {released}"
+            released
+                .script
+                .contains(&format!("if podman volume exists {volume}; then")),
+            "volume removal must guard against an already-missing volume under set -eu: {}",
+            released.script
+        );
+        assert!(released.script.contains("podman volume rm --force"));
+        assert!(
+            released.script.contains(&volume),
+            "the volume being released has to be named: {}",
+            released.script
         );
     }
 }

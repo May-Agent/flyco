@@ -732,10 +732,9 @@ fn codex_auth_json(credential: &CodexCredential) -> Option<String> {
 
 /// The current instant as Codex writes `last_refresh`: RFC 3339, UTC.
 fn now_rfc3339() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock is set before the Unix epoch")
-        .as_secs();
+    use crate::clock::WallClock as _;
+
+    let seconds = crate::clock::SystemWallClock::new().unix_seconds();
     datetime::rfc3339(seconds).expect("a current timestamp is representable")
 }
 
@@ -1360,5 +1359,17 @@ mod tests {
         let rendered = render(&with_no_effort).expect("render");
         assert!(rendered.contains(r#"model = "sonnet""#), "{rendered}");
         assert!(!rendered.contains("effort ="), "{rendered}");
+    }
+
+    #[test]
+    fn now_rfc3339_formats_utc_timestamp_via_wall_clock() {
+        let stamp = super::now_rfc3339();
+        assert_eq!(stamp.len(), 20, "{stamp}");
+        assert!(stamp.ends_with('Z'), "{stamp}");
+        assert_eq!(&stamp[4..5], "-", "{stamp}");
+        assert_eq!(&stamp[7..8], "-", "{stamp}");
+        assert_eq!(&stamp[10..11], "T", "{stamp}");
+        assert_eq!(&stamp[13..14], ":", "{stamp}");
+        assert_eq!(&stamp[16..17], ":", "{stamp}");
     }
 }

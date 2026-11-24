@@ -197,9 +197,12 @@ async fn the_catalog_lists_every_machine_type_in_every_geography() {
     assert_eq!(header(&request, "x-github-api-version"), "2022-11-28");
 }
 
+const EMPTY_CODESPACES: &str = r#"{"codespaces":[]}"#;
+
 #[tokio::test]
 async fn a_provision_creates_the_codespace_and_polls_it_available() {
     let mut provider = provider_for(vec![
+        json(EMPTY_CODESPACES),
         HttpResponse::new(201, CODESPACE_PROVISIONING.as_bytes().to_vec()),
         json(CODESPACE_AVAILABLE),
     ]);
@@ -222,7 +225,14 @@ async fn a_provision_creates_the_codespace_and_polls_it_available() {
         Some(format!("https://github.com/codespaces/{CODESPACE}").as_str())
     );
 
-    let create = provider.transport().request(0);
+    let lookup = provider.transport().request(0);
+    assert_eq!(lookup.method, Method::Get);
+    assert_eq!(
+        lookup.url,
+        format!("{API}/repos/{ENV_REPO}/codespaces?per_page=100&page=1")
+    );
+
+    let create = provider.transport().request(1);
     assert_eq!(create.method, Method::Post);
     assert_eq!(create.url, format!("{API}/user/codespaces"));
     let body = body_of(&create);
@@ -239,17 +249,17 @@ async fn a_provision_creates_the_codespace_and_polls_it_available() {
     assert_eq!(body["retention_period_minutes"], 43_200);
     assert_eq!(body["devcontainer_path"], ".devcontainer/devcontainer.json");
 
-    let poll = provider.transport().request(1);
+    let poll = provider.transport().request(2);
     assert_eq!(poll.method, Method::Get);
     assert_eq!(poll.url, format!("{API}/user/codespaces/{CODESPACE}"));
 }
 
 #[tokio::test]
 async fn a_provision_yields_a_continuation_when_the_build_outlives_the_polls() {
-    let mut script = vec![HttpResponse::new(
-        201,
-        CODESPACE_PROVISIONING.as_bytes().to_vec(),
-    )];
+    let mut script = vec![
+        json(EMPTY_CODESPACES),
+        HttpResponse::new(201, CODESPACE_PROVISIONING.as_bytes().to_vec()),
+    ];
     // POLLS_PER_INVOCATION inspections, all still building.
     script.extend((0..12).map(|_| json(CODESPACE_PROVISIONING)));
     let mut provider = provider_for(script);
@@ -285,6 +295,7 @@ async fn a_provision_yields_a_continuation_when_the_build_outlives_the_polls() {
 #[tokio::test]
 async fn a_failed_build_is_an_operation_failure() {
     let mut provider = provider_for(vec![
+        json(EMPTY_CODESPACES),
         HttpResponse::new(201, CODESPACE_PROVISIONING.as_bytes().to_vec()),
         json(&CODESPACE_PROVISIONING.replace("\"Provisioning\"", "\"Failed\"")),
     ]);
@@ -301,7 +312,7 @@ async fn a_failed_build_is_an_operation_failure() {
 
 #[tokio::test]
 async fn a_refusal_lifts_the_errors_code_out_of_the_document() {
-    let mut provider = provider_for(vec![refused(422, ERROR_VALIDATION)]);
+    let mut provider = provider_for(vec![json(EMPTY_CODESPACES), refused(422, ERROR_VALIDATION)]);
 
     let error = provider
         .provision(&request_spec(MachineId::generate()))
@@ -529,6 +540,7 @@ async fn ensure_environment_creates_the_repository_and_its_devcontainer() {
     let transport = RecordedTransport::new(vec![
         empty(404),
         HttpResponse::new(201, REPO_PRIVATE.as_bytes().to_vec()),
+        empty(404),
         HttpResponse::new(201, b"{}".to_vec()),
     ]);
     let devcontainer =
@@ -553,7 +565,14 @@ async fn ensure_environment_creates_the_repository_and_its_devcontainer() {
     assert_eq!(body["private"], true);
     assert_eq!(body["auto_init"], true);
 
-    let put = transport.request(2);
+    let check_blob = transport.request(2);
+    assert_eq!(check_blob.method, Method::Get);
+    assert_eq!(
+        check_blob.url,
+        format!("{API}/repos/{ENV_REPO}/contents/.devcontainer/devcontainer.json")
+    );
+
+    let put = transport.request(3);
     assert_eq!(put.method, Method::Put);
     assert_eq!(
         put.url,
@@ -564,12 +583,14 @@ async fn ensure_environment_creates_the_repository_and_its_devcontainer() {
         base64::engine::general_purpose::STANDARD.encode(devcontainer.as_bytes())
     };
     assert_eq!(body_of(&put)["content"], Value::String(expected));
+    assert!(body_of(&put).get("sha").is_none());
 }
 
 #[tokio::test]
 async fn ensure_environment_rewrites_the_devcontainer_it_finds() {
     let transport = RecordedTransport::new(vec![
         json(REPO_PRIVATE),
+        json(r#"{"sha":"deadbeef1234"}"#),
         HttpResponse::new(200, b"{}".to_vec()),
     ]);
 
@@ -578,10 +599,16 @@ async fn ensure_environment_rewrites_the_devcontainer_it_finds() {
         .expect("ensured");
 
     assert_eq!(repo.full_name, ENV_REPO);
-    // GET, then the contents PUT — an existing repository is never
-    // recreated.
-    assert_eq!(transport.request_count(), 2);
-    assert_eq!(transport.request(1).method, Method::Put);
+    // GET repo, GET existing devcontainer SHA, then PUT with that SHA — an
+    // existing repository is never recreated and GitHub accepts updates.
+    assert_eq!(transport.request_count(), 3);
+    assert_eq!(transport.request(1).method, Method::Get);
+    let put = transport.request(2);
+    assert_eq!(put.method, Method::Put);
+    assert_eq!(
+        body_of(&put)["sha"],
+        Value::String("deadbeef1234".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -594,4 +621,88 @@ async fn ensure_environment_refuses_a_public_repository() {
     assert!(matches!(error, ProviderError::Rejected(_)));
     // And nothing was written to it.
     assert_eq!(transport.request_count(), 1);
+}
+
+#[tokio::test]
+async fn a_redelivered_provision_adopts_the_existing_codespace_by_display_name() {
+    let machine = MachineId::generate();
+    let display_name = format!("flyco-{machine}");
+    let existing_list = serde_json::json!({
+        "codespaces": [{
+            "name": CODESPACE,
+            "display_name": display_name,
+            "state": "Available",
+            "web_url": format!("https://github.com/codespaces/{CODESPACE}")
+        }]
+    })
+    .to_string();
+    let mut provider = provider_for(vec![json(&existing_list)]);
+
+    let provisioned = provider
+        .provision(&request_spec(machine))
+        .await
+        .expect("redelivery adopts existing codespace")
+        .ready()
+        .expect("already available");
+
+    assert_eq!(provisioned.native_id, CODESPACE);
+    assert_eq!(
+        provider.transport().request_count(),
+        1,
+        "must not POST /user/codespaces when a matching codespace already exists"
+    );
+}
+
+#[tokio::test]
+async fn resume_caps_polls_at_polls_per_invocation_and_yields_pending() {
+    let machine = Machine {
+        state: MachineState::Provisioning,
+        ..running(MachineId::generate())
+    };
+    let continuation = crate::Continuation::write(&super::ContinuationState {
+        codespace: CODESPACE.to_owned(),
+        region: GEO.to_owned(),
+    })
+    .expect("continuation");
+    // 1 initial inspect + POLLS_PER_INVOCATION polls inside await_available.
+    let script: Vec<HttpResponse> = (0..=crate::polling::POLLS_PER_INVOCATION)
+        .map(|_| json(CODESPACE_PROVISIONING))
+        .collect();
+    let mut provider = provider_for(script);
+
+    let outcome = provider
+        .resume(&machine, &continuation)
+        .await
+        .expect("resume yields pending after POLLS_PER_INVOCATION");
+    assert!(matches!(outcome, Provisioning::Pending { .. }));
+    assert_eq!(
+        provider.transport().request_count(),
+        1 + crate::polling::POLLS_PER_INVOCATION
+    );
+}
+
+#[tokio::test]
+async fn a_resize_that_fails_to_finish_stopping_never_calls_start() {
+    let shutting_down = CODESPACE_SHUTDOWN.replace("\"Shutdown\"", "\"ShuttingDown\"");
+    let mut script = vec![
+        json(CODESPACE_AVAILABLE), // PATCH
+        json(&shutting_down),      // POST /stop
+    ];
+    script.extend((0..crate::polling::POLLS_PER_INVOCATION).map(|_| json(&shutting_down)));
+    let mut provider = provider_for(script);
+    let machine = running(MachineId::generate());
+
+    let error = provider
+        .resize(&machine, "premiumLinux")
+        .await
+        .expect_err("resize fails when deallocate does not settle as Shutdown");
+    assert!(matches!(error, ProviderError::Rejected(_)));
+    assert!(
+        !(0..provider.transport().request_count()).any(|i| provider
+            .transport()
+            .request(i)
+            .url
+            .ends_with("/start")),
+        "start must never be called while the codespace is still ShuttingDown"
+    );
 }

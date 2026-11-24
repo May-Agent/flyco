@@ -17,21 +17,26 @@
 //! is read off it. A driver that starts calling a second Cost Explorer
 //! operation changes the constant, and the policy changes with it.
 
-use crate::aws::{costs, identity, image, pricing, quotas};
+use crate::aws::{costs, fargate, identity, image, pricing, quotas};
 
 /// IAM's service prefix for EC2.
 pub const EC2: &str = "ec2";
 
+/// IAM's service prefix for ECS.
+pub const ECS: &str = fargate::SERVICE;
+
 /// Every EC2 action the driver names in a request of its own.
 ///
 /// In the order the driver reaches them: reading what an account can deploy,
-/// finding or building the workspace network, launching, addressing, and
-/// finally the lifecycle operations a session's machine goes through.
-pub const EC2_ACTIONS: [&str; 21] = [
+/// reading live spot prices, finding or building the workspace network,
+/// launching, addressing, and finally the lifecycle operations a session's
+/// machine goes through.
+pub const EC2_ACTIONS: [&str; 23] = [
     "DescribeRegions",
     "DescribeInstanceTypes",
     "DescribeInstanceTypeOfferings",
     "DescribeInstances",
+    "DescribeSpotPriceHistory",
     "DescribeVpcs",
     "DescribeSubnets",
     "DescribeSecurityGroups",
@@ -46,6 +51,7 @@ pub const EC2_ACTIONS: [&str; 21] = [
     "StartInstances",
     "StopInstances",
     "ModifyInstanceAttribute",
+    "CancelSpotInstanceRequests",
     "TerminateInstances",
     "ReleaseAddress",
     "DeleteVolume",
@@ -60,6 +66,27 @@ pub const EC2_ACTIONS: [&str; 21] = [
 /// that list to exactly the call sites, and so the reason a right is granted
 /// is written down beside it.
 pub const IMPLIED_EC2_ACTIONS: [&str; 1] = ["CreateTags"];
+
+/// Every ECS action the Fargate path names in a request of its own.
+pub const ECS_ACTIONS: [&str; 11] = [
+    "DescribeClusters",
+    "CreateCluster",
+    "RegisterTaskDefinition",
+    "ListTaskDefinitions",
+    "DescribeTaskDefinition",
+    "DeregisterTaskDefinition",
+    "DeleteTaskDefinitions",
+    "ListTasks",
+    "DescribeTasks",
+    "RunTask",
+    "StopTask",
+];
+
+/// ECS actions no call site names directly and Fargate provisions need anyway.
+///
+/// `RegisterTaskDefinition` passes `tags` and `RunTask` propagates them to
+/// tasks, which IAM authorizes through `ecs:TagResource`.
+pub const IMPLIED_ECS_ACTIONS: [&str; 1] = ["TagResource"];
 
 /// The services reached through one JSON-RPC target each, and that target.
 ///
@@ -84,6 +111,12 @@ pub fn actions() -> Vec<String> {
         .iter()
         .chain(&IMPLIED_EC2_ACTIONS)
         .map(|action| format!("{EC2}:{action}"))
+        .chain(
+            ECS_ACTIONS
+                .iter()
+                .chain(&IMPLIED_ECS_ACTIONS)
+                .map(|action| format!("{ECS}:{action}")),
+        )
         .chain(
             OTHER_SERVICES
                 .iter()
@@ -110,15 +143,17 @@ fn operation(target: &str) -> &str {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{EC2_ACTIONS, IMPLIED_EC2_ACTIONS, actions, operation};
+    use super::{
+        EC2_ACTIONS, ECS_ACTIONS, IMPLIED_EC2_ACTIONS, IMPLIED_ECS_ACTIONS, actions, operation,
+    };
 
-    /// The driver's own source, read at compile time.
+    /// The driver's own sources, read at compile time.
     ///
-    /// The only way to check a list of call sites against the call sites: a
-    /// list maintained by hand beside code that changes is a list that goes
-    /// stale, and going stale here means shipping a policy that does not let
-    /// a session start.
+    /// Checking `mod.rs`, `pricing.rs`, and `fargate.rs` keeps the IAM policy
+    /// locked to every EC2 and ECS action the crate actually sends.
     const DRIVER: &str = include_str!("mod.rs");
+    const PRICING: &str = include_str!("pricing.rs");
+    const FARGATE: &str = include_str!("fargate.rs");
 
     /// The first argument of every EC2 call site, in every spelling the
     /// driver uses.
@@ -130,25 +165,68 @@ mod tests {
     /// test rather than silently under-reading the driver.
     const REGION_ARGUMENTS: [&str; 3] = ["region,", "&region,", "identity::REGION,"];
 
-    /// Every action literal the driver hands to `ec2` or `ec2_call`.
-    ///
-    /// Both take the region first and the action second, as a `&'static str`
-    /// literal, so a call site is `.ec2(` or `.ec2_call(`, a region
-    /// argument, and then the action. Scanned rather than regex-matched
-    /// because this crate has no regex dependency and does not need one.
-    fn called() -> BTreeSet<String> {
+    /// Extracts the first string literal argument after an opener when the
+    /// prefix before that literal matches `predicate`.
+    fn extract_literals(
+        source: &str,
+        opener: &str,
+        predicate: impl Fn(&str) -> bool,
+    ) -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        for site in source.split(opener).skip(1) {
+            let Some(open) = site.find('"') else { continue };
+            let Some(close) = site[open + 1..].find('"') else {
+                continue;
+            };
+            let between: String = site[..open].split_whitespace().collect();
+            if !predicate(&between) {
+                continue;
+            }
+            found.insert(site[open + 1..open + 1 + close].to_owned());
+        }
+        found
+    }
+
+    /// Every EC2 action literal sent through `.ec2(`, `.ec2_call(`, or
+    /// `send_ec2(`.
+    fn called_ec2() -> BTreeSet<String> {
         let mut found = BTreeSet::new();
         for opener in [".ec2(", ".ec2_call("] {
-            for site in DRIVER.split(opener).skip(1) {
-                let Some(open) = site.find('"') else { continue };
-                let Some(close) = site[open + 1..].find('"') else {
-                    continue;
-                };
-                let between: String = site[..open].split_whitespace().collect();
-                if !REGION_ARGUMENTS.contains(&between.as_str()) {
-                    continue;
-                }
-                found.insert(site[open + 1..open + 1 + close].to_owned());
+            found.extend(extract_literals(DRIVER, opener, |between| {
+                REGION_ARGUMENTS.contains(&between)
+            }));
+        }
+        found.extend(extract_literals(PRICING, "send_ec2(", |between| {
+            between.ends_with("region,")
+        }));
+        found
+    }
+
+    /// Every ECS action literal sent through `.ecs(` in `fargate.rs`.
+    fn called_ecs() -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        for opener in [
+            ".ecs(",
+            ".ecs::<_,DefinitionAnswer>(",
+            ".ecs::<_,TaskDefinitionDeletions>(",
+        ] {
+            found.extend(extract_literals(FARGATE, opener, |between| {
+                between == "region," || between == "&region,"
+            }));
+        }
+        // Also scan `.ecs::<...>(region, "Action", ...)` with whitespace intact.
+        for site in FARGATE.split(".ecs::<").skip(1) {
+            let Some(paren) = site.find('(') else {
+                continue;
+            };
+            let rest = &site[paren + 1..];
+            let Some(open) = rest.find('"') else { continue };
+            let Some(close) = rest[open + 1..].find('"') else {
+                continue;
+            };
+            let between: String = rest[..open].split_whitespace().collect();
+            if between == "region," || between == "&region," {
+                found.insert(rest[open + 1..open + 1 + close].to_owned());
             }
         }
         found
@@ -158,9 +236,19 @@ mod tests {
     fn the_ec2_actions_are_exactly_the_ones_the_driver_calls() {
         let listed: BTreeSet<String> = EC2_ACTIONS.iter().map(|&a| a.to_owned()).collect();
         assert_eq!(
-            called(),
+            called_ec2(),
             listed,
-            "EC2_ACTIONS must name every action the driver sends, and no others"
+            "EC2_ACTIONS must name every EC2 action the driver and pricing module send, and no others"
+        );
+    }
+
+    #[test]
+    fn the_ecs_actions_are_exactly_the_ones_fargate_calls() {
+        let listed: BTreeSet<String> = ECS_ACTIONS.iter().map(|&a| a.to_owned()).collect();
+        assert_eq!(
+            called_ecs(),
+            listed,
+            "ECS_ACTIONS must name every ECS action fargate.rs sends, and no others"
         );
     }
 
@@ -172,6 +260,12 @@ mod tests {
                 "{implied} is granted as an implied right and also listed as a call site"
             );
         }
+        for implied in IMPLIED_ECS_ACTIONS {
+            assert!(
+                !ECS_ACTIONS.contains(&implied),
+                "{implied} is granted as an implied right and also listed as a call site"
+            );
+        }
     }
 
     #[test]
@@ -180,6 +274,12 @@ mod tests {
         for expected in [
             "ec2:RunInstances",
             "ec2:CreateTags",
+            "ec2:CancelSpotInstanceRequests",
+            "ec2:DescribeSpotPriceHistory",
+            "ecs:RunTask",
+            "ecs:RegisterTaskDefinition",
+            "ecs:DeleteTaskDefinitions",
+            "ecs:TagResource",
             "sts:GetCallerIdentity",
             "ce:GetCostAndUsage",
             "pricing:GetProducts",
@@ -190,7 +290,11 @@ mod tests {
         }
         assert_eq!(
             actions.len(),
-            EC2_ACTIONS.len() + IMPLIED_EC2_ACTIONS.len() + 5
+            EC2_ACTIONS.len()
+                + IMPLIED_EC2_ACTIONS.len()
+                + ECS_ACTIONS.len()
+                + IMPLIED_ECS_ACTIONS.len()
+                + 5
         );
     }
 

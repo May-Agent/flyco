@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use crate::ProviderError;
 use crate::clock::MonotonicClock;
 use crate::http::HttpTransport;
+use crate::polling::PageCursor;
 
 use super::ec2;
 use super::sigv4::{AccessKey, Scope};
@@ -582,6 +583,7 @@ async fn read_architecture_rates<T: HttpTransport>(
 ) -> Result<Vec<(CpuArchitecture, Usd)>, ProviderError> {
     let mut rates: Vec<(CpuArchitecture, Usd)> = Vec::new();
     let mut next = None;
+    let mut cursor = PageCursor::new();
 
     loop {
         let page = read_products(transport, key, region, now_unix, query, next).await?;
@@ -601,7 +603,7 @@ async fn read_architecture_rates<T: HttpTransport>(
                 rates.push((architecture, micros(rate)));
             }
         }
-        next = page.next_token.filter(|token| !token.is_empty());
+        next = cursor.advance(page.next_token, "AWS Fargate price list")?;
         if next.is_none() {
             return Ok(rates);
         }
@@ -619,6 +621,7 @@ async fn read_ephemeral_rate<T: HttpTransport>(
     now_unix: u64,
 ) -> Result<Option<Usd>, ProviderError> {
     let mut next = None;
+    let mut cursor = PageCursor::new();
     loop {
         let page = read_products(
             transport,
@@ -634,7 +637,7 @@ async fn read_ephemeral_rate<T: HttpTransport>(
                 return Ok(Some(micros(rate)));
             }
         }
-        next = page.next_token.filter(|token| !token.is_empty());
+        next = cursor.advance(page.next_token, "AWS Fargate storage price list")?;
         if next.is_none() {
             return Ok(None);
         }
@@ -684,6 +687,7 @@ async fn read_storage<T: HttpTransport>(
     now_unix: u64,
 ) -> Result<Usd, ProviderError> {
     let mut next = None;
+    let mut cursor = PageCursor::new();
     loop {
         let page: ProductPage = json_rpc(
             transport,
@@ -706,7 +710,7 @@ async fn read_storage<T: HttpTransport>(
                 return Ok(hourly);
             }
         }
-        next = page.next_token.filter(|token| !token.is_empty());
+        next = cursor.advance(page.next_token, "AWS gp3 storage price list")?;
         if next.is_none() {
             return Err(ProviderError::Malformed(
                 "AWS published no gp3 capacity price for the requested region",
@@ -744,6 +748,7 @@ async fn read_on_demand<T: HttpTransport>(
 ) -> Result<Vec<(String, MachinePrices)>, ProviderError> {
     let mut folded: Vec<(String, MachinePrices)> = Vec::new();
     let mut next = None;
+    let mut cursor = PageCursor::new();
 
     loop {
         let page: ProductPage = json_rpc(
@@ -784,7 +789,7 @@ async fn read_on_demand<T: HttpTransport>(
             }
         }
 
-        next = page.next_token.filter(|token| !token.is_empty());
+        next = cursor.advance(page.next_token, "AWS EC2 on-demand price list")?;
         if next.is_none() {
             return Ok(folded);
         }
@@ -804,6 +809,7 @@ async fn apply_spot<T: HttpTransport>(
     prices: &mut [(String, MachinePrices)],
 ) -> Result<(), ProviderError> {
     let mut next = None;
+    let mut cursor = PageCursor::new();
     loop {
         let body = ec2::DescribeSpotPriceHistory {
             product_description: vec![LINUX_PRODUCT.to_owned()],
@@ -820,6 +826,9 @@ async fn apply_spot<T: HttpTransport>(
             now_unix,
         )
         .await?;
+        if !response.is_success() {
+            return Err(ec2::refusal(&response));
+        }
         let page: ec2::DescribeSpotPriceHistoryResponse = ec2::decode(&response)?;
 
         for quote in &page.spot_price_history_set.item {
@@ -841,7 +850,7 @@ async fn apply_spot<T: HttpTransport>(
             entry.1.spot = Some(entry.1.spot.map_or(quoted, |seen| seen.min(quoted)));
         }
 
-        next = page.next_token.filter(|token| !token.is_empty());
+        next = cursor.advance(page.next_token, "AWS EC2 spot price history")?;
         if next.is_none() {
             return Ok(());
         }
@@ -936,5 +945,26 @@ mod tests {
             .find(|product| product.product.attributes.instance_type == "t2.micro")
             .expect("the fixture holds the free-tier meter");
         assert_eq!(on_demand_hourly(&free), None);
+    }
+
+    #[tokio::test]
+    async fn spot_price_http_error_fails_fast_instead_of_returning_empty() {
+        let transport = crate::testing::RecordedTransport::new(vec![
+            crate::http::HttpResponse::new(200, PRODUCTS.as_bytes().to_vec()),
+            crate::http::HttpResponse::new(200, STORAGE_PRODUCTS.as_bytes().to_vec()),
+            crate::http::HttpResponse::new(
+                403,
+                include_bytes!("../../fixtures/aws/error_unauthorized.xml").to_vec(),
+            ),
+        ]);
+        let clock = crate::clock::ManualClock::new();
+        let key = crate::aws::sigv4::AccessKey::new("AKIAIOSFODNN7EXAMPLE", "secret");
+        let mut catalog = super::PriceCatalog::new();
+
+        let error = catalog
+            .region_prices(&transport, &clock, &key, "us-west-2", 1_788_004_800)
+            .await
+            .expect_err("an HTTP 403 on DescribeSpotPriceHistory must not be swallowed");
+        assert_eq!(error.code(), Some("UnauthorizedOperation"));
     }
 }

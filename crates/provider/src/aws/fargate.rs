@@ -86,7 +86,7 @@ use super::{
 use crate::clock::{MonotonicClock, Timer, WallClock};
 use crate::host::{CONFIG_ENV, encoded_config};
 use crate::http::HttpTransport;
-use crate::polling::{MAX_POLL_ATTEMPTS, poll_delay};
+use crate::polling::{MAX_POLL_ATTEMPTS, PageCursor, poll_delay};
 use crate::{CapacityMode, Machine, ProviderError, ProvisionRequest};
 
 // ── The service ──
@@ -192,6 +192,9 @@ pub const DESIRED_RUNNING: &str = "RUNNING";
 
 /// Definition revisions that can still be run.
 pub const ACTIVE: &str = "ACTIVE";
+
+/// Definition revisions that have been deregistered and await deletion.
+pub const INACTIVE: &str = "INACTIVE";
 
 /// Newest revision first.
 pub const NEWEST_FIRST: &str = "DESC";
@@ -1352,17 +1355,20 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
         Ok(page.task_definition_arns.into_iter().next())
     }
 
-    /// Every revision of one family, newest first.
+    /// Every revision of one family in a given status (`ACTIVE` or `INACTIVE`),
+    /// newest first.
     ///
-    /// Paged, because a session that has been resized many times has a
-    /// revision per resize and teardown has to reach all of them.
-    async fn all_definitions(
+    /// Paged under a bounded page cap and cursor progress guard so a stalled
+    /// token cannot loop indefinitely.
+    async fn definitions_with_status(
         &self,
         region: &str,
         family: &str,
+        status: &'static str,
     ) -> Result<Vec<String>, ProviderError> {
         let mut collected = Vec::new();
         let mut next = None;
+        let mut cursor = PageCursor::new();
         loop {
             let page: DefinitionArnPage = self
                 .ecs(
@@ -1370,7 +1376,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
                     "ListTaskDefinitions",
                     &ListTaskDefinitions {
                         family_prefix: family.to_owned(),
-                        status: ACTIVE,
+                        status,
                         sort: NEWEST_FIRST,
                         max_results: 100,
                         next_token: next,
@@ -1378,10 +1384,46 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
                 )
                 .await?;
             collected.extend(page.task_definition_arns);
-            next = page.next_token.filter(|token| !token.is_empty());
+            next = cursor.advance(page.next_token, "ECS task definitions")?;
             if next.is_none() {
                 return Ok(collected);
             }
+        }
+    }
+
+    /// Best-effort deregister and delete of one task definition revision when
+    /// `RunTask` fails after registering a new revision holding live secrets.
+    async fn rollback_definition(&self, region: &str, revision: &str) {
+        if let Err(error) = self
+            .ecs::<_, DefinitionAnswer>(
+                region,
+                "DeregisterTaskDefinition",
+                &OneTaskDefinition::named(revision.to_owned()),
+            )
+            .await
+        {
+            tracing::warn!(
+                %error,
+                %revision,
+                "could not deregister a Fargate task definition after RunTask failed"
+            );
+            return;
+        }
+        if let Err(error) = self
+            .ecs::<_, TaskDefinitionDeletions>(
+                region,
+                "DeleteTaskDefinitions",
+                &DeleteTaskDefinitions {
+                    task_definitions: vec![revision.to_owned()],
+                },
+            )
+            .await
+        {
+            tracing::warn!(
+                %error,
+                %revision,
+                "could not delete a Fargate task definition after RunTask failed"
+            );
         }
     }
 
@@ -1392,6 +1434,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
     /// an empty list.
     async fn live_task(&self, region: &str, family: &str) -> Result<Option<String>, ProviderError> {
         let mut next = None;
+        let mut cursor = PageCursor::new();
         loop {
             let page: TaskArnPage = self
                 .ecs(
@@ -1408,7 +1451,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
             if let Some(task) = page.task_arns.into_iter().next() {
                 return Ok(Some(task));
             }
-            next = page.next_token.filter(|token| !token.is_empty());
+            next = cursor.advance(page.next_token, "ECS live tasks")?;
             if next.is_none() {
                 return Ok(None);
             }
@@ -1654,14 +1697,26 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
             ));
         }
 
-        let definition = match existing {
-            Some(revision) => revision,
-            None => self.register_definition(region, &body).await?,
-        };
+        // Resolve the network before registering a task definition that stores
+        // live `FLYCO_DAEMON_CONFIG` secrets so a missing VPC/subnet never
+        // leaves a registered revision behind.
         let network = self.ensure_network(region).await?;
-        let task = self
-            .run_task(region, definition, &network, request.spec.spot)
-            .await?;
+        let (definition, registered_new) = match existing {
+            Some(revision) => (revision, false),
+            None => (self.register_definition(region, &body).await?, true),
+        };
+        let task = match self
+            .run_task(region, definition.clone(), &network, request.spec.spot)
+            .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                if registered_new {
+                    self.rollback_definition(region, &definition).await;
+                }
+                return Err(error);
+            }
+        };
 
         let machine = Self::container_machine(request.machine, region, &task, requested);
         tracing::info!(
@@ -1848,8 +1903,13 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
         let family = names::machine(machine.id);
         self.stop_task(&region, &machine.native_id).await?;
 
-        let revisions = self.all_definitions(&region, &family).await?;
-        for revision in &revisions {
+        let active = self
+            .definitions_with_status(&region, &family, ACTIVE)
+            .await?;
+        let inactive = self
+            .definitions_with_status(&region, &family, INACTIVE)
+            .await?;
+        for revision in &active {
             let _: DefinitionAnswer = self
                 .ecs(
                     &region,
@@ -1858,7 +1918,13 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
                 )
                 .await?;
         }
-        for batch in revisions.chunks(DELETE_BATCH) {
+        let mut to_delete = active;
+        for revision in inactive {
+            if !to_delete.contains(&revision) {
+                to_delete.push(revision);
+            }
+        }
+        for batch in to_delete.chunks(DELETE_BATCH) {
             let deleted: TaskDefinitionDeletions = self
                 .ecs(
                     &region,
@@ -1883,7 +1949,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
 
         tracing::info!(
             machine = %machine.id,
-            revisions = revisions.len(),
+            revisions = to_delete.len(),
             "destroyed a Fargate task and its definitions"
         );
         Ok(())

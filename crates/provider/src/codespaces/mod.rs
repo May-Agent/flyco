@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{SystemTimer, Timer};
 use crate::http::{HttpRequest, HttpResponse, HttpTransport, Method};
-use crate::polling::{MAX_POLL_ATTEMPTS, POLLS_PER_INVOCATION, poll_delay};
+use crate::polling::{MAX_PAGINATION_PAGES, POLLS_PER_INVOCATION, poll_delay};
 use crate::{
     CapacityMode, CloudProvider, Continuation, LiveTransport, Machine, ProviderError,
     ProvisionRequest, Provisioning,
@@ -154,6 +154,10 @@ const DEVCONTAINER_PATH: &str = ".devcontainer/devcontainer.json";
 pub struct Codespace {
     /// The codespace's generated name — the machine's `native_id`.
     pub name: String,
+    /// Human-readable display name (`flyco-<machine_id>`), used to adopt an
+    /// already-created codespace on queue redelivery.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// The lifecycle state GitHub reports.
     pub state: String,
     /// The machine type it is on.
@@ -162,6 +166,19 @@ pub struct Codespace {
     /// `github.com/codespaces/{name}` — where the account can open it.
     #[serde(default)]
     pub web_url: Option<String>,
+}
+
+/// One page of `GET /repos/{owner}/{repo}/codespaces`.
+#[derive(Debug, Deserialize)]
+struct CodespaceListing {
+    #[serde(default)]
+    codespaces: Vec<Codespace>,
+}
+
+/// The existing blob metadata returned by `GET /repos/{slug}/contents/{path}`.
+#[derive(Debug, Deserialize)]
+struct ContentBlob {
+    sha: String,
 }
 
 /// The machine entry inside a codespace, or one row of the machines
@@ -294,6 +311,9 @@ struct PutContents<'a> {
     message: &'a str,
     /// Base64 file content.
     content: &'a str,
+    /// Existing blob SHA, required by GitHub when updating an existing file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha: Option<&'a str>,
 }
 
 /// Where one provision is, carried across invocations.
@@ -669,6 +689,72 @@ impl<T: HttpTransport, K: Timer> CodespacesProvider<T, K> {
         }
     }
 
+    /// Looks up a non-gone, non-failed codespace on this account's environment
+    /// repository by its deterministic `display_name` (`flyco-<machine_id>`).
+    ///
+    /// Paginated with an explicit page cap so an at-least-once queue redelivery
+    /// adopts an already-created codespace rather than billing a duplicate.
+    async fn find_by_display_name(
+        &self,
+        display_name: &str,
+    ) -> Result<Option<Codespace>, ProviderError> {
+        const PER_PAGE: usize = 100;
+        for page in 1..=MAX_PAGINATION_PAGES {
+            let url = format!(
+                "{API}/repos/{}/codespaces?per_page={PER_PAGE}&page={page}",
+                self.env_repo
+            );
+            let listing: CodespaceListing = self.get(url).await?;
+            let count = listing.codespaces.len();
+            if let Some(found) = listing.codespaces.into_iter().find(|cs| {
+                cs.display_name.as_deref() == Some(display_name)
+                    && !GONE_STATES.contains(&cs.state.as_str())
+                    && cs.state != "Failed"
+            }) {
+                return Ok(Some(found));
+            }
+            if count < PER_PAGE {
+                return Ok(None);
+            }
+        }
+        Err(ProviderError::Rejected(format!(
+            "Codespaces listing exceeded the maximum of {MAX_PAGINATION_PAGES} pages"
+        )))
+    }
+
+    /// Stops a codespace and polls until it settles.
+    ///
+    /// When `require_settled` is true (used by `resize` before calling
+    /// `start`), timing out while still `ShuttingDown` returns an error
+    /// instead of proceeding to start a still-stopping codespace.
+    async fn stop_codespace(&self, name: &str, require_settled: bool) -> Result<(), ProviderError> {
+        let url = format!("{API}/user/codespaces/{name}/stop");
+        let response = self.send(self.request(Method::Post, url)).await?;
+        if response.status == 404 {
+            return Err(ProviderError::Gone(format!(
+                "codespace {name} no longer exists"
+            )));
+        }
+        if !response.is_success() {
+            return Err(refusal(&response));
+        }
+        let Some(codespace) = self.await_codespace(name, POLLS_PER_INVOCATION).await? else {
+            if require_settled {
+                return Err(ProviderError::Rejected(format!(
+                    "codespace {name} was still stopping after {POLLS_PER_INVOCATION} polls"
+                )));
+            }
+            return Ok(());
+        };
+        if machine_state(&codespace.state) != MachineState::Deallocated {
+            return Err(ProviderError::Rejected(format!(
+                "codespace {} stopped as {}, not Shutdown",
+                codespace.name, codespace.state
+            )));
+        }
+        Ok(())
+    }
+
     /// Drives a created codespace to `Available`, yielding a continuation
     /// when the invocation's polls run out.
     ///
@@ -874,6 +960,22 @@ impl<T: HttpTransport, K: Timer> CloudProvider for CodespacesProvider<T, K> {
     ) -> Result<Provisioning, ProviderError> {
         let spec = &request.spec;
         let display_name = format!("flyco-{}", request.machine);
+        if let Some(existing) = self.find_by_display_name(&display_name).await? {
+            tracing::info!(
+                machine = %request.machine,
+                codespace = %existing.name,
+                "a redelivered provision found the codespace already created; adopting it"
+            );
+            return self
+                .poll_build(
+                    request.machine,
+                    &spec.region,
+                    existing,
+                    POLLS_PER_INVOCATION,
+                )
+                .await;
+        }
+
         let body = CreateCodespace {
             repository_id: self.env_repo_id,
             geo: &spec.region,
@@ -916,7 +1018,7 @@ impl<T: HttpTransport, K: Timer> CloudProvider for CodespacesProvider<T, K> {
                 state.codespace
             ))
         })?;
-        self.poll_build(machine.id, &state.region, codespace, MAX_POLL_ATTEMPTS)
+        self.poll_build(machine.id, &state.region, codespace, POLLS_PER_INVOCATION)
             .await
     }
 
@@ -951,7 +1053,7 @@ impl<T: HttpTransport, K: Timer> CloudProvider for CodespacesProvider<T, K> {
         let updated: Codespace = response.json()?;
 
         if machine.state == MachineState::Running {
-            self.deallocate(machine).await?;
+            self.stop_codespace(&machine.native_id, true).await?;
             return self.start(machine).await;
         }
         Ok(Self::machine(machine.id, &machine.region, &updated))
@@ -963,30 +1065,7 @@ impl<T: HttpTransport, K: Timer> CloudProvider for CodespacesProvider<T, K> {
     /// GitHub finishes the stop on its own, and the row's `Deallocated`
     /// records the intent either way.
     async fn deallocate(&mut self, machine: &Machine) -> Result<(), ProviderError> {
-        let url = format!("{API}/user/codespaces/{}/stop", machine.native_id);
-        let response = self.send(self.request(Method::Post, url)).await?;
-        if response.status == 404 {
-            return Err(ProviderError::Gone(format!(
-                "codespace {} no longer exists",
-                machine.native_id
-            )));
-        }
-        if !response.is_success() {
-            return Err(refusal(&response));
-        }
-        let Some(codespace) = self
-            .await_codespace(&machine.native_id, POLLS_PER_INVOCATION)
-            .await?
-        else {
-            return Ok(());
-        };
-        if machine_state(&codespace.state) != MachineState::Deallocated {
-            return Err(ProviderError::Rejected(format!(
-                "codespace {} stopped as {}, not Shutdown",
-                codespace.name, codespace.state
-            )));
-        }
-        Ok(())
+        self.stop_codespace(&machine.native_id, false).await
     }
 
     /// Starts a stopped codespace on the disk it kept.
@@ -1112,18 +1191,27 @@ pub async fn ensure_environment<T: HttpTransport>(
 
     // The devcontainer is always rewritten: it pins the session image and
     // the control-plane URL, and a stale one is a codespace that boots
-    // without its daemon.
+    // without its daemon. GitHub requires the existing blob's `sha` on update
+    // (returning 422 without it), so read it first when present.
+    let contents_url = format!("{API}/repos/{slug}/contents/{DEVCONTAINER_PATH}");
+    let existing = transport
+        .send(request(Method::Get, contents_url.clone()))
+        .await?;
+    let existing_sha = if existing.status == 404 {
+        None
+    } else if existing.is_success() {
+        let blob: ContentBlob = existing.json()?;
+        Some(blob.sha)
+    } else {
+        return Err(refusal(&existing));
+    };
+
     let put = transport
-        .send(
-            request(
-                Method::Put,
-                format!("{API}/repos/{slug}/contents/{DEVCONTAINER_PATH}"),
-            )
-            .json_body(&PutContents {
-                message: "Boot flyco sessions",
-                content: &devcontainer_b64(devcontainer_json),
-            })?,
-        )
+        .send(request(Method::Put, contents_url).json_body(&PutContents {
+            message: "Boot flyco sessions",
+            content: &devcontainer_b64(devcontainer_json),
+            sha: existing_sha.as_deref(),
+        })?)
         .await?;
     if !put.is_success() {
         return Err(refusal(&put));

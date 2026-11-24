@@ -53,12 +53,16 @@
 //!
 //! # Nothing is orphaned
 //!
-//! The root volume is created with `DeleteOnTermination: false`, which is
-//! this driver's `Detach`, and the address is an **elastic IP** rather than
-//! an auto-assigned one — an auto-assigned address is lost on stop, and a
+//! The root volume is created with `DeleteOnTermination: true` so terminating
+//! or rolling back an instance deletes its EBS root volume automatically
+//! (stopping an instance and persistent Spot `stop` interruptions still
+//! preserve it). The address is an **elastic IP** rather than an
+//! auto-assigned one — an auto-assigned address is lost on stop, and a
 //! session that comes back from a spot interruption at a different address
-//! is a session nothing can find. Both therefore outlive the instance, and
-//! [`AwsProvider::destroy`] releases them explicitly, in dependency order.
+//! is a session nothing can find. [`AwsProvider::destroy`] cancels any
+//! persistent spot request, terminates the instance, releases the elastic IP,
+//! and deletes the root volume explicitly if an older instance still has
+//! `DeleteOnTermination: false`.
 //!
 //! `clippy::future_not_send` is allowed across this module for the reason it
 //! is in `azure::pricing`: `Send`-ness follows from the concrete transport —
@@ -88,17 +92,24 @@ use flyco_core::machine::{
     MachinePricing, MachineSpec, MachineState, OsFamily, Runtime, StoragePricing,
 };
 use flyco_core::{CloudSpend, MachineId};
-use serde::Serialize;
-
-use core::future::Future;
+use serde::{Deserialize, Serialize};
 
 use crate::clock::{MonotonicClock, SystemClock, SystemTimer, SystemWallClock, Timer, WallClock};
 use crate::http::{HttpRequest, HttpResponse, HttpTransport, Method};
-use crate::polling::{MAX_POLL_ATTEMPTS, poll_delay};
+use crate::polling::{MAX_POLL_ATTEMPTS, POLLS_PER_INVOCATION, PageCursor, poll_delay};
 use crate::{
     CapacityMode, CloudProvider, Continuation, LiveTransport, Machine, ProviderError,
     ProvisionRequest, Provisioning, cloud_init, flycod,
 };
+
+/// Where an EC2 provision got to when its invocation poll budget ran out.
+#[derive(Debug, Serialize, Deserialize)]
+struct Ec2ProvisionInProgress {
+    instance_id: String,
+    allocation_id: String,
+    public_ip: String,
+    region: String,
+}
 
 use ec2::InstanceState;
 use pricing::{MachinePrices, PriceCatalog};
@@ -505,7 +516,15 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
     }
 
     /// The regions a catalog covers.
-    async fn catalog_regions(&mut self) -> Result<Vec<String>, ProviderError> {
+    ///
+    /// Public so the provisioning queue can fan out AWS catalog refreshes one
+    /// region per message (`CatalogReads::PerRegion`) and stay inside
+    /// Cloudflare Workers' 50-subrequest limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError`] if `DescribeRegions` is refused.
+    pub async fn catalog_regions(&mut self) -> Result<Vec<String>, ProviderError> {
         let access = self.region_access().await?;
         let asked = if self.workspace.regions.is_empty() {
             DEFAULT_CANDIDATE_REGIONS
@@ -522,6 +541,34 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
             .collect())
     }
 
+    /// Reads both the EC2 and Fargate catalogs for a single region.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError`] if any AWS read for `region` is refused.
+    pub async fn region_catalog(
+        &mut self,
+        region: &str,
+    ) -> Result<Vec<MachineCatalogEntry>, ProviderError> {
+        let report = self.region_report(region).await?;
+        tracing::debug!(
+            %region,
+            offered = report.offered.len(),
+            excluded = report.excluded.len(),
+            "read an AWS region's catalog"
+        );
+        let mut entries = report.offered;
+
+        let containers = self.fargate_catalog(region).await?;
+        tracing::debug!(
+            %region,
+            offered = containers.len(),
+            "read an AWS region's Fargate catalog"
+        );
+        entries.extend(containers);
+        Ok(entries)
+    }
+
     /// Every instance type EC2 describes for one region, with its shape.
     async fn list_instance_types(
         &self,
@@ -529,6 +576,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
     ) -> Result<Vec<ec2::InstanceTypeInfo>, ProviderError> {
         let mut collected = Vec::new();
         let mut next = None;
+        let mut cursor = PageCursor::new();
         loop {
             let page: ec2::DescribeInstanceTypesResponse = self
                 .ec2(
@@ -541,7 +589,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
                 )
                 .await?;
             collected.extend(page.instance_type_set.item);
-            next = page.next_token.filter(|token| !token.is_empty());
+            next = cursor.advance(page.next_token, "EC2 DescribeInstanceTypes")?;
             if next.is_none() {
                 return Ok(collected);
             }
@@ -552,6 +600,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
     async fn list_offerings(&self, region: &str) -> Result<Vec<String>, ProviderError> {
         let mut collected = Vec::new();
         let mut next = None;
+        let mut cursor = PageCursor::new();
         loop {
             let page: ec2::DescribeInstanceTypeOfferingsResponse = self
                 .ec2(
@@ -571,7 +620,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
                     .into_iter()
                     .map(|offering| offering.instance_type),
             );
-            next = page.next_token.filter(|token| !token.is_empty());
+            next = cursor.advance(page.next_token, "EC2 DescribeInstanceTypeOfferings")?;
             if next.is_none() {
                 return Ok(collected);
             }
@@ -580,16 +629,18 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
 
     /// One region's quotas, and how much of them the account is spending.
     ///
-    /// Two reads because AWS splits what Azure publishes together: Service
-    /// Quotas states the limit, and the instances already running state what
-    /// is under it.
+    /// When `exclude_instance` is `Some`, that running instance is omitted from
+    /// the spending count (used during in-place resize so the VM does not block
+    /// itself against a tight quota pool).
     async fn read_quotas(
         &self,
         region: &str,
         types: &[ec2::InstanceTypeInfo],
+        exclude_instance: Option<&str>,
     ) -> Result<Quotas, ProviderError> {
         let mut limits = Vec::new();
         let mut next = None;
+        let mut cursor = PageCursor::new();
         loop {
             let page: quotas::QuotaPage = self
                 .json_rpc(
@@ -607,7 +658,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
                 )
                 .await?;
             limits.extend(page.quotas);
-            next = page.next_token.filter(|token| !token.is_empty());
+            next = cursor.advance(page.next_token, "AWS ListServiceQuotas")?;
             if next.is_none() {
                 break;
             }
@@ -616,6 +667,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
         let running = self.list_running(region).await?;
         let spending: Vec<(Market, &ec2::InstanceTypeInfo)> = running
             .iter()
+            .filter(|instance| exclude_instance != Some(instance.instance_id.as_str()))
             .filter_map(|instance| {
                 let info = types
                     .iter()
@@ -638,6 +690,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
     async fn list_running(&self, region: &str) -> Result<Vec<ec2::Instance>, ProviderError> {
         let mut collected = Vec::new();
         let mut next = None;
+        let mut cursor = PageCursor::new();
         loop {
             let page: ec2::DescribeInstancesResponse = self
                 .ec2(
@@ -658,11 +711,44 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
             for reservation in page.reservation_set.item {
                 collected.extend(reservation.instances_set.item);
             }
-            next = page.next_token.filter(|token| !token.is_empty());
+            next = cursor.advance(page.next_token, "EC2 DescribeInstances")?;
             if next.is_none() {
                 return Ok(collected);
             }
         }
+    }
+
+    /// Looks up a non-terminated EC2 instance tagged with `flyco-machine` so
+    /// queue redeliveries adopt an existing instance rather than launching a
+    /// duplicate.
+    async fn instance_by_machine(
+        &self,
+        region: &str,
+        machine: MachineId,
+    ) -> Result<Option<ec2::Instance>, ProviderError> {
+        let page: ec2::DescribeInstancesResponse = self
+            .ec2(
+                region,
+                "DescribeInstances",
+                &ec2::DescribeInstances {
+                    instance_id: Vec::new(),
+                    filter: vec![
+                        ec2::Filter::is(&format!("tag:{MACHINE_TAG}"), machine.to_string()),
+                        ec2::Filter::any_of(
+                            "instance-state-name",
+                            &["pending", "running", "stopping", "stopped"],
+                        ),
+                    ],
+                    next_token: None,
+                },
+            )
+            .await?;
+        Ok(page
+            .reservation_set
+            .item
+            .into_iter()
+            .flat_map(|reservation| reservation.instances_set.item)
+            .next())
     }
 
     /// One instance, as EC2 currently sees it.
@@ -694,6 +780,39 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
             ))
     }
 
+    /// Polls an instance for up to `budget` attempts until it reaches `wanted`,
+    /// failing if it settles in another terminal state or returning `Ok(None)`
+    /// if it is still transitioning when `budget` runs out.
+    async fn follow_state(
+        &self,
+        region: &str,
+        instance: &str,
+        wanted: &InstanceState,
+        budget: usize,
+    ) -> Result<Option<ec2::Instance>, ProviderError> {
+        for attempt in 0..budget {
+            // EC2 states no `Retry-After`, so the shared backoff is what
+            // paces this.
+            self.timer.sleep(poll_delay(None, attempt)).await;
+            let described = self.describe_instance(region, instance).await?;
+            let state = described.state();
+            if state == *wanted {
+                return Ok(Some(described));
+            }
+            if state.is_settled() {
+                return Err(ProviderError::OperationFailed {
+                    status: described.instance_state.name.clone(),
+                    code: String::new(),
+                    message: format!(
+                        "the instance settled as {} rather than reaching the state that was asked for",
+                        described.instance_state.name
+                    ),
+                });
+            }
+        }
+        Ok(None)
+    }
+
     /// Waits until an instance reaches one settled state, and refuses if it
     /// settles anywhere else.
     ///
@@ -708,30 +827,13 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
         instance: &str,
         wanted: &InstanceState,
     ) -> Result<ec2::Instance, ProviderError> {
-        for attempt in 0..MAX_POLL_ATTEMPTS {
-            // EC2 states no `Retry-After`, so the shared backoff is what
-            // paces this.
-            self.timer.sleep(poll_delay(None, attempt)).await;
-            let described = self.describe_instance(region, instance).await?;
-            let state = described.state();
-            if state == *wanted {
-                return Ok(described);
-            }
-            if state.is_settled() {
-                return Err(ProviderError::OperationFailed {
-                    status: described.instance_state.name.clone(),
-                    code: String::new(),
-                    message: format!(
-                        "the instance settled as {} rather than reaching the state that was asked for",
-                        described.instance_state.name
-                    ),
-                });
-            }
-        }
-
-        Err(ProviderError::Rejected(format!(
-            "an EC2 instance had not settled after {MAX_POLL_ATTEMPTS} polls"
-        )))
+        self.follow_state(region, instance, wanted, MAX_POLL_ATTEMPTS)
+            .await?
+            .ok_or_else(|| {
+                ProviderError::Rejected(format!(
+                    "an EC2 instance had not settled after {MAX_POLL_ATTEMPTS} polls"
+                ))
+            })
     }
 
     /// Creates or finds the one-time network a region's machines share.
@@ -917,7 +1019,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
             });
         }
 
-        let quotas = self.read_quotas(region, &types).await?;
+        let quotas = self.read_quotas(region, &types, None).await?;
         quotas.require_capacity_for(&info, region, mode)?;
         Ok((info, quotas))
     }
@@ -1023,9 +1125,10 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
                 ebs: ec2::Ebs {
                     volume_size: request.spec.disk_gib,
                     volume_type: ROOT_VOLUME_TYPE,
-                    // This driver's `Detach`: the disk outlives the machine,
-                    // and `destroy` is what deletes it.
-                    delete_on_termination: false,
+                    // Delete automatically on termination (stopping and spot
+                    // `stop` interruptions still preserve the root volume),
+                    // preventing orphaned EBS volumes on rollback or crash.
+                    delete_on_termination: true,
                 },
             }],
             instance_market_options: request.spec.spot.then_some(ec2::InstanceMarketOptions {
@@ -1039,6 +1142,15 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
                 Self::tags(request, "instance"),
                 Self::tags(request, "volume"),
             ],
+            client_token: Some(format!(
+                "flyco-{}-{}",
+                request.machine,
+                if request.spec.spot {
+                    "spot"
+                } else {
+                    "ondemand"
+                }
+            )),
         })
     }
 
@@ -1160,7 +1272,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
 
         let types = self.list_instance_types(region).await?;
         let offerings = self.list_offerings(region).await?;
-        let quotas = self.read_quotas(region, &types).await?;
+        let quotas = self.read_quotas(region, &types, None).await?;
         let now = self.now();
         let (priced, storage_rate) = self
             .prices
@@ -1423,26 +1535,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> CloudProvider
     async fn catalog(&mut self) -> Result<Vec<MachineCatalogEntry>, ProviderError> {
         let mut entries = Vec::new();
         for region in self.catalog_regions().await? {
-            let report = self.region_report(&region).await?;
-            tracing::debug!(
-                %region,
-                offered = report.offered.len(),
-                excluded = report.excluded.len(),
-                "read an AWS region's catalog"
-            );
-            entries.extend(report.offered);
-
-            // The same account also sells containers, at rates published
-            // under a different offer code — three reads rather than the
-            // instance walk, and a region that publishes none of them offers
-            // no container here rather than an unpriced one.
-            let containers = self.fargate_catalog(&region).await?;
-            tracing::debug!(
-                %region,
-                offered = containers.len(),
-                "read an AWS region's Fargate catalog"
-            );
-            entries.extend(containers);
+            entries.extend(self.region_catalog(&region).await?);
         }
         Ok(entries)
     }
@@ -1455,19 +1548,21 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> CloudProvider
     ) -> Result<Provisioning, ProviderError> {
         match request.spec.runtime {
             Runtime::Vm => self.provision_instance(request).await,
-            Runtime::Container => self.provision_task(request).await,
+            Runtime::Container => self.provision_task(request).await.map(Provisioning::Ready),
         }
-        .map(Provisioning::Ready)
     }
 
-    fn resume(
+    async fn resume(
         &mut self,
-        _machine: &Machine,
-        _continuation: &Continuation,
-    ) -> impl Future<Output = Result<Provisioning, ProviderError>> {
-        core::future::ready(Err(ProviderError::Malformed(
-            "an AWS machine is built in one call and has nothing to resume",
-        )))
+        machine: &Machine,
+        continuation: &Continuation,
+    ) -> Result<Provisioning, ProviderError> {
+        match machine.runtime {
+            Runtime::Vm => self.resume_instance(machine, continuation).await,
+            Runtime::Container => Err(ProviderError::Malformed(
+                "a Fargate task is built in one call and has nothing to resume",
+            )),
+        }
     }
 
     /// Stop, `ModifyInstanceAttribute`, start on a virtual machine; stop and
@@ -1506,16 +1601,98 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> CloudProvider
 }
 
 impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T, C, K, W> {
+    /// Reuses an existing `flyco-machine`-tagged Elastic IP or allocates a new one.
+    async fn ensure_address(
+        &self,
+        region: &str,
+        request: &ProvisionRequest,
+    ) -> Result<(String, String), ProviderError> {
+        if let Some(existing) = self.address_of(region, request.machine).await? {
+            return Ok((existing.allocation_id, existing.public_ip));
+        }
+        let allocated: ec2::AllocateAddressResponse = self
+            .ec2(
+                region,
+                "AllocateAddress",
+                &ec2::AllocateAddress {
+                    domain: "vpc",
+                    tag_specification: vec![Self::tags(request, "elastic-ip")],
+                },
+            )
+            .await?;
+        Ok((allocated.allocation_id, allocated.public_ip))
+    }
+
+    /// Builds the [`Provisioning::Pending`] continuation for an EC2 instance
+    /// still transitioning after one invocation's poll budget.
+    fn pending_ec2(
+        id: MachineId,
+        region: &str,
+        launched: &ec2::Instance,
+        allocation_id: String,
+        public_ip: String,
+    ) -> Result<Provisioning, ProviderError> {
+        let capacity_mode = if launched.is_spot() {
+            CapacityMode::Spot
+        } else {
+            CapacityMode::OnDemand
+        };
+        Ok(Provisioning::Pending {
+            machine: Machine {
+                id,
+                native_id: launched.instance_id.clone(),
+                runtime: Runtime::Vm,
+                region: region.to_owned(),
+                state: MachineState::Provisioning,
+                capacity_mode,
+                address: Some(public_ip.clone()),
+            },
+            continuation: Continuation::write(&Ec2ProvisionInProgress {
+                instance_id: launched.instance_id.clone(),
+                allocation_id,
+                public_ip,
+                region: region.to_owned(),
+            })?,
+        })
+    }
+
+    /// Associates `allocation_id` with `instance`, rolling back the whole
+    /// launch on failure.
+    async fn associate_or_rollback(
+        &self,
+        region: &str,
+        instance: &ec2::Instance,
+        allocation_id: &str,
+    ) -> Result<(), ProviderError> {
+        if let Err(error) = self
+            .ec2_call(
+                region,
+                "AssociateAddress",
+                &ec2::AssociateAddress {
+                    allocation_id: allocation_id.to_owned(),
+                    instance_id: instance.instance_id.clone(),
+                },
+            )
+            .await
+        {
+            self.rollback_instance(region, instance, allocation_id)
+                .await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// The three gates, the workspace network, the address, the machine.
     ///
-    /// The address is allocated before the launch for Azure's reason — a
-    /// machine has to be created *with* the network it will answer on — and
-    /// released again if the launch fails, because an elastic IP nothing is
-    /// using is still billed by the hour.
+    /// Builds the `RunInstances` body before allocating any billable resource,
+    /// checks existing `flyco-machine`-tagged instances/addresses for queue
+    /// redelivery idempotency, rolls back EIP + Spot request + instance on
+    /// partial failure, and yields [`Provisioning::Pending`] if the instance
+    /// stays `pending` past [`POLLS_PER_INVOCATION`] polls.
     async fn provision_instance(
         &mut self,
         request: &ProvisionRequest,
-    ) -> Result<Machine, ProviderError> {
+    ) -> Result<Provisioning, ProviderError> {
         let MachineSpec {
             region,
             machine_type,
@@ -1533,42 +1710,55 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
             .await?;
         let network = self.ensure_network(region).await?;
         let (image_id, root_device) = self.boot_image(region, &info).await?;
-
-        let allocated: ec2::AllocateAddressResponse = self
-            .ec2(
-                region,
-                "AllocateAddress",
-                &ec2::AllocateAddress {
-                    domain: "vpc",
-                    tag_specification: vec![Self::tags(request, "elastic-ip")],
-                },
-            )
-            .await?;
-
         let body = self.run_body(request, &network, image_id, root_device)?;
-        let launched = match self.launch(region, body, &info, &quotas).await {
-            Ok(launched) => launched,
-            Err(error) => {
-                // An address nothing is attached to is still billed, so a
-                // failed launch takes it with it rather than leaving one
-                // behind that only a console visit would ever find.
-                self.release_address(region, &allocated.allocation_id).await;
-                return Err(error);
+
+        let existing_instance = self.instance_by_machine(region, id).await?;
+        let (allocation_id, public_ip) = self.ensure_address(region, request).await?;
+
+        let launched = match existing_instance {
+            Some(existing) => {
+                tracing::info!(
+                    machine = %id,
+                    instance = %existing.instance_id,
+                    "a redelivered provision found an existing EC2 instance; adopting it"
+                );
+                existing
+            }
+            None => match self.launch(region, body, &info, &quotas).await {
+                Ok(launched) => launched,
+                Err(error) => {
+                    self.release_address(region, &allocation_id).await;
+                    return Err(error);
+                }
+            },
+        };
+
+        let instance = if launched.state() == InstanceState::Running {
+            launched
+        } else {
+            match self
+                .follow_state(
+                    region,
+                    &launched.instance_id,
+                    &InstanceState::Running,
+                    POLLS_PER_INVOCATION,
+                )
+                .await
+            {
+                Ok(Some(running)) => running,
+                Ok(None) => {
+                    return Self::pending_ec2(id, region, &launched, allocation_id, public_ip);
+                }
+                Err(error) => {
+                    self.rollback_instance(region, &launched, &allocation_id)
+                        .await;
+                    return Err(error);
+                }
             }
         };
 
-        let instance = self
-            .await_state(region, &launched.instance_id, &InstanceState::Running)
+        self.associate_or_rollback(region, &instance, &allocation_id)
             .await?;
-        self.ec2_call(
-            region,
-            "AssociateAddress",
-            &ec2::AssociateAddress {
-                allocation_id: allocated.allocation_id.clone(),
-                instance_id: launched.instance_id.clone(),
-            },
-        )
-        .await?;
 
         let capacity_mode = if instance.is_spot() {
             CapacityMode::Spot
@@ -1583,39 +1773,186 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
             "provisioned an AWS machine"
         );
 
-        Ok(Machine {
+        Ok(Provisioning::Ready(Machine {
             id,
-            native_id: launched.instance_id,
-            // EC2 sells this driver nothing but virtual machines: flyco's
-            // container runtime on AWS would be Fargate, which is not this
-            // API.
+            native_id: instance.instance_id,
             runtime: Runtime::Vm,
             region: region.clone(),
             state: MachineState::Running,
             capacity_mode,
-            // The elastic IP, which is the whole reason there is one: it
-            // survives a stop, so a machine that comes back from a spot
-            // interruption is still reachable where it was.
-            address: Some(allocated.public_ip),
-        })
+            address: Some(public_ip),
+        }))
+    }
+
+    /// Resumes an EC2 launch that was still `pending` after one invocation's
+    /// poll budget.
+    async fn resume_instance(
+        &self,
+        machine: &Machine,
+        continuation: &Continuation,
+    ) -> Result<Provisioning, ProviderError> {
+        let state: Ec2ProvisionInProgress = continuation.read()?;
+        let instance = match self
+            .follow_state(
+                &state.region,
+                &state.instance_id,
+                &InstanceState::Running,
+                POLLS_PER_INVOCATION,
+            )
+            .await
+        {
+            Ok(Some(running)) => running,
+            Ok(None) => {
+                return Ok(Provisioning::Pending {
+                    machine: machine.clone(),
+                    continuation: Continuation::write(&state)?,
+                });
+            }
+            Err(error) => {
+                if let Ok(described) = self
+                    .describe_instance(&state.region, &state.instance_id)
+                    .await
+                {
+                    self.rollback_instance(&state.region, &described, &state.allocation_id)
+                        .await;
+                } else {
+                    self.release_address(&state.region, &state.allocation_id)
+                        .await;
+                }
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self
+            .ec2_call(
+                &state.region,
+                "AssociateAddress",
+                &ec2::AssociateAddress {
+                    allocation_id: state.allocation_id.clone(),
+                    instance_id: instance.instance_id.clone(),
+                },
+            )
+            .await
+        {
+            self.rollback_instance(&state.region, &instance, &state.allocation_id)
+                .await;
+            return Err(error);
+        }
+
+        let capacity_mode = if instance.is_spot() {
+            CapacityMode::Spot
+        } else {
+            CapacityMode::OnDemand
+        };
+        Ok(Provisioning::Ready(Machine {
+            id: machine.id,
+            native_id: instance.instance_id,
+            runtime: Runtime::Vm,
+            region: state.region,
+            state: MachineState::Running,
+            capacity_mode,
+            address: Some(state.public_ip),
+        }))
+    }
+
+    /// Validates that `machine` can be resized to `new_machine_type` in place
+    /// (not Spot, offered Linux type, matching CPU architecture, and sufficient
+    /// quota headroom after excluding `machine`'s own vCPUs).
+    async fn validate_resize_target(
+        &mut self,
+        machine: &Machine,
+        new_machine_type: &str,
+    ) -> Result<(), ProviderError> {
+        if machine.capacity_mode.is_spot() {
+            return Err(ProviderError::Unsupported {
+                provider: PROVIDER,
+                operation: "resize",
+                reason: "EC2 does not allow changing the instance type of a Spot instance in place",
+            });
+        }
+
+        let region = machine.region.clone();
+        let current = self.describe_instance(&region, &machine.native_id).await?;
+        if current.is_spot() {
+            return Err(ProviderError::Unsupported {
+                provider: PROVIDER,
+                operation: "resize",
+                reason: "EC2 does not allow changing the instance type of a Spot instance in place",
+            });
+        }
+
+        let access = self.region_access().await?;
+        if !access.allows(&region) {
+            return Err(ProviderError::Unavailable {
+                machine_type: new_machine_type.to_owned(),
+                region: region.clone(),
+                reason: access.refusal(&region),
+            });
+        }
+
+        let types = self.list_instance_types(&region).await?;
+        let target = types
+            .iter()
+            .find(|info| info.instance_type == new_machine_type)
+            .cloned()
+            .ok_or_else(|| ProviderError::Unavailable {
+                machine_type: new_machine_type.to_owned(),
+                region: region.clone(),
+                reason: "EC2 describes no such instance type".to_owned(),
+            })?;
+
+        let offerings = self.list_offerings(&region).await?;
+        if !offerings.iter().any(|offered| offered == new_machine_type) {
+            return Err(ProviderError::Unavailable {
+                machine_type: new_machine_type.to_owned(),
+                region: region.clone(),
+                reason: "EC2 does not offer this instance type in this region".to_owned(),
+            });
+        }
+
+        if os_family(&target.processor_info.supported_architectures.item) != OsFamily::Linux {
+            return Err(ProviderError::Unsupported {
+                provider: PROVIDER,
+                operation: "resize",
+                reason: "flyco boots Ubuntu and this instance type runs macOS",
+            });
+        }
+
+        let current_info = types
+            .iter()
+            .find(|info| info.instance_type == current.instance_type);
+        if let (Some(current_arch), Some(target_arch)) = (
+            current_info.and_then(ec2::InstanceTypeInfo::cpu_architecture),
+            target.cpu_architecture(),
+        ) && current_arch != target_arch
+        {
+            return Err(ProviderError::Unsupported {
+                provider: PROVIDER,
+                operation: "resize",
+                reason: "a virtual machine cannot be resized across CPU architectures",
+            });
+        }
+
+        let quotas = self
+            .read_quotas(&region, &types, Some(&machine.native_id))
+            .await?;
+        quotas.require_capacity_for(&target, &region, machine.capacity_mode)
     }
 
     /// Stop, change the type, start.
     ///
-    /// Always through a stop, because the attribute is settable only on a
-    /// stopped instance, and the disk survives because it is a separate
-    /// volume that was never being deleted. The result is read from the
-    /// settled states, never from the instance's own reported type: a
-    /// modification that failed leaves the instance running on the old type
-    /// with nothing to distinguish it.
+    /// Validates three things before calling `StopInstances`: EC2 refuses
+    /// in-place `ModifyInstanceAttribute` on Spot instances, refuses
+    /// cross-architecture resizes, and requires target quota headroom
+    /// (excluding this instance's own vCPUs so tight pools do not self-block).
     async fn resize_instance(
         &mut self,
         machine: &Machine,
         new_machine_type: &str,
     ) -> Result<Machine, ProviderError> {
-        let region = machine.region.clone();
-        self.deployable_type(&region, new_machine_type, machine.capacity_mode)
+        self.validate_resize_target(machine, new_machine_type)
             .await?;
+        let region = machine.region.clone();
 
         self.ec2_call(
             &region,
@@ -1684,28 +2021,43 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
         })
     }
 
-    /// Terminates the machine and removes everything that outlived it.
+    /// Cancels any persistent Spot request, terminates the machine, and
+    /// removes everything that outlived it.
     ///
-    /// In dependency order, and reading what has to be released *before*
-    /// anything is destroyed: the root volume's id is only on the instance,
-    /// and an elastic IP's association is gone the moment the instance is.
-    /// Then the instance, then the address, then the volume — which is only
-    /// deletable once it has actually detached, so that is waited for rather
-    /// than assumed.
+    /// Cancelling the persistent Spot request *before* `TerminateInstances`
+    /// prevents EC2 from reopening the request and launching an untracked
+    /// replacement instance. Volumes created with `delete_on_termination: true`
+    /// are deleted automatically by EC2 on termination; legacy volumes with
+    /// `delete_on_termination: false` are waited on and deleted explicitly.
     async fn destroy_instance(&self, machine: &Machine) -> Result<(), ProviderError> {
         let region = machine.region.clone();
         let described = self.describe_instance(&region, &machine.native_id).await?;
-        let volume = described.root_volume().map(ToOwned::to_owned);
+        let volume = (!described.root_volume_deletes_on_termination())
+            .then(|| described.root_volume().map(ToOwned::to_owned))
+            .flatten();
         let address = self.address_of(&region, machine.id).await?;
 
-        self.ec2_call(
-            &region,
-            "TerminateInstances",
-            &ec2::InstanceAction::on(&machine.native_id),
-        )
-        .await?;
-        self.await_state(&region, &machine.native_id, &InstanceState::Terminated)
+        if let Some(spot_request_id) = described.spot_request_id() {
+            self.ec2_call(
+                &region,
+                "CancelSpotInstanceRequests",
+                &ec2::CancelSpotInstanceRequests {
+                    spot_instance_request_id: vec![spot_request_id.to_owned()],
+                },
+            )
             .await?;
+        }
+
+        if described.state() != InstanceState::Terminated {
+            self.ec2_call(
+                &region,
+                "TerminateInstances",
+                &ec2::InstanceAction::on(&machine.native_id),
+            )
+            .await?;
+            self.await_state(&region, &machine.native_id, &InstanceState::Terminated)
+                .await?;
+        }
 
         if let Some(address) = address {
             self.ec2_call(
@@ -1734,6 +2086,44 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T,
 }
 
 impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> AwsProvider<T, C, K, W> {
+    /// Best-effort rollback of a partially provisioned instance (Spot request,
+    /// EC2 instance, and Elastic IP) when startup or address association fails.
+    async fn rollback_instance(&self, region: &str, instance: &ec2::Instance, allocation: &str) {
+        if let Some(spot_request_id) = instance.spot_request_id()
+            && let Err(error) = self
+                .ec2_call(
+                    region,
+                    "CancelSpotInstanceRequests",
+                    &ec2::CancelSpotInstanceRequests {
+                        spot_instance_request_id: vec![spot_request_id.to_owned()],
+                    },
+                )
+                .await
+        {
+            tracing::warn!(
+                %error,
+                %spot_request_id,
+                "could not cancel the Spot request of a launch that failed"
+            );
+        }
+        if instance.state() != InstanceState::Terminated
+            && let Err(error) = self
+                .ec2_call(
+                    region,
+                    "TerminateInstances",
+                    &ec2::InstanceAction::on(&instance.instance_id),
+                )
+                .await
+        {
+            tracing::warn!(
+                %error,
+                instance = %instance.instance_id,
+                "could not terminate an EC2 instance after a failed provision"
+            );
+        }
+        self.release_address(region, allocation).await;
+    }
+
     /// Releases an address a failed launch would otherwise leave behind.
     ///
     /// A failure here is logged rather than raised: the caller is already

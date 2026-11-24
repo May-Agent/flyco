@@ -276,12 +276,15 @@ fn actions(provider: &Recorded) -> Vec<String> {
         .collect()
 }
 
+const NO_ADDRESSES: &str = r#"<DescribeAddressesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/"><requestId>8f7d3e11-4a2b-4c3d-9e8f-1a2b3c4d5e6f</requestId><addressesSet/></DescribeAddressesResponse>"#;
+
 /// The responses a clean provisioning run consumes, in order.
 ///
 /// Index 0 is the region-access read, 1 the instance types, 2 the offerings,
 /// 3 the quota limits, 4 the running instances that spend them; the
-/// workspace reads follow, then the image, then the address, and the launch
-/// is at [`RUN_INSTANCES`].
+/// workspace reads follow (5..=7), then the image (8..=9), then the
+/// idempotency tag lookups for existing instance/address (10..=11), then the
+/// Elastic IP allocation (12), and the launch is at [`RUN_INSTANCES`].
 fn provision_script(launch: Vec<HttpResponse>) -> Vec<HttpResponse> {
     let mut script = vec![
         xml(REGIONS),
@@ -294,6 +297,8 @@ fn provision_script(launch: Vec<HttpResponse>) -> Vec<HttpResponse> {
         xml(GROUPS),
         json(PARAMETER),
         xml(IMAGES),
+        xml(NO_INSTANCES),
+        xml(NO_ADDRESSES),
         xml(ALLOCATED),
     ];
     script.extend(launch);
@@ -301,7 +306,7 @@ fn provision_script(launch: Vec<HttpResponse>) -> Vec<HttpResponse> {
 }
 
 /// Index of `RunInstances` in a [`provision_script`] run.
-const RUN_INSTANCES: usize = 11;
+const RUN_INSTANCES: usize = 13;
 
 /// The tail of a successful provision: the instance settles, then the
 /// address is attached.
@@ -635,13 +640,18 @@ async fn the_launch_body_is_the_measured_shape() {
         "`terminate` would delete the session's work on the first interruption"
     );
 
-    // The root volume outlives its instance, which is what makes a resize
-    // and a destroy two different things.
+    // The root volume deletes automatically on termination (stopping and Spot
+    // `stop` interruptions still preserve it), preventing orphaned volumes on
+    // rollback or crash.
     assert_eq!(field(&launch, "BlockDeviceMapping.1.Ebs.VolumeSize"), "30");
     assert_eq!(field(&launch, "BlockDeviceMapping.1.Ebs.VolumeType"), "gp3");
     assert_eq!(
         field(&launch, "BlockDeviceMapping.1.Ebs.DeleteOnTermination"),
-        "false"
+        "true"
+    );
+    assert_eq!(
+        field(&launch, "ClientToken"),
+        format!("flyco-{machine}-spot")
     );
 
     // Tags on the instance and on the volume, applied at creation: a
@@ -787,7 +797,7 @@ async fn the_address_is_an_elastic_ip_allocated_before_the_launch_and_attached_a
         .expect("provision");
 
     let transport = aws.transport();
-    let allocate = transport.request(10);
+    let allocate = transport.request(12);
     assert_eq!(action(&allocate), "AllocateAddress");
     assert_eq!(field(&allocate, "Domain"), "vpc");
     // Tagged at allocation, because an association is gone the moment the
@@ -1058,11 +1068,14 @@ async fn an_instance_is_polled_until_it_settles() {
 async fn an_instance_that_settles_somewhere_else_is_a_failure() {
     // A spot launch that is interrupted before it comes up settles as
     // `terminated`, and waiting for `running` forever would be the wrong
-    // answer to a machine that will never arrive.
+    // answer to a machine that will never arrive. Rollback still cleans up
+    // the instance and releases the Elastic IP.
     let mut aws = provider(provision_script(vec![
         xml(RUN),
         xml(PENDING),
         xml(TERMINATED),
+        xml(TERMINATE),
+        xml(RELEASED),
     ]));
 
     let error = aws
@@ -1074,6 +1087,10 @@ async fn an_instance_that_settles_somewhere_else_is_a_failure() {
         error,
         ProviderError::OperationFailed { ref status, .. } if status == "terminated"
     ));
+    assert!(
+        actions(&aws).iter().any(|name| name == "ReleaseAddress"),
+        "rollback releases the Elastic IP when startup settles in a terminal failure"
+    );
 }
 
 // ── Lifecycle ──
@@ -1107,10 +1124,18 @@ async fn starting_starts_the_instance_and_waits_for_it_to_run() {
     assert_eq!(action(&aws.transport().request(0)), "StartInstances");
 }
 
+fn provisioned_on_demand(machine: MachineId) -> Machine {
+    Machine {
+        capacity_mode: CapacityMode::OnDemand,
+        ..provisioned(machine)
+    }
+}
+
 #[tokio::test]
 async fn resizing_stops_modifies_the_type_and_starts_again() {
-    let machine = provisioned(MachineId::generate());
+    let machine = provisioned_on_demand(MachineId::generate());
     let mut aws = provider(vec![
+        xml(ON_DEMAND_RUNNING),
         xml(REGIONS),
         xml(TYPES),
         xml(OFFERINGS),
@@ -1120,16 +1145,16 @@ async fn resizing_stops_modifies_the_type_and_starts_again() {
         xml(STOPPED),
         xml(MODIFIED),
         xml(START),
-        xml(RUNNING),
+        xml(ON_DEMAND_RUNNING),
     ]);
 
-    aws.resize(&machine, X64_TYPE)
+    aws.resize(&machine, ARM64_TYPE)
         .await
         .expect("resize preserves the disk");
 
     let transport = aws.transport();
     assert_eq!(
-        actions(&aws)[5..],
+        actions(&aws)[6..],
         [
             "StopInstances",
             // The attribute is settable only on a stopped instance, so the
@@ -1141,11 +1166,11 @@ async fn resizing_stops_modifies_the_type_and_starts_again() {
         ]
     );
 
-    let modify = transport.request(7);
+    let modify = transport.request(8);
     assert_eq!(field(&modify, "InstanceId"), INSTANCE);
     assert_eq!(
         field(&modify, "InstanceType.Value"),
-        X64_TYPE,
+        ARM64_TYPE,
         "the attribute is nested one level deep, and a flat `InstanceType` is ignored"
     );
 
@@ -1156,8 +1181,13 @@ async fn resizing_stops_modifies_the_type_and_starts_again() {
 
 #[tokio::test]
 async fn a_resize_to_a_type_with_no_quota_never_stops_the_machine() {
-    let machine = provisioned(MachineId::generate());
-    let mut aws = provider(vec![xml(REGIONS), xml(TYPES), xml(OFFERINGS)]);
+    let machine = provisioned_on_demand(MachineId::generate());
+    let mut aws = provider(vec![
+        xml(ON_DEMAND_RUNNING),
+        xml(REGIONS),
+        xml(TYPES),
+        xml(OFFERINGS),
+    ]);
 
     aws.resize(&machine, UNOFFERED_TYPE)
         .await
@@ -1173,8 +1203,9 @@ async fn a_resize_whose_instance_settles_running_again_is_a_failure() {
     // EC2's documented trap: a `ModifyInstanceAttribute` sent to an instance
     // that is not stopped is refused, and an instance that never stopped
     // reports the old type with nothing to distinguish it.
-    let machine = provisioned(MachineId::generate());
+    let machine = provisioned_on_demand(MachineId::generate());
     let mut aws = provider(vec![
+        xml(ON_DEMAND_RUNNING),
         xml(REGIONS),
         xml(TYPES),
         xml(OFFERINGS),
@@ -1182,11 +1213,11 @@ async fn a_resize_whose_instance_settles_running_again_is_a_failure() {
         xml(NO_INSTANCES),
         xml(STOP),
         // It settled `running` rather than `stopped`.
-        xml(RUNNING),
+        xml(ON_DEMAND_RUNNING),
     ]);
 
     let error = aws
-        .resize(&machine, X64_TYPE)
+        .resize(&machine, ARM64_TYPE)
         .await
         .expect_err("an instance that did not stop cannot be modified");
     assert!(matches!(error, ProviderError::OperationFailed { .. }));
@@ -1522,10 +1553,10 @@ fn container_script(run: Vec<HttpResponse>) -> Vec<HttpResponse> {
         json(ECS_NO_CLUSTER),
         json(ECS_CREATED_CLUSTER),
         json(ECS_NO_DEFINITIONS),
-        json(ECS_REGISTERED),
         xml(VPCS),
         xml(SUBNETS),
         xml(GROUPS),
+        json(ECS_REGISTERED),
     ];
     script.extend(run);
     script
@@ -1554,10 +1585,10 @@ async fn provisioning_a_container_creates_the_cluster_then_registers_a_revision(
             "DescribeClusters",
             "CreateCluster",
             "ListTaskDefinitions",
-            "RegisterTaskDefinition",
             "DescribeVpcs",
             "DescribeSubnets",
             "DescribeSecurityGroups",
+            "RegisterTaskDefinition",
             "RunTask",
         ]
     );
@@ -1578,7 +1609,7 @@ async fn provisioning_a_container_creates_the_cluster_then_registers_a_revision(
          spot fallback needs the other one to be there already"
     );
 
-    let registered = aws.transport().request(4);
+    let registered = aws.transport().request(7);
     let definition = body_of(&registered);
     assert_eq!(definition["family"], names::machine(machine));
     assert_eq!(definition["cpu"], "4096", "four vCPUs, in CPU units");
@@ -1742,7 +1773,11 @@ async fn a_capacity_refusal_on_demand_is_the_end_of_the_attempt() {
     let machine = MachineId::generate();
     let mut request = container_request(machine, CONTAINER_TYPE);
     request.spec.spot = false;
-    let mut aws = provider(container_script(vec![json(ECS_NO_SPOT_CAPACITY)]));
+    let mut aws = provider(container_script(vec![
+        json(ECS_NO_SPOT_CAPACITY),
+        json(ECS_DEREGISTERED),
+        json(ECS_DELETED),
+    ]));
 
     let error = aws
         .provision(&request)
@@ -1750,10 +1785,16 @@ async fn a_capacity_refusal_on_demand_is_the_end_of_the_attempt() {
         .and_then(Provisioning::ready)
         .expect_err("there is no third market to try");
     assert!(matches!(error, ProviderError::NoCapacity(_)));
-    assert_eq!(
-        aws.transport().request_count(),
-        RUN_TASK + 1,
-        "an on-demand refusal is not retried"
+    let run_tasks = ecs_actions(&aws)
+        .iter()
+        .filter(|action| *action == "RunTask")
+        .count();
+    assert_eq!(run_tasks, 1, "an on-demand refusal is not retried");
+    assert!(
+        ecs_actions(&aws)
+            .iter()
+            .any(|action| action == "DeleteTaskDefinitions"),
+        "a failed task launch rolls back the freshly registered definition"
     );
 }
 
@@ -2076,6 +2117,7 @@ async fn destroying_a_container_stops_the_task_then_removes_every_revision() {
         json(ECS_STOPPED),
         json(ECS_TASK_STOPPED),
         json(ECS_DEFINITIONS),
+        json(ECS_NO_DEFINITIONS),
         json(ECS_DEREGISTERED),
         json(ECS_DEREGISTERED),
         json(ECS_DELETED),
@@ -2090,6 +2132,7 @@ async fn destroying_a_container_stops_the_task_then_removes_every_revision() {
             "StopTask",
             "DescribeTasks",
             "ListTaskDefinitions",
+            "ListTaskDefinitions",
             // Deregistering alone leaves an INACTIVE revision in the account
             // for ever, and a revision cannot be deleted until it has been
             // deregistered.
@@ -2099,7 +2142,7 @@ async fn destroying_a_container_stops_the_task_then_removes_every_revision() {
         ]
     );
 
-    let deleted = body_of(&aws.transport().request(6));
+    let deleted = body_of(&aws.transport().request(7));
     assert_eq!(
         deleted["taskDefinitions"],
         serde_json::json!([
@@ -2230,6 +2273,205 @@ async fn a_refused_key_is_reported_with_the_code_aws_gave() {
         .await
         .expect_err("a bad key is an error");
     assert_eq!(error.code(), Some("AuthFailure"));
+}
+
+#[tokio::test]
+async fn destroying_a_spot_instance_cancels_the_persistent_spot_request_first() {
+    let spot_with_sir = RUNNING
+        .replace(
+            "<instanceLifecycle>spot</instanceLifecycle>",
+            "<instanceLifecycle>spot</instanceLifecycle><spotInstanceRequestId>sir-0abc1234</spotInstanceRequestId>",
+        )
+        .replace(
+            "<status>attached</status>",
+            "<status>attached</status><deleteOnTermination>true</deleteOnTermination>",
+        );
+    let machine = provisioned(MachineId::generate());
+    let mut aws = provider(vec![
+        xml(&spot_with_sir),
+        xml(ADDRESSES),
+        xml("<CancelSpotInstanceRequestsResponse/>"),
+        xml(TERMINATE),
+        xml(TERMINATED),
+        xml(RELEASED),
+    ]);
+
+    aws.destroy(&machine).await.expect("destroy spot instance");
+
+    assert_eq!(
+        actions(&aws),
+        [
+            "DescribeInstances",
+            "DescribeAddresses",
+            "CancelSpotInstanceRequests",
+            "TerminateInstances",
+            "DescribeInstances",
+            "ReleaseAddress",
+        ]
+    );
+    let cancel = aws.transport().request(2);
+    assert_eq!(field(&cancel, "SpotInstanceRequestId.1"), "sir-0abc1234");
+    assert!(
+        !actions(&aws).iter().any(|name| name == "DeleteVolume"),
+        "a volume with deleteOnTermination=true is removed by EC2 automatically"
+    );
+}
+
+#[tokio::test]
+async fn a_redelivered_provision_adopts_the_existing_instance_and_address() {
+    let mut script = vec![
+        xml(REGIONS),
+        xml(TYPES),
+        xml(OFFERINGS),
+        json(QUOTAS),
+        xml(NO_INSTANCES),
+        xml(VPCS),
+        xml(SUBNETS),
+        xml(GROUPS),
+        json(PARAMETER),
+        xml(IMAGES),
+        // Existing instance and EIP found by flyco-machine tag.
+        xml(RUNNING),
+        xml(ADDRESSES),
+        xml(ASSOCIATED),
+    ];
+    let mut aws = provider(std::mem::take(&mut script));
+    let machine = aws
+        .provision(&request(MachineId::generate(), ARM64_TYPE, true))
+        .await
+        .and_then(Provisioning::ready)
+        .expect("redelivery adopts existing instance");
+
+    assert_eq!(machine.native_id, INSTANCE);
+    assert!(!actions(&aws).iter().any(|name| name == "AllocateAddress"));
+    assert!(!actions(&aws).iter().any(|name| name == "RunInstances"));
+}
+
+#[tokio::test]
+async fn a_vm_provision_yields_a_continuation_and_resumes_to_running() {
+    let mut tail = vec![xml(RUN)];
+    tail.extend((0..crate::polling::POLLS_PER_INVOCATION).map(|_| xml(PENDING)));
+    let mut aws = provider(provision_script(tail));
+
+    let outcome = aws
+        .provision(&request(MachineId::generate(), ARM64_TYPE, true))
+        .await
+        .expect("provision yields pending");
+    let Provisioning::Pending {
+        machine,
+        continuation,
+    } = outcome
+    else {
+        panic!("expected Pending after POLLS_PER_INVOCATION pending polls");
+    };
+    assert_eq!(machine.state, MachineState::Provisioning);
+
+    let mut resumed_aws = provider(vec![xml(RUNNING), xml(ASSOCIATED)]);
+    let ready = resumed_aws
+        .resume(&machine, &continuation)
+        .await
+        .and_then(Provisioning::ready)
+        .expect("resume finishes when instance reaches running");
+    assert_eq!(ready.state, MachineState::Running);
+    assert_eq!(ready.native_id, INSTANCE);
+    assert_eq!(ready.address.as_deref(), Some(PUBLIC_IP));
+}
+
+#[tokio::test]
+async fn resizing_a_spot_instance_is_refused_before_stopping() {
+    let spot = provisioned(MachineId::generate());
+    let mut aws = provider(Vec::new());
+    let error = aws
+        .resize(&spot, ARM64_TYPE)
+        .await
+        .expect_err("spot instances cannot resize in place");
+    assert!(matches!(error, ProviderError::Unsupported { .. }));
+    assert_eq!(aws.transport().request_count(), 0);
+
+    // Even if the caller thought it was OnDemand, EC2 reporting spot blocks it
+    // before StopInstances.
+    let stale_on_demand = provisioned_on_demand(MachineId::generate());
+    let mut aws = provider(vec![xml(RUNNING)]);
+    let error = aws
+        .resize(&stale_on_demand, ARM64_TYPE)
+        .await
+        .expect_err("EC2-confirmed spot instance cannot resize in place");
+    assert!(matches!(error, ProviderError::Unsupported { .. }));
+    assert!(!actions(&aws).iter().any(|name| name == "StopInstances"));
+}
+
+#[tokio::test]
+async fn resizing_across_cpu_architectures_is_refused_before_stopping() {
+    // ON_DEMAND_RUNNING is `t4g.small` (ARM64); resizing to `t3.small` (x86_64)
+    // must be rejected before StopInstances.
+    let machine = provisioned_on_demand(MachineId::generate());
+    let mut aws = provider(vec![
+        xml(ON_DEMAND_RUNNING),
+        xml(REGIONS),
+        xml(TYPES),
+        xml(OFFERINGS),
+    ]);
+
+    let error = aws
+        .resize(&machine, X64_TYPE)
+        .await
+        .expect_err("cross-architecture resize is unsupported");
+    assert!(matches!(error, ProviderError::Unsupported { .. }));
+    assert!(!actions(&aws).iter().any(|name| name == "StopInstances"));
+}
+
+#[tokio::test]
+async fn resizing_excludes_the_running_instances_own_vcpus_from_quota() {
+    // Limit is 4 vCPUs; two 2-vCPU instances are running including `INSTANCE`
+    // itself (4/4 used). Excluding `INSTANCE` leaves 2 used so resizing it to a
+    // 2-vCPU ARM64 type fits instead of self-blocking.
+    let two_running = ON_DEMAND_RUNNING.replace(
+        "</instancesSet>",
+        "<item><instanceId>i-other123</instanceId><instanceType>t3.small</instanceType>\
+         <instanceState><code>16</code><name>running</name></instanceState></item></instancesSet>",
+    );
+    let machine = provisioned_on_demand(MachineId::generate());
+    let mut aws = provider(vec![
+        xml(ON_DEMAND_RUNNING),
+        xml(REGIONS),
+        xml(TYPES),
+        xml(OFFERINGS),
+        json(QUOTAS),
+        xml(&two_running),
+        xml(STOP),
+        xml(STOPPED),
+        xml(MODIFIED),
+        xml(START),
+        xml(ON_DEMAND_RUNNING),
+    ]);
+
+    aws.resize(&machine, ARM64_TYPE)
+        .await
+        .expect("excluding self vCPUs lets in-place resize succeed at 4/4 quota");
+}
+
+#[tokio::test]
+async fn destroying_a_container_deletes_preexisting_inactive_revisions() {
+    let machine = container_machine(MachineId::generate());
+    let mut aws = provider(vec![
+        json(ECS_TASK_STOPPED),
+        json(ECS_NO_DEFINITIONS), // ACTIVE
+        json(ECS_DEFINITIONS),    // INACTIVE
+        json(ECS_DELETED),
+    ]);
+
+    aws.destroy(&machine)
+        .await
+        .expect("destroy inactive revisions");
+    assert_eq!(
+        ecs_actions(&aws),
+        [
+            "DescribeTasks",
+            "ListTaskDefinitions",
+            "ListTaskDefinitions",
+            "DeleteTaskDefinitions",
+        ]
+    );
 }
 
 /// The one test that touches a real account.

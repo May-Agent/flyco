@@ -1,5 +1,7 @@
 set -eu
 podman rm --force --ignore {{ container }}
 {%- if !keep_volume %}
-podman volume rm --force {{ volume }}
+if podman volume exists {{ volume }}; then
+  podman volume rm --force {{ volume }}
+fi
 {%- endif %}

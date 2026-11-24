@@ -608,14 +608,14 @@ const fn provider_name(kind: CloudProviderKind) -> &'static str {
 /// How many calls one account's catalog costs, and where they go.
 ///
 /// The provisioning queue reads a catalog one message at a time, and the two
-/// shapes are genuinely different work rather than a tuning knob. Azure is
-/// a full SKU list, a quota read and a page-walk of retail prices *per
-/// region*, which is why a region is the unit; AWS and GCP answer for every
-/// region they were asked about in one pass, so splitting them would be
-/// three times the work for the same answer.
+/// shapes are genuinely different work rather than a tuning knob. Azure, AWS,
+/// and GCP each run multi-page SKU/instance, quota, and pricing walks *per
+/// region* (or zone), which would exceed Cloudflare Workers' 50-subrequest
+/// limit if all regions ran in one invocation; Codespaces answers for every
+/// geography in a single repository call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CatalogReads {
-    /// One read per region, and these are the regions this account has.
+    /// One read per region (or zone), and these are the regions this account has.
     PerRegion(Vec<String>),
     /// One read for the whole account.
     Whole,
@@ -624,8 +624,8 @@ pub enum CatalogReads {
 /// How this account's catalog has to be read, and where.
 ///
 /// The region list is the provider's own answer — for Azure the
-/// subscription's allowed-regions policy, narrowed by nothing flyco
-/// invented — so it is a call rather than a constant.
+/// subscription's allowed-regions policy, for AWS its enabled candidate
+/// regions, for GCP its candidate zones — narrowed by nothing flyco invented.
 ///
 /// # Errors
 ///
@@ -652,12 +652,30 @@ pub async fn catalog_reads(account: &LinkedAccount) -> Result<CatalogReads, Prov
             .catalog_regions()
             .await?,
         )),
+        ProviderCredentials::Aws {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            key_name,
+        } => Ok(CatalogReads::PerRegion(
+            aws_driver(
+                access_key_id,
+                secret_access_key,
+                session_token.as_deref(),
+                key_name.as_deref(),
+            )
+            .catalog_regions()
+            .await?,
+        )),
+        ProviderCredentials::Gcp {
+            service_account_json,
+        } => Ok(CatalogReads::PerRegion(
+            gcp_driver(service_account_json)?.catalog_regions(),
+        )),
         // One read answers for the whole account: Codespaces' machine list
         // is per environment repository, not per geography, so the four
         // `geo` values share it.
-        ProviderCredentials::Aws { .. }
-        | ProviderCredentials::Gcp { .. }
-        | ProviderCredentials::Codespaces { .. } => Ok(CatalogReads::Whole),
+        ProviderCredentials::Codespaces { .. } => Ok(CatalogReads::Whole),
         ProviderCredentials::Host { .. } => Err(ProviderError::Unsupported {
             provider: flyco_provider::host::PROVIDER,
             operation: "reading a catalog from the provider",
@@ -666,11 +684,11 @@ pub async fn catalog_reads(account: &LinkedAccount) -> Result<CatalogReads, Prov
     }
 }
 
-/// Reads what an account can deploy in exactly one region.
+/// Reads what an account can deploy in exactly one region (or GCP zone).
 ///
-/// The unit the provisioning queue refreshes an Azure catalog in. Only the
-/// providers [`catalog_reads`] answers [`CatalogReads::PerRegion`] for can
-/// be asked this; the rest are read whole, through [`catalog`].
+/// The unit the provisioning queue refreshes an Azure, AWS, or GCP catalog in.
+/// Only the providers [`catalog_reads`] answers [`CatalogReads::PerRegion`]
+/// for can be asked this; the rest are read whole, through [`catalog`].
 ///
 /// # Errors
 ///
@@ -681,31 +699,56 @@ pub async fn region_catalog(
     account: &LinkedAccount,
     region: &str,
 ) -> Result<Vec<MachineCatalogEntry>, ProviderError> {
-    let ProviderCredentials::Azure {
-        tenant_id,
-        client_id,
-        client_secret,
-        subscription_id,
-    } = &account.credentials
-    else {
-        return Err(ProviderError::Unsupported {
-            provider: provider_name(account.kind()),
-            operation: "reading one region of a catalog",
-            reason: "this provider answers for every region it was asked about in one read",
-        });
+    let mut entries = match &account.credentials {
+        ProviderCredentials::Azure {
+            tenant_id,
+            client_id,
+            client_secret,
+            subscription_id,
+        } => {
+            azure_driver(
+                tenant_id,
+                client_id,
+                client_secret,
+                subscription_id,
+                account.azure_workspace()?,
+                &account.machine_login_key,
+            )
+            .region_report(region)
+            .await?
+            .offered
+        }
+        ProviderCredentials::Aws {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            key_name,
+        } => {
+            aws_driver(
+                access_key_id,
+                secret_access_key,
+                session_token.as_deref(),
+                key_name.as_deref(),
+            )
+            .region_catalog(region)
+            .await?
+        }
+        ProviderCredentials::Gcp {
+            service_account_json,
+        } => {
+            gcp_driver(service_account_json)?
+                .region_catalog(region)
+                .await?
+        }
+        ProviderCredentials::Codespaces { .. } | ProviderCredentials::Host { .. } => {
+            return Err(ProviderError::Unsupported {
+                provider: provider_name(account.kind()),
+                operation: "reading one region of a catalog",
+                reason: "this provider answers for every region it was asked about in one read",
+            });
+        }
     };
 
-    let mut entries = azure_driver(
-        tenant_id,
-        client_id,
-        client_secret,
-        subscription_id,
-        account.azure_workspace()?,
-        &account.machine_login_key,
-    )
-    .region_report(region)
-    .await?
-    .offered;
     // Stamped here for the same reason `catalog` stamps it: a driver holds
     // credentials, not the row they came from, and an entry that cannot
     // name its account cannot be provisioned through.
@@ -1146,7 +1189,12 @@ pub async fn deployable(
             });
     }
 
-    let offered = catalog(account).await?;
+    let offered = match account.credentials() {
+        ProviderCredentials::Aws { .. } | ProviderCredentials::Gcp { .. } => {
+            region_catalog(account, &spec.region).await?
+        }
+        _ => catalog(account).await?,
+    };
     offered
         .into_iter()
         .find(|entry| {
@@ -1225,6 +1273,36 @@ impl CloudProvisioner {
     }
 }
 
+/// The AWS driver an account opens, when it is an AWS account.
+fn aws_driver_for(account: &LinkedAccount) -> Option<AwsProvider> {
+    let ProviderCredentials::Aws {
+        access_key_id,
+        secret_access_key,
+        session_token,
+        key_name,
+    } = account.credentials()
+    else {
+        return None;
+    };
+    Some(aws_driver(
+        access_key_id,
+        secret_access_key,
+        session_token.as_deref(),
+        key_name.as_deref(),
+    ))
+}
+
+/// The GCP driver an account opens, when it is a GCP account.
+fn gcp_driver_for(account: &LinkedAccount) -> Result<Option<GcpProvider>, ProviderError> {
+    let ProviderCredentials::Gcp {
+        service_account_json,
+    } = account.credentials()
+    else {
+        return Ok(None);
+    };
+    gcp_driver(service_account_json).map(Some)
+}
+
 impl Provisioner for CloudProvisioner {
     async fn provision(
         &mut self,
@@ -1234,6 +1312,12 @@ impl Provisioner for CloudProvisioner {
         if let Some(mut azure) = azure_driver_for(account)? {
             return azure.provision(request).await;
         }
+        if let Some(mut aws) = aws_driver_for(account) {
+            return aws.provision(request).await;
+        }
+        if let Some(mut gcp) = gcp_driver_for(account)? {
+            return gcp.provision(request).await;
+        }
         if let Some(mut codespaces) = codespaces_driver_for(account) {
             return codespaces.provision(request).await;
         }
@@ -1242,20 +1326,13 @@ impl Provisioner for CloudProvisioner {
             ProviderCredentials::Host { .. } => provision_on_host(&self.hosts, account, request)
                 .await
                 .map(Provisioning::Ready),
-            // Unreachable: `azure_driver` answered for the Azure variant.
-            ProviderCredentials::Azure { .. } | ProviderCredentials::Codespaces { .. } => Err(
-                ProviderError::Malformed("an answered account produced no driver"),
-            ),
-            ProviderCredentials::Aws { .. } => Err(ProviderError::Unsupported {
-                provider: "AWS",
-                operation: "provision",
-                reason: "flyco has no AWS driver yet",
-            }),
-            ProviderCredentials::Gcp { .. } => Err(ProviderError::Unsupported {
-                provider: "GCP",
-                operation: "provision",
-                reason: "flyco has no GCP driver yet",
-            }),
+            // Unreachable: every cloud variant is handled by its driver above.
+            ProviderCredentials::Azure { .. }
+            | ProviderCredentials::Aws { .. }
+            | ProviderCredentials::Gcp { .. }
+            | ProviderCredentials::Codespaces { .. } => Err(ProviderError::Malformed(
+                "an answered account produced no driver",
+            )),
         }
     }
 
@@ -1268,6 +1345,12 @@ impl Provisioner for CloudProvisioner {
         if let Some(mut azure) = azure_driver_for(account)? {
             return azure.resume(machine, continuation).await;
         }
+        if let Some(mut aws) = aws_driver_for(account) {
+            return aws.resume(machine, continuation).await;
+        }
+        if let Some(mut gcp) = gcp_driver_for(account)? {
+            return gcp.resume(machine, continuation).await;
+        }
         if let Some(mut codespaces) = codespaces_driver_for(account) {
             return codespaces.resume(machine, continuation).await;
         }
@@ -1277,19 +1360,12 @@ impl Provisioner for CloudProvisioner {
             ProviderCredentials::Host { .. } => Err(ProviderError::Malformed(
                 "a machine the user owns is provisioned in one call and has nothing to resume",
             )),
-            ProviderCredentials::Azure { .. } | ProviderCredentials::Codespaces { .. } => Err(
-                ProviderError::Malformed("an answered account produced no driver"),
-            ),
-            ProviderCredentials::Aws { .. } => Err(ProviderError::Unsupported {
-                provider: "AWS",
-                operation: "resume a provision",
-                reason: "flyco has no AWS driver yet",
-            }),
-            ProviderCredentials::Gcp { .. } => Err(ProviderError::Unsupported {
-                provider: "GCP",
-                operation: "resume a provision",
-                reason: "flyco has no GCP driver yet",
-            }),
+            ProviderCredentials::Azure { .. }
+            | ProviderCredentials::Aws { .. }
+            | ProviderCredentials::Gcp { .. }
+            | ProviderCredentials::Codespaces { .. } => Err(ProviderError::Malformed(
+                "an answered account produced no driver",
+            )),
         }
     }
 
@@ -1352,4 +1428,171 @@ async fn provision_on_host(
         capacity_mode: flyco_provider::CapacityMode::OnDemand,
         address: Some(planner.machine_type().to_owned()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use flyco_core::machine::{CloudProviderKind, MachineSpec, MachineState, Runtime};
+    use flyco_core::{
+        MachineId, PermissionMode, ProviderAccountId, ProviderCredentials, SessionId,
+    };
+    use flyco_provider::{
+        CapacityMode, ClaudeCredential, Continuation, DaemonBootstrap, HarnessCredential, LoginKey,
+        Machine, ProviderError, ProvisionRequest, testing,
+    };
+
+    use super::{CatalogReads, CloudProvisioner, LinkedAccount, Provisioner, catalog_reads};
+    use crate::rooms::{HostRooms, NativeHostRooms};
+
+    fn account_with(credentials: ProviderCredentials) -> LinkedAccount {
+        LinkedAccount {
+            id: ProviderAccountId::generate(),
+            credentials,
+            resource_group: None,
+            machine_login_key: LoginKey::generate(),
+            host: None,
+        }
+    }
+
+    fn dummy_request(provider: CloudProviderKind, runtime: Runtime) -> ProvisionRequest {
+        ProvisionRequest {
+            machine: MachineId::generate(),
+            spec: MachineSpec {
+                provider,
+                machine_type: "fargate-999x999".to_owned(),
+                runtime,
+                region: "us-west-2".to_owned(),
+                spot: true,
+                disk_gib: 30,
+            },
+            bootstrap: DaemonBootstrap {
+                session: SessionId::generate(),
+                provider,
+                runtime,
+                control_plane_url: "https://flyco.dev/".to_owned(),
+                daemon_token: "fd_test-token".to_owned(),
+                permission_mode: PermissionMode::Default,
+                auth: HarnessCredential::ClaudeCode(ClaudeCredential::Inherit),
+                repos: Vec::new(),
+                github: testing::github(),
+                machine_origin: flyco_core::MachineOrigin::Auto,
+                machine: testing::session_machine(),
+                resume_session_id: None,
+                model: testing::session_model(),
+                mcp_servers: Vec::new(),
+                computer_use: false,
+            },
+        }
+    }
+
+    fn dummy_machine(runtime: Runtime, region: &str) -> Machine {
+        Machine {
+            id: MachineId::generate(),
+            native_id: "i-test".to_owned(),
+            runtime,
+            region: region.to_owned(),
+            state: MachineState::Provisioning,
+            capacity_mode: CapacityMode::OnDemand,
+            address: None,
+        }
+    }
+
+    #[skyzen::test]
+    async fn cloud_provisioner_wires_aws_provision_and_resume() {
+        let account = account_with(ProviderCredentials::Aws {
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_owned(),
+            secret_access_key: "secret".to_owned(),
+            session_token: None,
+            key_name: None,
+        });
+        let mut provisioner = CloudProvisioner::new(HostRooms::from_native(NativeHostRooms::new()));
+
+        // An unknown Fargate size is rejected locally by AwsProvider before any
+        // network call — proving CloudProvisioner dispatched to AWS rather than
+        // returning Unsupported.
+        let err = provisioner
+            .provision(
+                &account,
+                &dummy_request(CloudProviderKind::Aws, Runtime::Container),
+            )
+            .await
+            .expect_err("unknown fargate size rejected by AWS driver");
+        assert!(
+            matches!(err, ProviderError::Unavailable { .. }),
+            "expected AWS Unavailable, got {err:?}"
+        );
+
+        // Resuming an AWS VM with an invalid continuation reaches AwsProvider::resume
+        // and returns Malformed rather than Unsupported.
+        let bad_continuation = Continuation::write(&"not-ec2-state").expect("encode");
+        let err = provisioner
+            .resume(
+                &account,
+                &dummy_machine(Runtime::Vm, "us-west-2"),
+                &bad_continuation,
+            )
+            .await
+            .expect_err("bad continuation rejected by AWS driver");
+        assert!(
+            matches!(err, ProviderError::Malformed(_)),
+            "expected AWS Malformed, got {err:?}"
+        );
+    }
+
+    #[skyzen::test]
+    async fn cloud_provisioner_wires_gcp_provision_and_resume() {
+        let account = account_with(ProviderCredentials::Gcp {
+            service_account_json: "not-valid-json".to_owned(),
+        });
+        let mut provisioner = CloudProvisioner::new(HostRooms::from_native(NativeHostRooms::new()));
+
+        // Invalid service-account JSON fails inside gcp_driver_for (Malformed),
+        // proving CloudProvisioner dispatches GCP instead of returning Unsupported.
+        let err = provisioner
+            .provision(
+                &account,
+                &dummy_request(CloudProviderKind::Gcp, Runtime::Vm),
+            )
+            .await
+            .expect_err("malformed key fails inside gcp_driver_for");
+        assert!(
+            matches!(err, ProviderError::Malformed(_)),
+            "expected GCP Malformed, got {err:?}"
+        );
+
+        let bad_continuation = Continuation::write(&"not-gcp-state").expect("encode");
+        let err = provisioner
+            .resume(
+                &account,
+                &dummy_machine(Runtime::Vm, "us-central1-a"),
+                &bad_continuation,
+            )
+            .await
+            .expect_err("malformed key fails inside gcp_driver_for on resume");
+        assert!(
+            matches!(err, ProviderError::Malformed(_)),
+            "expected GCP Malformed on resume, got {err:?}"
+        );
+    }
+
+    #[skyzen::test]
+    async fn catalog_reads_splits_gcp_per_region_without_network() {
+        let account = account_with(ProviderCredentials::Gcp {
+            service_account_json: serde_json::json!({
+                "type": "service_account",
+                "project_id": "proj",
+                "private_key_id": "kid",
+                "private_key": "-----BEGIN PRIVATE KEY-----\nMII=\n-----END PRIVATE KEY-----\n",
+                "client_email": "svc@proj.iam.gserviceaccount.com",
+                "token_uri": "https://oauth2.googleapis.com/token"
+            })
+            .to_string(),
+        });
+
+        let reads = catalog_reads(&account).await.expect("gcp catalog_reads");
+        let CatalogReads::PerRegion(regions) = reads else {
+            panic!("expected CatalogReads::PerRegion for GCP");
+        };
+        assert_ne!(regions, [] as [std::string::String; 0]);
+    }
 }
