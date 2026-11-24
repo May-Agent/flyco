@@ -78,9 +78,14 @@ mod tests {
 
     #[skyzen::test]
     async fn a_non_numeric_cursor_is_refused() {
-        let error = page(&test_rooms(), SessionId::generate(), Some("not-a-seq"), None)
-            .await
-            .expect_err("non-numeric cursor");
+        let error = page(
+            &test_rooms(),
+            SessionId::generate(),
+            Some("not-a-seq"),
+            None,
+        )
+        .await
+        .expect_err("non-numeric cursor");
         assert!(matches!(error, ApiError::InvalidCursor(_)));
     }
 }

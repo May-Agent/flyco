@@ -393,12 +393,11 @@ pub async fn refresh(db: &Db, rooms: &HostRooms, row: HostRow) -> Result<HostVie
     let stamp_due = row
         .last_seen_unix
         .is_none_or(|stamped| now.saturating_sub(stamped) >= LAST_SEEN_EVERY_SECONDS);
-    let last_seen =
-        if status.connected && (state != row.state || facts != row.facts || stamp_due) {
-            Some(now)
-        } else {
-            row.last_seen_unix
-        };
+    let last_seen = if status.connected && (state != row.state || facts != row.facts || stamp_due) {
+        Some(now)
+    } else {
+        row.last_seen_unix
+    };
 
     if state == row.state && facts == row.facts && last_seen == row.last_seen_unix {
         return Ok(row.into());

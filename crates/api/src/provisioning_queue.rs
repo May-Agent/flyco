@@ -610,6 +610,40 @@ pub async fn consume(
     QueueBatchDisposition::PerMessage(decisions)
 }
 
+/// Handles non-machine catalog/marketplace refresh jobs, returning `None` for
+/// session-scoped jobs that must go through machine claiming and retry logic.
+async fn perform_catalog_job(
+    db: &Db,
+    config: &ApiConfig,
+    kv: &Kv,
+    queue: &Queue,
+    github: &impl GithubOauth,
+    job: &ProvisioningJob,
+) -> Option<Settled> {
+    match job {
+        ProvisioningJob::RefreshCatalog { user, account } => Some(settle(
+            refresh_catalog(db, config, kv, queue, github, *user, *account).await,
+        )),
+        ProvisioningJob::RefreshCatalogRegion {
+            user,
+            account,
+            region,
+        } => Some(settle(
+            refresh_region(db, config, kv, github, *user, *account, region).await,
+        )),
+        ProvisioningJob::RefreshMarketplace {
+            user,
+            repo,
+            git_ref,
+        } => Some(settle(
+            refresh_marketplace(db, config, kv, github, *user, repo, git_ref.clone()).await,
+        )),
+        ProvisioningJob::Provision { .. }
+        | ProvisioningJob::Continue { .. }
+        | ProvisioningJob::Recover { .. } => None,
+    }
+}
+
 /// Performs exactly one job.
 async fn perform(
     db: &Db,
@@ -622,34 +656,8 @@ async fn perform(
 ) -> Settled {
     // A catalog refresh is decided entirely by itself: it never claims a
     // machine row, never counts attempts, and never fails a session.
-    match &job {
-        ProvisioningJob::RefreshCatalog { user, account } => {
-            return settle(
-                refresh_catalog(db, config, kv, queue, clients.github, *user, *account).await,
-            );
-        }
-        ProvisioningJob::RefreshCatalogRegion {
-            user,
-            account,
-            region,
-        } => {
-            return settle(
-                refresh_region(db, config, kv, clients.github, *user, *account, region).await,
-            );
-        }
-        ProvisioningJob::RefreshMarketplace {
-            user,
-            repo,
-            git_ref,
-        } => {
-            return settle(
-                refresh_marketplace(db, config, kv, clients.github, *user, repo, git_ref.clone())
-                    .await,
-            );
-        }
-        ProvisioningJob::Provision { .. }
-        | ProvisioningJob::Continue { .. }
-        | ProvisioningJob::Recover { .. } => {}
+    if let Some(settled) = perform_catalog_job(db, config, kv, queue, clients.github, &job).await {
+        return settled;
     }
 
     let outcome = match job {
@@ -1254,17 +1262,7 @@ async fn build(
         )
         .await
         .map_err(|error| classify(&error))?;
-    settle_build(
-        db,
-        rooms,
-        queue,
-        claim,
-        &entry,
-        started_at_unix,
-        0,
-        outcome,
-    )
-    .await
+    settle_build(db, rooms, queue, claim, &entry, started_at_unix, 0, outcome).await
 }
 
 /// Carries on a build the provider handed back (issue #257).
@@ -1337,7 +1335,7 @@ async fn carry_on(
     .await
 }
 
-fn continuation_timed_out(started_at_unix: u64, leg: u32, now: u64) -> bool {
+const fn continuation_timed_out(started_at_unix: u64, leg: u32, now: u64) -> bool {
     leg > MAX_CONTINUE_LEGS
         || (started_at_unix > 0
             && now.saturating_sub(started_at_unix) >= flyco_core::PROVISION_DEADLINE_SECS)

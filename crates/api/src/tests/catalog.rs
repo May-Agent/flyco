@@ -542,7 +542,10 @@ async fn the_scheduled_sweep_paginates_large_account_sets_across_ticks(kv: Kv, d
     catalog::refresh_stale(&db, &kv, &queue, t0)
         .await
         .expect("first page");
-    assert_eq!(queued(&backend).len(), catalog::MAX_ACCOUNTS_PER_SWEEP as usize);
+    assert_eq!(
+        queued(&backend).len(),
+        catalog::MAX_ACCOUNTS_PER_SWEEP as usize
+    );
 
     // Next minute finishes the in-progress pass (remaining 2 accounts).
     catalog::refresh_stale(&db, &kv, &queue, t0 + 60)

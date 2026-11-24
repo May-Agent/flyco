@@ -519,9 +519,8 @@ async fn accept_batch(
     // whole SQLite statement so `host_commands` and `host_frames.through`
     // never drift apart.
     for (chunk_idx, chunk) in fresh.chunks(MAX_FRAME_ROWS_PER_STATEMENT).enumerate() {
-        let base_seq = first_fresh_seq.saturating_add(
-            u64::try_from(chunk_idx * MAX_FRAME_ROWS_PER_STATEMENT).unwrap_or(0),
-        );
+        let base_seq = first_fresh_seq
+            .saturating_add(u64::try_from(chunk_idx * MAX_FRAME_ROWS_PER_STATEMENT).unwrap_or(0));
         let placeholders = vec!["(?, ?, ?, ?)"; chunk.len()].join(", ");
         let statement = format!(
             "INSERT OR IGNORE INTO host_frame_log (epoch, frame_seq, machine, command_seq) \
@@ -551,10 +550,7 @@ async fn accept_batch(
                 }
             }
         }
-        query
-            .execute()
-            .await
-            .map_err(|error| room_failed(&error))?;
+        query.execute().await.map_err(|error| room_failed(&error))?;
     }
 
     // Ephemeral rows — a `Revoked` — are retired by acknowledgement. Job

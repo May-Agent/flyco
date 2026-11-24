@@ -2049,10 +2049,13 @@ async fn accept_batch_commits_events_turns_and_through_atomically_and_deduplicat
 
     // 3. Verify `daemon_frames.through` matches the applied frame count.
     let db = DurableDb::new(room.db.clone());
-    let through: u64 = skyzen::sql!(db, "SELECT through FROM daemon_frames WHERE epoch = {epoch}")
-        .fetch_scalar()
-        .await
-        .expect("through");
+    let through: u64 = skyzen::sql!(
+        db,
+        "SELECT through FROM daemon_frames WHERE epoch = {epoch}"
+    )
+    .fetch_scalar()
+    .await
+    .expect("through");
     assert_eq!(through, 4);
 
     // 4. Verify `turns` was projected atomically from the batch.

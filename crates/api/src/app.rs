@@ -2851,9 +2851,7 @@ pub async fn fail_stalled_provisions(
             break;
         }
         handled += 1;
-        if let Err(error) =
-            fail_one_stalled(db, config, github, rooms, hosts, &stalled).await
-        {
+        if let Err(error) = fail_one_stalled(db, config, github, rooms, hosts, &stalled).await {
             tracing::warn!(
                 session = %stalled.id,
                 %error,

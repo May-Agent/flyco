@@ -965,12 +965,7 @@ async fn listing_multiple_hosts_refreshes_concurrently_and_preserves_order(
         ids.push(enrolled.host_id);
     }
 
-    let list: Vec<HostView> = client
-        .get("/v1/hosts")
-        .bearer(&token)
-        .send()
-        .await
-        .json();
+    let list: Vec<HostView> = client.get("/v1/hosts").bearer(&token).send().await.json();
     assert_eq!(list.len(), 3);
     assert!(list.iter().all(|h| h.state == HostState::Online));
     for id in ids {

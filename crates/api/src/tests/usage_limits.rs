@@ -711,10 +711,7 @@ async fn the_daemon_route_takes_a_limit_and_refuses_one_with_no_reset(
 }
 
 #[skyzen::test]
-async fn raising_budget_does_not_unpause_a_usage_limit_paused_session(
-    _ctx: TestContext,
-    db: Db,
-) {
+async fn raising_budget_does_not_unpause_a_usage_limit_paused_session(_ctx: TestContext, db: Db) {
     let waiting = live(&db).await;
     usage_limits::pause(
         &db,
@@ -804,20 +801,16 @@ async fn archiving_and_failing_clear_pause_metadata_and_exclude_terminal_session
     // also clears paused_reason and usage_limit_* metadata.
     let second = seed_session(&db, &crate::testing::seed_other_user(&db).await).await;
     let active = SessionState::Active;
-    sql!(db, "UPDATE sessions SET state = {active} WHERE id = {second}")
-        .execute()
-        .await
-        .expect("activate");
-    usage_limits::pause(
-        &db,
-        &test_config(),
-        &waiting.rooms,
-        second,
-        &weekly(),
-        NOW,
+    sql!(
+        db,
+        "UPDATE sessions SET state = {active} WHERE id = {second}"
     )
+    .execute()
     .await
-    .expect("pause second session");
+    .expect("activate");
+    usage_limits::pause(&db, &test_config(), &waiting.rooms, second, &weekly(), NOW)
+        .await
+        .expect("pause second session");
     sessions::recovering(&db, second)
         .await
         .expect("wake second session into provisioning");

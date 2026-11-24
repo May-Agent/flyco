@@ -952,11 +952,13 @@ async fn a_stuck_continuation_keeps_the_stall_clock_and_fails_at_deadline_and_le
     run_queue_watching(&db, &kv, &queue, &test_rooms(), &mut host, batch(first_leg)).await;
     assert_eq!(host.resumes, 1);
 
-    let after_carry_on: u64 =
-        sql!(db, "SELECT last_active_unix FROM sessions WHERE id = {session}")
-            .fetch_scalar()
-            .await
-            .expect("read last_active_unix");
+    let after_carry_on: u64 = sql!(
+        db,
+        "SELECT last_active_unix FROM sessions WHERE id = {session}"
+    )
+    .fetch_scalar()
+    .await
+    .expect("read last_active_unix");
     assert_eq!(
         after_carry_on, old_active,
         "carry_on must not refresh last_active_unix and defeat the stall sweep"

@@ -987,35 +987,50 @@ enum FrameSideEffect<'a> {
 }
 
 /// Pre-validated, pre-serialized form of one daemon frame ready to commit.
+#[derive(Default)]
+struct TurnOp {
+    op: Option<&'static str>,
+    turn_id: Option<String>,
+    payload: Option<String>,
+}
+
 struct PreparedFrame<'a> {
     frame_seq: u64,
     event_json: Option<String>,
-    turn_op: Option<&'static str>,
-    turn_id: Option<String>,
-    turn_payload: Option<String>,
+    turn: TurnOp,
     side_effect: FrameSideEffect<'a>,
     emitted: Option<ClientEvent>,
 }
 
 /// Extracts the turn projection operation for a `ClientEvent`, if any.
-fn turn_op_of(
-    event: &ClientEvent,
-) -> Result<(Option<&'static str>, Option<String>, Option<String>), ApiError> {
+fn turn_op_of(event: &ClientEvent) -> Result<TurnOp, ApiError> {
     match event {
         ClientEvent::Harness {
             event: HarnessEvent::TurnStarted { turn_id },
-        } => Ok((Some("start"), Some(turn_id.clone()), None)),
+        } => Ok(TurnOp {
+            op: Some("start"),
+            turn_id: Some(turn_id.clone()),
+            payload: None,
+        }),
         ClientEvent::Harness {
             event: HarnessEvent::TurnCompleted { turn_id, usage },
         } => {
             let usage_json = serde_json::to_string(usage)
                 .map_err(|error| ApiError::Room(format!("usage did not serialize: {error}")))?;
-            Ok((Some("complete"), Some(turn_id.clone()), Some(usage_json)))
+            Ok(TurnOp {
+                op: Some("complete"),
+                turn_id: Some(turn_id.clone()),
+                payload: Some(usage_json),
+            })
         }
         ClientEvent::Harness {
             event: HarnessEvent::TurnFailed { turn_id, .. },
-        } => Ok((Some("fail"), Some(turn_id.clone()), None)),
-        _ => Ok((None, None, None)),
+        } => Ok(TurnOp {
+            op: Some("fail"),
+            turn_id: Some(turn_id.clone()),
+            payload: None,
+        }),
+        _ => Ok(TurnOp::default()),
     }
 }
 
@@ -1028,9 +1043,7 @@ fn prepare_daemon_frame(
         return Ok(PreparedFrame {
             frame_seq,
             event_json: None,
-            turn_op: None,
-            turn_id: None,
-            turn_payload: None,
+            turn: TurnOp::default(),
             side_effect: FrameSideEffect::WorkdirReply { id: *id, reply },
             emitted: None,
         });
@@ -1039,9 +1052,7 @@ fn prepare_daemon_frame(
         return Ok(PreparedFrame {
             frame_seq,
             event_json: None,
-            turn_op: None,
-            turn_id: None,
-            turn_payload: None,
+            turn: TurnOp::default(),
             side_effect: FrameSideEffect::DesktopChunk {
                 keyframe: *keyframe,
                 data,
@@ -1084,24 +1095,116 @@ fn prepare_daemon_frame(
         _ => (false, FrameSideEffect::None),
     };
 
-    let (event_json, turn_op, turn_id, turn_payload) = if recorded {
+    let (event_json, turn) = if recorded {
         let json = serde_json::to_string(&event)
             .map_err(|error| ApiError::Room(format!("an event did not serialize: {error}")))?;
-        let (turn_op, turn_id, turn_payload) = turn_op_of(&event)?;
-        (Some(json), turn_op, turn_id, turn_payload)
+        (Some(json), turn_op_of(&event)?)
     } else {
-        (None, None, None, None)
+        (None, TurnOp::default())
     };
 
     Ok(PreparedFrame {
         frame_seq,
         event_json,
-        turn_op,
-        turn_id,
-        turn_payload,
+        turn,
         side_effect,
         emitted: Some(event),
     })
+}
+
+/// Applies non-event side effects (KV latest values, workdir replies, desktop
+/// chunks) for a chunk of daemon frames before committing its receipt rows.
+async fn apply_frame_side_effects(
+    db: &DurableDb,
+    kv: &DurableKv,
+    cache: &Cache,
+    signals: &RoomSignals,
+    chunk: &[PreparedFrame<'_>],
+) -> Result<(), ApiError> {
+    for item in chunk {
+        match &item.side_effect {
+            FrameSideEffect::None => {}
+            FrameSideEffect::WorkdirReply { id, reply } => {
+                store_workdir_reply(db, cache, *id, reply, &signals.workdir)
+                    .await
+                    .map_err(|error| room_failed(&error))?;
+            }
+            FrameSideEffect::DesktopChunk { keyframe, data } => {
+                store_desktop_chunk(db, *keyframe, data, &signals.chunks)
+                    .await
+                    .map_err(|error| room_failed(&error))?;
+            }
+            FrameSideEffect::Started(harness_session_id) => {
+                put_latest(kv, KEY_HARNESS_SESSION, harness_session_id)
+                    .await
+                    .map_err(|error| room_failed(&error))?;
+            }
+            FrameSideEffect::Capabilities(capabilities) => {
+                put_latest(kv, KEY_CAPABILITIES, capabilities)
+                    .await
+                    .map_err(|error| room_failed(&error))?;
+            }
+            FrameSideEffect::RepoDirty { dir, summary } => {
+                note_checkout(kv, *dir, summary)
+                    .await
+                    .map_err(|error| room_failed(&error))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Atomically records one chunk of daemon frames via `daemon_frame_events` and
+/// appends their emitted events (with assigned sequence numbers) to `emitted`.
+async fn commit_frame_chunk(
+    db: &DurableDb,
+    epoch: u64,
+    at_unix: u64,
+    chunk: &mut [PreparedFrame<'_>],
+    emitted: &mut Vec<EmittedEvent>,
+) -> Result<(), ApiError> {
+    let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+    let statement = format!(
+        "INSERT OR IGNORE INTO daemon_frame_events \
+         (epoch, frame_seq, json, at_unix, turn_op, turn_id, turn_payload) \
+         VALUES {placeholders}"
+    );
+    let mut query = db.query(&statement);
+    for item in chunk.iter() {
+        query = query
+            .bind(epoch)
+            .bind(item.frame_seq)
+            .bind(item.event_json.clone())
+            .bind(at_unix)
+            .bind(item.turn.op.map(str::to_owned))
+            .bind(item.turn.turn_id.clone())
+            .bind(item.turn.payload.clone());
+    }
+    query.execute().await.map_err(|error| room_failed(&error))?;
+
+    let first_seq = chunk[0].frame_seq;
+    let last_seq = chunk[chunk.len() - 1].frame_seq;
+    let seqs: Vec<FrameSeqRow> = sql!(
+        db,
+        "SELECT frame_seq, event_seq FROM daemon_frame_events \
+         WHERE epoch = {epoch} AND frame_seq >= {first_seq} AND frame_seq <= {last_seq} \
+         ORDER BY frame_seq"
+    )
+    .fetch_all()
+    .await
+    .map_err(|error| room_failed(&error))?;
+
+    for item in chunk.iter_mut() {
+        let Some(event) = item.emitted.take() else {
+            continue;
+        };
+        let seq = seqs
+            .iter()
+            .find(|row| row.frame_seq == item.frame_seq)
+            .and_then(|row| row.event_seq);
+        emitted.push(EmittedEvent { seq, event });
+    }
+    Ok(())
 }
 
 async fn accept_batch(
@@ -1174,81 +1277,8 @@ async fn accept_batch(
     // `daemon_frames.through` inside one SQLite statement so a mid-batch
     // storage failure can never duplicate events on retry.
     for chunk in prepared.chunks_mut(MAX_FRAME_ROWS_PER_STATEMENT) {
-        for item in chunk.iter() {
-            match &item.side_effect {
-                FrameSideEffect::None => {}
-                FrameSideEffect::WorkdirReply { id, reply } => {
-                    store_workdir_reply(db, cache, *id, reply, &signals.workdir)
-                        .await
-                        .map_err(|error| room_failed(&error))?;
-                }
-                FrameSideEffect::DesktopChunk { keyframe, data } => {
-                    store_desktop_chunk(db, *keyframe, data, &signals.chunks)
-                        .await
-                        .map_err(|error| room_failed(&error))?;
-                }
-                FrameSideEffect::Started(harness_session_id) => {
-                    put_latest(kv, KEY_HARNESS_SESSION, harness_session_id)
-                        .await
-                        .map_err(|error| room_failed(&error))?;
-                }
-                FrameSideEffect::Capabilities(capabilities) => {
-                    put_latest(kv, KEY_CAPABILITIES, capabilities)
-                        .await
-                        .map_err(|error| room_failed(&error))?;
-                }
-                FrameSideEffect::RepoDirty { dir, summary } => {
-                    note_checkout(kv, *dir, summary)
-                        .await
-                        .map_err(|error| room_failed(&error))?;
-                }
-            }
-        }
-
-        let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
-        let statement = format!(
-            "INSERT OR IGNORE INTO daemon_frame_events \
-             (epoch, frame_seq, json, at_unix, turn_op, turn_id, turn_payload) \
-             VALUES {placeholders}"
-        );
-        let mut query = db.query(&statement);
-        for item in chunk.iter() {
-            query = query
-                .bind(epoch)
-                .bind(item.frame_seq)
-                .bind(item.event_json.clone())
-                .bind(at_unix)
-                .bind(item.turn_op.map(str::to_owned))
-                .bind(item.turn_id.clone())
-                .bind(item.turn_payload.clone());
-        }
-        query
-            .execute()
-            .await
-            .map_err(|error| room_failed(&error))?;
-
-        let first_seq = chunk[0].frame_seq;
-        let last_seq = chunk[chunk.len() - 1].frame_seq;
-        let seqs: Vec<FrameSeqRow> = sql!(
-            db,
-            "SELECT frame_seq, event_seq FROM daemon_frame_events \
-             WHERE epoch = {epoch} AND frame_seq >= {first_seq} AND frame_seq <= {last_seq} \
-             ORDER BY frame_seq"
-        )
-        .fetch_all()
-        .await
-        .map_err(|error| room_failed(&error))?;
-
-        for item in chunk.iter_mut() {
-            let Some(event) = item.emitted.take() else {
-                continue;
-            };
-            let seq = seqs
-                .iter()
-                .find(|row| row.frame_seq == item.frame_seq)
-                .and_then(|row| row.event_seq);
-            emitted.push(EmittedEvent { seq, event });
-        }
+        apply_frame_side_effects(db, kv, cache, signals, chunk).await?;
+        commit_frame_chunk(db, epoch, at_unix, chunk, &mut emitted).await?;
     }
 
     let ack_through = batch.ack_through;
@@ -1750,14 +1780,11 @@ async fn project_turn_event(
             event: HarnessEvent::TurnStarted { turn_id },
         } => {
             let turn_id = turn_id.as_str();
-            let prompt: String = sql!(
-                db,
-                "SELECT excerpt FROM turn_pending_prompt WHERE id = 0"
-            )
-            .fetch_scalar_optional()
-            .await
-            .map_err(|error| stored(&error))?
-            .unwrap_or_default();
+            let prompt: String = sql!(db, "SELECT excerpt FROM turn_pending_prompt WHERE id = 0")
+                .fetch_scalar_optional()
+                .await
+                .map_err(|error| stored(&error))?
+                .unwrap_or_default();
             sql!(
                 db,
                 "INSERT OR IGNORE INTO turns \
@@ -1863,180 +1890,177 @@ async fn put_latest<T: Serialize + Sync>(
 /// once, on its next call.
 const SCHEMA_VERSION: i64 = 4;
 
+/// DDL statements applied once per room when upgrading to [`SCHEMA_VERSION`].
+const SCHEMA_STATEMENTS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS events (\
+     seq     INTEGER PRIMARY KEY AUTOINCREMENT, \
+     json    TEXT    NOT NULL, \
+     at_unix INTEGER NOT NULL)",
+    // Every command owed to the daemon, whether it is attached or
+    // not. The command stream is a cursor over this table; a row is
+    // deleted the moment the daemon acknowledges past it, so the
+    // table is a delivery log rather than a transcript — what a
+    // command *was* is in `events` where it matters.
+    "CREATE TABLE IF NOT EXISTS daemon_commands (\
+     seq     INTEGER PRIMARY KEY AUTOINCREMENT, \
+     json    TEXT    NOT NULL, \
+     at_unix INTEGER NOT NULL)",
+    // Exactly one row, because a room has exactly one daemon. The
+    // epoch names the current attach; `live_until` is the deadline its
+    // contact renews; `gone_reported` is what makes the first caller
+    // past that deadline the only one to announce it. The CHECK is
+    // what makes one row structural rather than a convention.
+    "CREATE TABLE IF NOT EXISTS daemon_presence (\
+     id            INTEGER PRIMARY KEY CHECK (id = 0), \
+     epoch         INTEGER NOT NULL, \
+     live_until    INTEGER NOT NULL, \
+     gone_reported INTEGER NOT NULL)",
+    // One row per attach, recording how far into that epoch's frame
+    // numbering the room has stored. A retransmitted batch is answered
+    // from this without reapplying a frame of it; a gap is refused.
+    "CREATE TABLE IF NOT EXISTS daemon_frames (\
+     epoch   INTEGER PRIMARY KEY, \
+     through INTEGER NOT NULL)",
+    // The size the client's terminal pane last reported, handed to
+    // every daemon's fresh command stream: a daemon that was still
+    // booting when the pane opened, or one restarted by a resize, has
+    // a PTY at its default size and no other way to learn the real
+    // one (issue #258). One row, because a session has one pane
+    // size — the last client to fit its pane wins.
+    "CREATE TABLE IF NOT EXISTS terminal_size (\
+     id   INTEGER PRIMARY KEY CHECK (id = 0), \
+     cols INTEGER NOT NULL, \
+     rows INTEGER NOT NULL)",
+    // One row per answered question about the checkout, keyed by the
+    // id the Worker minted for it and deleted the moment the held
+    // question serves it. A table rather than KV because these expire: the
+    // sweep in `store_workdir_reply` needs to find rows by age, which
+    // is a query and not a key.
+    "CREATE TABLE IF NOT EXISTS workdir_replies (\
+     id      TEXT    PRIMARY KEY, \
+     json    TEXT    NOT NULL, \
+     at_unix INTEGER NOT NULL)",
+    // The TTL sweep in `store_workdir_reply` deletes by `at_unix`;
+    // without this index every store scans the whole table.
+    "CREATE INDEX IF NOT EXISTS workdir_replies_at ON workdir_replies (at_unix)",
+    // The room's row-read ledger — one row per UTC day, debited by
+    // `row_budget::charge_reads`, and the circuit breaker that keeps a
+    // runaway reader here from spending the account's quota.
+    crate::row_budget::SCHEMA,
+    // The desktop stream's GOP tail: the newest keyframe plus
+    // everything encoded since. Not `events` — a replayed transcript
+    // is not a screen recording — and bounded, so a live session
+    // cannot grow it without limit.
+    "CREATE TABLE IF NOT EXISTS desktop_chunks (\
+     seq      INTEGER PRIMARY KEY AUTOINCREMENT, \
+     keyframe INTEGER NOT NULL, \
+     data     TEXT    NOT NULL, \
+     at_unix  INTEGER NOT NULL)",
+    // One lease per browser watching the desktop stream. A row is a
+    // heartbeat — the stream and its takeover and input calls renew
+    // `live_until` — so a tab that dies stops counting, and a
+    // takeover it held lapses, on the deadline rather than on a close
+    // event nothing sends. `takeover` marks the one row allowed to
+    // drive the screen.
+    "CREATE TABLE IF NOT EXISTS desktop_watchers (\
+     id         INTEGER PRIMARY KEY AUTOINCREMENT, \
+     takeover   INTEGER NOT NULL, \
+     live_until INTEGER NOT NULL)",
+    // What the daemon was last told about its desktop audience. The
+    // conditional updates in `note_audience`/`note_takeover` make a
+    // flip atomic — whichever room call lands it is the one that
+    // emits the command, so a join racing an expiry can never emit
+    // the same transition twice. One row, like the pane size.
+    "CREATE TABLE IF NOT EXISTS desktop_state (\
+     id       INTEGER PRIMARY KEY CHECK (id = 0), \
+     watching INTEGER NOT NULL, \
+     takeover INTEGER NOT NULL)",
+    // The row the conditional updates CAS against; absent it, a
+    // first flip would have nothing to flip from.
+    "INSERT OR IGNORE INTO desktop_state (id, watching, takeover) VALUES (0, 0, 0)",
+    // Lightweight turn projection maintained beside `events` so
+    // `GET /v1/sessions/{id}/turns` reads O(turns) rows instead of
+    // scanning thousands of streaming deltas, and never stalls when
+    // one turn spans >500 events.
+    "CREATE TABLE IF NOT EXISTS turns (\
+     seq               INTEGER PRIMARY KEY, \
+     turn_id           TEXT    NOT NULL, \
+     started_at_unix   INTEGER NOT NULL, \
+     completed_at_unix INTEGER, \
+     prompt_excerpt    TEXT    NOT NULL, \
+     usage_json        TEXT)",
+    // Pending user prompt waiting for the next `TurnStarted` event.
+    "CREATE TABLE IF NOT EXISTS turn_pending_prompt (\
+     id      INTEGER PRIMARY KEY CHECK (id = 0), \
+     excerpt TEXT    NOT NULL)",
+    // One-shot backfill cursor for rooms upgraded from schema v3 that
+    // already hold pre-projection rows in `events`. Brand-new rooms
+    // start with `end_seq = 0` and never scan `events`.
+    "CREATE TABLE IF NOT EXISTS turn_backfill (\
+     id       INTEGER PRIMARY KEY CHECK (id = 0), \
+     next_seq INTEGER NOT NULL, \
+     end_seq  INTEGER NOT NULL)",
+    "INSERT OR IGNORE INTO turn_backfill (id, next_seq, end_seq) \
+     VALUES (0, 0, COALESCE((SELECT MAX(seq) FROM events), 0))",
+    // Per-frame receipt log for atomic, idempotent `accept_batch`
+    // writes. Inserting rows here fires `daemon_frame_events_apply`
+    // in the same implicit SQLite transaction, appending recorded
+    // events, projecting turn boundaries, and advancing
+    // `daemon_frames.through` atomically without BEGIN/COMMIT.
+    "CREATE TABLE IF NOT EXISTS daemon_frame_events (\
+     epoch        INTEGER NOT NULL, \
+     frame_seq    INTEGER NOT NULL, \
+     json         TEXT, \
+     at_unix      INTEGER NOT NULL, \
+     turn_op      TEXT, \
+     turn_id      TEXT, \
+     turn_payload TEXT, \
+     event_seq    INTEGER, \
+     PRIMARY KEY (epoch, frame_seq))",
+    "CREATE TRIGGER IF NOT EXISTS daemon_frame_events_apply \
+     AFTER INSERT ON daemon_frame_events \
+     BEGIN \
+         INSERT INTO events (json, at_unix) \
+         SELECT NEW.json, NEW.at_unix WHERE NEW.json IS NOT NULL; \
+         UPDATE daemon_frame_events \
+         SET event_seq = last_insert_rowid() \
+         WHERE epoch = NEW.epoch AND frame_seq = NEW.frame_seq AND NEW.json IS NOT NULL; \
+         INSERT OR IGNORE INTO turns \
+             (seq, turn_id, started_at_unix, completed_at_unix, prompt_excerpt, usage_json) \
+         SELECT (SELECT event_seq FROM daemon_frame_events \
+                 WHERE epoch = NEW.epoch AND frame_seq = NEW.frame_seq), \
+                NEW.turn_id, \
+                NEW.at_unix, \
+                NULL, \
+                COALESCE((SELECT excerpt FROM turn_pending_prompt WHERE id = 0), ''), \
+                NULL \
+         WHERE NEW.turn_op = 'start'; \
+         DELETE FROM turn_pending_prompt WHERE id = 0 AND NEW.turn_op = 'start'; \
+         UPDATE turns \
+         SET completed_at_unix = NEW.at_unix, usage_json = NEW.turn_payload \
+         WHERE NEW.turn_op = 'complete' \
+           AND seq = (SELECT seq FROM turns ORDER BY seq DESC LIMIT 1) \
+           AND turn_id = NEW.turn_id \
+           AND completed_at_unix IS NULL; \
+         UPDATE turns \
+         SET completed_at_unix = NEW.at_unix \
+         WHERE NEW.turn_op = 'fail' \
+           AND seq = (SELECT seq FROM turns ORDER BY seq DESC LIMIT 1) \
+           AND turn_id = NEW.turn_id \
+           AND completed_at_unix IS NULL; \
+         INSERT INTO daemon_frames (epoch, through) VALUES (NEW.epoch, NEW.frame_seq) \
+         ON CONFLICT (epoch) DO UPDATE SET \
+             through = max(excluded.through, daemon_frames.through); \
+     END",
+];
+
 /// Creates the room's tables if this is its first write.
 ///
 /// `AUTOINCREMENT` rather than a counter in the struct: the sequences
 /// have to be monotonic across the object being rebuilt around every
 /// event, and the database is the only thing here that guarantees it.
 async fn ensure_schema(db: &DurableDb, cache: &Cache) -> Result<(), DurableObjectError> {
-    crate::schema_version::ensure(
-        db,
-        cache,
-        SCHEMA_VERSION,
-        &[
-            "CREATE TABLE IF NOT EXISTS events (\
-             seq     INTEGER PRIMARY KEY AUTOINCREMENT, \
-             json    TEXT    NOT NULL, \
-             at_unix INTEGER NOT NULL)",
-            // Every command owed to the daemon, whether it is attached or
-            // not. The command stream is a cursor over this table; a row is
-            // deleted the moment the daemon acknowledges past it, so the
-            // table is a delivery log rather than a transcript — what a
-            // command *was* is in `events` where it matters.
-            "CREATE TABLE IF NOT EXISTS daemon_commands (\
-             seq     INTEGER PRIMARY KEY AUTOINCREMENT, \
-             json    TEXT    NOT NULL, \
-             at_unix INTEGER NOT NULL)",
-            // Exactly one row, because a room has exactly one daemon. The
-            // epoch names the current attach; `live_until` is the deadline its
-            // contact renews; `gone_reported` is what makes the first caller
-            // past that deadline the only one to announce it. The CHECK is
-            // what makes one row structural rather than a convention.
-            "CREATE TABLE IF NOT EXISTS daemon_presence (\
-             id            INTEGER PRIMARY KEY CHECK (id = 0), \
-             epoch         INTEGER NOT NULL, \
-             live_until    INTEGER NOT NULL, \
-             gone_reported INTEGER NOT NULL)",
-            // One row per attach, recording how far into that epoch's frame
-            // numbering the room has stored. A retransmitted batch is answered
-            // from this without reapplying a frame of it; a gap is refused.
-            "CREATE TABLE IF NOT EXISTS daemon_frames (\
-             epoch   INTEGER PRIMARY KEY, \
-             through INTEGER NOT NULL)",
-            // The size the client's terminal pane last reported, handed to
-            // every daemon's fresh command stream: a daemon that was still
-            // booting when the pane opened, or one restarted by a resize, has
-            // a PTY at its default size and no other way to learn the real
-            // one (issue #258). One row, because a session has one pane
-            // size — the last client to fit its pane wins.
-            "CREATE TABLE IF NOT EXISTS terminal_size (\
-             id   INTEGER PRIMARY KEY CHECK (id = 0), \
-             cols INTEGER NOT NULL, \
-             rows INTEGER NOT NULL)",
-            // One row per answered question about the checkout, keyed by the
-            // id the Worker minted for it and deleted the moment the held
-            // question serves it. A table rather than KV because these expire: the
-            // sweep in `store_workdir_reply` needs to find rows by age, which
-            // is a query and not a key.
-            "CREATE TABLE IF NOT EXISTS workdir_replies (\
-             id      TEXT    PRIMARY KEY, \
-             json    TEXT    NOT NULL, \
-             at_unix INTEGER NOT NULL)",
-            // The TTL sweep in `store_workdir_reply` deletes by `at_unix`;
-            // without this index every store scans the whole table.
-            "CREATE INDEX IF NOT EXISTS workdir_replies_at ON workdir_replies (at_unix)",
-            // The room's row-read ledger — one row per UTC day, debited by
-            // `row_budget::charge_reads`, and the circuit breaker that keeps a
-            // runaway reader here from spending the account's quota.
-            crate::row_budget::SCHEMA,
-            // The desktop stream's GOP tail: the newest keyframe plus
-            // everything encoded since. Not `events` — a replayed transcript
-            // is not a screen recording — and bounded, so a live session
-            // cannot grow it without limit.
-            "CREATE TABLE IF NOT EXISTS desktop_chunks (\
-             seq      INTEGER PRIMARY KEY AUTOINCREMENT, \
-             keyframe INTEGER NOT NULL, \
-             data     TEXT    NOT NULL, \
-             at_unix  INTEGER NOT NULL)",
-            // One lease per browser watching the desktop stream. A row is a
-            // heartbeat — the stream and its takeover and input calls renew
-            // `live_until` — so a tab that dies stops counting, and a
-            // takeover it held lapses, on the deadline rather than on a close
-            // event nothing sends. `takeover` marks the one row allowed to
-            // drive the screen.
-            "CREATE TABLE IF NOT EXISTS desktop_watchers (\
-             id         INTEGER PRIMARY KEY AUTOINCREMENT, \
-             takeover   INTEGER NOT NULL, \
-             live_until INTEGER NOT NULL)",
-            // What the daemon was last told about its desktop audience. The
-            // conditional updates in `note_audience`/`note_takeover` make a
-            // flip atomic — whichever room call lands it is the one that
-            // emits the command, so a join racing an expiry can never emit
-            // the same transition twice. One row, like the pane size.
-            "CREATE TABLE IF NOT EXISTS desktop_state (\
-             id       INTEGER PRIMARY KEY CHECK (id = 0), \
-             watching INTEGER NOT NULL, \
-             takeover INTEGER NOT NULL)",
-            // The row the conditional updates CAS against; absent it, a
-            // first flip would have nothing to flip from.
-            "INSERT OR IGNORE INTO desktop_state (id, watching, takeover) VALUES (0, 0, 0)",
-            // Lightweight turn projection maintained beside `events` so
-            // `GET /v1/sessions/{id}/turns` reads O(turns) rows instead of
-            // scanning thousands of streaming deltas, and never stalls when
-            // one turn spans >500 events.
-            "CREATE TABLE IF NOT EXISTS turns (\
-             seq               INTEGER PRIMARY KEY, \
-             turn_id           TEXT    NOT NULL, \
-             started_at_unix   INTEGER NOT NULL, \
-             completed_at_unix INTEGER, \
-             prompt_excerpt    TEXT    NOT NULL, \
-             usage_json        TEXT)",
-            // Pending user prompt waiting for the next `TurnStarted` event.
-            "CREATE TABLE IF NOT EXISTS turn_pending_prompt (\
-             id      INTEGER PRIMARY KEY CHECK (id = 0), \
-             excerpt TEXT    NOT NULL)",
-            // One-shot backfill cursor for rooms upgraded from schema v3 that
-            // already hold pre-projection rows in `events`. Brand-new rooms
-            // start with `end_seq = 0` and never scan `events`.
-            "CREATE TABLE IF NOT EXISTS turn_backfill (\
-             id       INTEGER PRIMARY KEY CHECK (id = 0), \
-             next_seq INTEGER NOT NULL, \
-             end_seq  INTEGER NOT NULL)",
-            "INSERT OR IGNORE INTO turn_backfill (id, next_seq, end_seq) \
-             VALUES (0, 0, COALESCE((SELECT MAX(seq) FROM events), 0))",
-            // Per-frame receipt log for atomic, idempotent `accept_batch`
-            // writes. Inserting rows here fires `daemon_frame_events_apply`
-            // in the same implicit SQLite transaction, appending recorded
-            // events, projecting turn boundaries, and advancing
-            // `daemon_frames.through` atomically without BEGIN/COMMIT.
-            "CREATE TABLE IF NOT EXISTS daemon_frame_events (\
-             epoch        INTEGER NOT NULL, \
-             frame_seq    INTEGER NOT NULL, \
-             json         TEXT, \
-             at_unix      INTEGER NOT NULL, \
-             turn_op      TEXT, \
-             turn_id      TEXT, \
-             turn_payload TEXT, \
-             event_seq    INTEGER, \
-             PRIMARY KEY (epoch, frame_seq))",
-            "CREATE TRIGGER IF NOT EXISTS daemon_frame_events_apply \
-             AFTER INSERT ON daemon_frame_events \
-             BEGIN \
-                 INSERT INTO events (json, at_unix) \
-                 SELECT NEW.json, NEW.at_unix WHERE NEW.json IS NOT NULL; \
-                 UPDATE daemon_frame_events \
-                 SET event_seq = last_insert_rowid() \
-                 WHERE epoch = NEW.epoch AND frame_seq = NEW.frame_seq AND NEW.json IS NOT NULL; \
-                 INSERT OR IGNORE INTO turns \
-                     (seq, turn_id, started_at_unix, completed_at_unix, prompt_excerpt, usage_json) \
-                 SELECT (SELECT event_seq FROM daemon_frame_events \
-                         WHERE epoch = NEW.epoch AND frame_seq = NEW.frame_seq), \
-                        NEW.turn_id, \
-                        NEW.at_unix, \
-                        NULL, \
-                        COALESCE((SELECT excerpt FROM turn_pending_prompt WHERE id = 0), ''), \
-                        NULL \
-                 WHERE NEW.turn_op = 'start'; \
-                 DELETE FROM turn_pending_prompt WHERE id = 0 AND NEW.turn_op = 'start'; \
-                 UPDATE turns \
-                 SET completed_at_unix = NEW.at_unix, usage_json = NEW.turn_payload \
-                 WHERE NEW.turn_op = 'complete' \
-                   AND seq = (SELECT seq FROM turns ORDER BY seq DESC LIMIT 1) \
-                   AND turn_id = NEW.turn_id \
-                   AND completed_at_unix IS NULL; \
-                 UPDATE turns \
-                 SET completed_at_unix = NEW.at_unix \
-                 WHERE NEW.turn_op = 'fail' \
-                   AND seq = (SELECT seq FROM turns ORDER BY seq DESC LIMIT 1) \
-                   AND turn_id = NEW.turn_id \
-                   AND completed_at_unix IS NULL; \
-                 INSERT INTO daemon_frames (epoch, through) VALUES (NEW.epoch, NEW.frame_seq) \
-                 ON CONFLICT (epoch) DO UPDATE SET \
-                     through = max(excluded.through, daemon_frames.through); \
-             END",
-        ],
-    )
-    .await
+    crate::schema_version::ensure(db, cache, SCHEMA_VERSION, SCHEMA_STATEMENTS).await
 }
 
 /// The room's own database failed, which is a runtime fault rather than
@@ -2172,11 +2196,13 @@ async fn read_turns(
 /// and zero event scans. Upgraded rooms catch up once in `EVENT_PAGE_LIMIT`
 /// chunks under the daily row-read budget.
 async fn backfill_turns(db: &DurableDb) -> Result<(), ApiError> {
-    let Some(mut progress): Option<TurnBackfillRow> =
-        sql!(db, "SELECT next_seq, end_seq FROM turn_backfill WHERE id = 0")
-            .fetch_optional()
-            .await
-            .map_err(|error| ApiError::Room(error.to_string()))?
+    let Some(mut progress): Option<TurnBackfillRow> = sql!(
+        db,
+        "SELECT next_seq, end_seq FROM turn_backfill WHERE id = 0"
+    )
+    .fetch_optional()
+    .await
+    .map_err(|error| ApiError::Room(error.to_string()))?
     else {
         return Ok(());
     };

@@ -448,8 +448,7 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
             );
             return;
         };
-        self.in_flight_stops
-            .retain(|handle| !handle.is_finished());
+        self.in_flight_stops.retain(|handle| !handle.is_finished());
         let is_stop = matches!(job, ContainerJob::Stop { .. });
         let jobs = Arc::clone(&self.jobs);
         let results = self.results.clone();
@@ -481,8 +480,7 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
     /// Waits for any in-flight `ContainerJob::Stop` tasks to finish before
     /// the relay exits on revocation, bounded by [`REVOKE_STOP_GRACE`].
     async fn drain_stops(&mut self) {
-        self.in_flight_stops
-            .retain(|handle| !handle.is_finished());
+        self.in_flight_stops.retain(|handle| !handle.is_finished());
         if self.in_flight_stops.is_empty() {
             return;
         }

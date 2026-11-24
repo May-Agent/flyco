@@ -44,8 +44,8 @@ use crate::room::{
     WORKDIR_TIMEOUT_EVENT,
 };
 use crate::user_events::{HEADER_USER, PublishEvents};
-use flyco_core::wire::EventPage;
 use flyco_core::TurnPage;
+use flyco_core::wire::EventPage;
 
 /// Cloudflare binding the session-room namespace is exposed under.
 pub const BINDING: &str = "SESSION_ROOMS";
