@@ -15,13 +15,11 @@ use crate::control::rest::{
     ApprovalRaiser, CommandStream, ControlApi, ControlApiError, HttpControlApi, RelayTransport,
     TranscriptRead,
 };
-use crate::control::store::{RemoteTranscriptStore, stream_key};
+use crate::control::store::{MAX_STREAM_LEN, R2TranscriptSync, TranscriptKeyError, stream_key};
 use crate::control::wire::{self, QUEUE_DEPTH, SessionRelay, WireError};
 use crate::desktop::FakeDesktop;
 use crate::git::FakeRepos;
 use crate::harness::SessionOutput;
-use crate::harness::claude::protocol::SessionKey;
-use crate::harness::claude::store::{StoreError, TranscriptStore};
 use crate::shell::{FakeShell, ShellEvent, ShellUpdate, StartedRun};
 use crate::spot::{FakeEviction, SpotNotice};
 use crate::terminal::{FakeTerminal, TerminalCall};
@@ -2969,14 +2967,13 @@ mod rest_client {
 // ── The remote transcript store ──
 
 mod remote_store {
-    use super::{RemoteTranscriptStore, SessionKey, StoreError, TranscriptStore, stream_key};
+    use super::{MAX_STREAM_LEN, R2TranscriptSync, TranscriptKeyError, stream_key};
     use crate::control::rest::{ApprovalRaiser, ControlApi, ControlApiError, TranscriptRead};
     use flyco_core::wire::ApprovalPayload;
     use flyco_core::{
         ApprovalId, HarnessObservation, HarnessSessionView, ModelOption, StopReason, UsageWindow,
     };
-    use serde_json::{Value, json};
-    use std::sync::mpsc::{Receiver, Sender, channel};
+    use serde_json::Value;
 
     /// One call the store made.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2989,15 +2986,32 @@ mod remote_store {
         Read(String),
     }
 
-    /// A control plane that already holds `batches` batches of `body`.
-    #[derive(Debug)]
+    type StreamMap = std::collections::BTreeMap<String, (Vec<u8>, u64)>;
+
+    /// A control plane holding per-stream transcript batches in memory.
+    #[derive(Debug, Clone)]
     struct Held {
-        body: Vec<u8>,
-        batches: u64,
-        wrote: Sender<Wrote>,
-        /// Refuse every batch with this status, the way a control plane
-        /// that has run out of room, or of patience, does.
+        streams: std::sync::Arc<std::sync::Mutex<StreamMap>>,
+        wrote: std::sync::Arc<std::sync::Mutex<Vec<Wrote>>>,
         refuse_puts: Option<u16>,
+    }
+
+    impl Held {
+        fn new(initial: Vec<(&str, &[u8], u64)>) -> Self {
+            let mut map = std::collections::BTreeMap::new();
+            for (k, body, batches) in initial {
+                map.insert(k.to_owned(), (body.to_vec(), batches));
+            }
+            Self {
+                streams: std::sync::Arc::new(std::sync::Mutex::new(map)),
+                wrote: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                refuse_puts: None,
+            }
+        }
+
+        fn log(&self) -> Vec<Wrote> {
+            self.wrote.lock().expect("wrote").clone()
+        }
     }
 
     impl ApprovalRaiser for Held {
@@ -3118,15 +3132,21 @@ mod remote_store {
                     retry_after_secs: None,
                 }));
             }
-            core::future::ready(
-                self.wrote
-                    .send(Wrote::Put {
-                        stream: stream.to_owned(),
-                        seq,
-                        body,
-                    })
-                    .map_err(|error| ControlApiError::Transport(error.to_string())),
-            )
+            {
+                let mut map = self.streams.lock().expect("streams");
+                let entry = map
+                    .entry(stream.to_owned())
+                    .or_insert_with(|| (Vec::new(), 0));
+                entry.0.extend_from_slice(&body);
+                entry.1 = seq + 1;
+                drop(map);
+            }
+            self.wrote.lock().expect("wrote").push(Wrote::Put {
+                stream: stream.to_owned(),
+                seq,
+                body,
+            });
+            core::future::ready(Ok(()))
         }
 
         fn put_workdir_patch(
@@ -3195,211 +3215,181 @@ mod remote_store {
             stream: &str,
         ) -> impl core::future::Future<Output = Result<TranscriptRead, ControlApiError>> + Send
         {
-            let recorded = self
-                .wrote
-                .send(Wrote::Read(stream.to_owned()))
-                .map_err(|error| ControlApiError::Transport(error.to_string()));
-            core::future::ready(recorded.map(|()| TranscriptRead {
-                body: self.body.clone(),
-                batches: self.batches,
-            }))
+            self.wrote
+                .lock()
+                .expect("wrote")
+                .push(Wrote::Read(stream.to_owned()));
+            let read = self
+                .streams
+                .lock()
+                .expect("streams")
+                .get(stream)
+                .map_or_else(
+                    || TranscriptRead {
+                        body: Vec::new(),
+                        batches: 0,
+                    },
+                    |(body, batches)| TranscriptRead {
+                        body: body.clone(),
+                        batches: *batches,
+                    },
+                );
+            core::future::ready(Ok(read))
         }
     }
 
-    fn store(body: &[u8], batches: u64) -> (RemoteTranscriptStore<Held>, Receiver<Wrote>) {
-        let (wrote, received) = channel();
-        (
-            RemoteTranscriptStore::new(Held {
-                body: body.to_vec(),
-                batches,
-                wrote,
-                refuse_puts: None,
-            }),
-            received,
-        )
+    fn scratch_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flycod-r2-sync-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp home");
+        dir
     }
 
     #[tokio::test]
     async fn a_refused_batch_is_reported_with_the_control_planes_own_answer() {
-        // Issue #231: the session failed with `transcript store I/O failed
-        // at <control plane>`, and nothing about which request or why.
-        let (wrote, _received) = channel();
-        let mut store = RemoteTranscriptStore::new(Held {
-            body: Vec::new(),
-            batches: 0,
-            wrote,
-            refuse_puts: Some(413),
-        });
+        use claude_acp_sdk::TranscriptSync as _;
 
-        let error = store
-            .append(&key(None), vec![json!({ "uuid": "a" })])
+        let home = scratch_home("refused");
+        let project_dir = home.join(".claude/projects/flyco-work");
+        std::fs::create_dir_all(&project_dir).expect("project dir");
+        std::fs::write(project_dir.join("9d0f4b1a.jsonl"), b"{\"uuid\":\"a\"}\n").expect("write");
+
+        let mut held = Held::new(Vec::new());
+        held.refuse_puts = Some(413);
+        let sync = R2TranscriptSync::new(held, Some("flyco-work".to_owned()), None);
+
+        let error = sync
+            .push("9d0f4b1a", std::path::Path::new("/srv/flyco/work"), &home)
             .await
             .expect_err("a refused batch is an error");
-
-        assert!(matches!(error, StoreError::ControlPlane { .. }));
-        let described = crate::harness::describe(&error);
-        assert_eq!(
-            described,
-            "the control plane could not keep the transcript: the control plane refused PUT \
-             /v1/sessions/s/transcript/flyco-work.9d0f4b1a/0: 413 Payload Too Large — the \
-             batch is over the 1 MiB a transcript batch may be"
-        );
-    }
-
-    fn key(subpath: Option<&str>) -> SessionKey {
-        SessionKey {
-            project_key: "flyco-work".to_owned(),
-            session_id: "9d0f4b1a".to_owned(),
-            subpath: subpath.map(str::to_owned),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_fresh_stream_numbers_its_batches_from_zero() {
-        let (mut store, wrote) = store(b"", 0);
-        store
-            .append(&key(None), vec![json!({ "uuid": "a" })])
-            .await
-            .expect("append");
-        store
-            .append(&key(None), vec![json!({ "uuid": "b" })])
-            .await
-            .expect("append");
-
-        assert_eq!(
-            wrote.try_iter().collect::<Vec<_>>(),
-            vec![
-                // The sequence is read once, then advanced locally: this
-                // daemon is the only writer of its own transcript.
-                Wrote::Read("flyco-work.9d0f4b1a".to_owned()),
-                Wrote::Put {
-                    stream: "flyco-work.9d0f4b1a".to_owned(),
-                    seq: 0,
-                    body: b"{\"uuid\":\"a\"}\n".to_vec(),
-                },
-                Wrote::Put {
-                    stream: "flyco-work.9d0f4b1a".to_owned(),
-                    seq: 1,
-                    body: b"{\"uuid\":\"b\"}\n".to_vec(),
-                },
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_resumed_stream_continues_where_the_previous_host_stopped() {
-        // Three batches already in the control plane: a session that moved
-        // machine must not write batch 0 over its predecessor's.
-        let (mut store, wrote) = store(b"{\"uuid\":\"a\"}\n", 3);
-        store
-            .append(&key(None), vec![json!({ "uuid": "d" })])
-            .await
-            .expect("append");
-
-        let calls: Vec<Wrote> = wrote.try_iter().collect();
-        assert!(matches!(
-            calls.as_slice(),
-            [Wrote::Read(_), Wrote::Put { seq: 3, .. }]
-        ));
-    }
-
-    #[tokio::test]
-    async fn loading_parses_the_concatenated_stream_and_seeds_the_sequence() {
-        let (mut store, wrote) = store(b"{\"uuid\":\"a\"}\n\n{\"uuid\":\"b\"}\n", 2);
-        assert_eq!(
-            store.load(&key(None)).await.expect("load"),
-            vec![json!({ "uuid": "a" }), json!({ "uuid": "b" })]
+        let described = error.to_string();
+        assert!(
+            described.contains("413 Payload Too Large")
+                && described.contains("PUT /v1/sessions/s/transcript/flyco-work.9d0f4b1a/0"),
+            "error should include the control plane's refusal: {described}"
         );
 
-        // The load already told the store where the stream ends, so the next
-        // append needs no second read.
-        store
-            .append(&key(None), vec![json!({ "uuid": "c" })])
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn push_and_pull_round_trip_main_and_subagent_transcripts_incrementally() {
+        use claude_acp_sdk::TranscriptSync as _;
+
+        let home_a = scratch_home("push-a");
+        let project_dir = home_a.join(".claude/projects/flyco-work");
+        let subagents = project_dir.join("9d0f4b1a/subagents");
+        std::fs::create_dir_all(&subagents).expect("subagents dir");
+        std::fs::write(project_dir.join("9d0f4b1a.jsonl"), b"{\"uuid\":\"a\"}\n").expect("main");
+        std::fs::write(subagents.join("agent-1.jsonl"), b"{\"uuid\":\"sub-1\"}\n").expect("sub");
+
+        let held = Held::new(Vec::new());
+        let sync_a = R2TranscriptSync::new(held.clone(), Some("flyco-work".to_owned()), None);
+        sync_a
+            .push("9d0f4b1a", std::path::Path::new("/srv/flyco/work"), &home_a)
             .await
-            .expect("append");
-        assert!(matches!(
-            wrote.try_iter().collect::<Vec<_>>().as_slice(),
-            [Wrote::Read(_), Wrote::Put { seq: 2, .. }]
-        ));
-    }
+            .expect("first push");
 
-    #[tokio::test]
-    async fn an_empty_batch_is_not_a_round_trip() {
-        let (mut store, wrote) = store(b"", 0);
-        store.append(&key(None), Vec::new()).await.expect("append");
-        assert_eq!(wrote.try_iter().count(), 0);
-    }
+        // Second push with no new bytes must not send any PUTs.
+        let before = held.log().len();
+        sync_a
+            .push("9d0f4b1a", std::path::Path::new("/srv/flyco/work"), &home_a)
+            .await
+            .expect("noop push");
+        assert_eq!(held.log().len(), before, "unchanged files make no PUTs");
 
-    #[tokio::test]
-    async fn a_corrupt_stored_line_is_reported_with_its_position() {
-        let (mut store, _wrote) = store(b"{\"uuid\":\"a\"}\nnot json\n", 1);
-        assert!(matches!(
-            store.load(&key(None)).await,
-            Err(StoreError::CorruptLine { line: 2, .. })
-        ));
+        // Append a second line to main and verify only the delta is uploaded as seq 1.
+        std::fs::write(
+            project_dir.join("9d0f4b1a.jsonl"),
+            b"{\"uuid\":\"a\"}\n{\"uuid\":\"b\"}\n",
+        )
+        .expect("append main");
+        sync_a
+            .push("9d0f4b1a", std::path::Path::new("/srv/flyco/work"), &home_a)
+            .await
+            .expect("second push");
+        assert!(held.log().iter().any(|entry| matches!(
+            entry,
+            Wrote::Put {
+                stream,
+                seq: 1,
+                body,
+            } if stream == "flyco-work.9d0f4b1a" && body == b"{\"uuid\":\"b\"}\n"
+        )));
+
+        // Pull into a fresh host home and verify both main and subagent transcripts land.
+        let home_b = scratch_home("pull-b");
+        let sync_b = R2TranscriptSync::new(held, Some("flyco-work".to_owned()), None);
+        sync_b
+            .pull("9d0f4b1a", std::path::Path::new("/srv/flyco/work"), &home_b)
+            .await
+            .expect("pull on second host");
+
+        assert_eq!(
+            std::fs::read(home_b.join(".claude/projects/flyco-work/9d0f4b1a.jsonl"))
+                .expect("pulled main"),
+            b"{\"uuid\":\"a\"}\n{\"uuid\":\"b\"}\n"
+        );
+        assert_eq!(
+            std::fs::read(
+                home_b.join(".claude/projects/flyco-work/9d0f4b1a/subagents/agent-1.jsonl")
+            )
+            .expect("pulled subagent"),
+            b"{\"uuid\":\"sub-1\"}\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&home_a);
+        let _ = std::fs::remove_dir_all(&home_b);
     }
 
     #[test]
-    fn a_stream_key_is_one_path_segment_whatever_the_harness_named_things() {
-        assert_eq!(stream_key(&key(None)).expect("key"), "flyco-work.9d0f4b1a");
+    fn stream_keys_stay_single_segment_and_fold_long_or_subpath_keys_under_limit() {
         assert_eq!(
-            stream_key(&key(Some("subagents/agent-7"))).expect("key"),
-            "flyco-work.9d0f4b1a.subagents_agent-7",
-            "a sub-stream's slash must not become a second path segment"
+            stream_key("flyco-work", "9d0f4b1a", None).expect("key"),
+            "flyco-work.9d0f4b1a"
         );
 
-        // Replacing rather than dropping keeps two different keys apart.
-        let dotted = SessionKey {
-            project_key: "a/b".to_owned(),
-            session_id: "s".to_owned(),
-            subpath: None,
-        };
-        let underscored = SessionKey {
-            project_key: "a_b".to_owned(),
-            session_id: "s".to_owned(),
-            subpath: None,
-        };
-        assert_eq!(
-            stream_key(&dotted).expect("key"),
-            stream_key(&underscored).expect("key"),
-            "this collision is accepted: both are one segment and the SDK's \
-             project keys are directory names, not free text"
+        let sub = stream_key("flyco-work", "9d0f4b1a", Some("subagents/agent-7.jsonl"))
+            .expect("subagent key");
+        assert!(
+            sub.len() <= MAX_STREAM_LEN,
+            "len {} > {MAX_STREAM_LEN}",
+            sub.len()
         );
-    }
+        assert!(!sub.contains('/'), "single path segment: {sub}");
+        assert!(
+            sub.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+            "valid control-plane segment: {sub}"
+        );
 
-    #[test]
-    fn an_empty_key_part_is_refused_before_any_call() {
-        let empty = SessionKey {
-            project_key: String::new(),
-            session_id: "s".to_owned(),
-            subpath: None,
-        };
+        // Long project keys fold deterministically without failing >128-byte limits.
+        let long_a = stream_key(&"x".repeat(200), "s1", None).expect("long key a");
+        let long_b = stream_key(&format!("{}y", "x".repeat(199)), "s1", None).expect("long key b");
+        assert!(long_a.len() <= MAX_STREAM_LEN, "{long_a}");
+        assert!(long_b.len() <= MAX_STREAM_LEN, "{long_b}");
+        assert_ne!(long_a, long_b, "folded keys keep distinct hashes");
+
+        // Empty or traversal segments are refused before any API call.
         assert!(matches!(
-            stream_key(&empty),
-            Err(StoreError::UnusableKeySegment {
+            stream_key("", "s", None),
+            Err(TranscriptKeyError::InvalidSegment {
                 field: "project_key",
                 ..
             })
         ));
-    }
-
-    #[test]
-    fn a_key_longer_than_the_control_plane_accepts_is_refused() {
-        let long = SessionKey {
-            project_key: "x".repeat(200),
-            session_id: "s".to_owned(),
-            subpath: None,
-        };
         assert!(matches!(
-            stream_key(&long),
-            Err(StoreError::UnusableKeySegment {
-                field: "stream",
+            stream_key("proj", "../escape", None),
+            Err(TranscriptKeyError::InvalidSegment {
+                field: "session_id",
                 ..
             })
         ));
     }
 
-    /// Keeps the unused-import warning honest: `Value` names the entry type
-    /// the store round-trips.
     const _: Option<Vec<Value>> = None;
 }

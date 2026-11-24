@@ -21,11 +21,15 @@ flyco-core = { workspace = true, features = ["schemars"] }
 # `flyco_provider::host`, so the machine cannot disagree with the planner
 # about what a job is or how it is quoted.
 flyco-provider.workspace = true
-# The generic harness driver: every agent but Claude Code is an ACP
-# process. `aither-mcp` is the JSON-RPC types the client handler returns
-# errors in.
+# The unified ACP harness driver: Claude Code and Codex run in-process via
+# `claude-acp` and `codex-acp`; Devin and custom agents run as ACP child
+# processes over `aither-acp`.
 aither-acp.workspace = true
-aither-mcp.workspace = true
+claude-acp.workspace = true
+claude-acp-sdk.workspace = true
+codex-acp.workspace = true
+codex-sdk.workspace = true
+futures-lite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -42,7 +46,6 @@ futures-util.workspace = true
 portable-pty.workspace = true
 rmcp.workspace = true
 rand.workspace = true
-rust-embed.workspace = true
 # A handoff patch is verified against its manifest's SHA-256 before `git
 # apply` sees it.
 sha2.workspace = true

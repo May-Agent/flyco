@@ -7,12 +7,8 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use flyco_core::{DriverKind, ProvisioningStage};
 use flyco_daemon::config::{ControlPlaneConfig, DaemonConfig, EXAMPLE};
-use flyco_daemon::control::{
-    ControlApi, HttpControlApi, RemoteTranscriptStore, SessionRelay, wire,
-};
+use flyco_daemon::control::{ControlApi, HttpControlApi, R2TranscriptSync, SessionRelay, wire};
 use flyco_daemon::harness::acp::AcpHarness;
-use flyco_daemon::harness::claude::ClaudeCodeHarness;
-use flyco_daemon::harness::claude::store::{JsonlTranscriptStore, TranscriptStore};
 use flyco_daemon::harness::{Harness as _, HarnessSession, StartRequest, Started};
 use flyco_daemon::host;
 use flyco_daemon::mcp::{FlycoTools, RepoTrees, spawn_desktop_watcher};
@@ -123,8 +119,6 @@ enum HostCommand {
 enum Failure {
     #[error(transparent)]
     Config(#[from] flyco_daemon::config::ConfigError),
-    #[error(transparent)]
-    Claude(#[from] flyco_daemon::harness::claude::ClaudeError),
     #[error(transparent)]
     Acp(#[from] flyco_daemon::harness::acp::AcpError),
     #[error(transparent)]
@@ -677,85 +671,45 @@ async fn serve_mcp(socket: PathBuf) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Drives a Claude Code session, reporting to a control plane if the
-/// configuration names one and to the terminal otherwise.
-///
-/// The two paths differ in more than their output: a session that reports to
-/// a control plane keeps its transcript there, which is what lets it resume
-/// onto another machine. Which one a run took is logged, because "why is
-/// nothing reaching the browser" has exactly one cheap answer.
+/// Drives a Claude Code session in-process via `claude-acp`, reporting to a
+/// control plane (with R2 transcript sync) if configured or to the terminal
+/// REPL otherwise.
 async fn drive_claude_code(
     config: DaemonConfig,
     mount: Mount,
     agent: Option<AgentUser>,
     desktop_socket: PathBuf,
 ) -> Result<(), Failure> {
-    let Some(control_plane) = config.control_plane.clone() else {
-        tracing::info!(
-            "no [control_plane] in the config: driving this session from stdin. \
-             Transcripts stay in `transcript_dir` and no browser can reach the session."
+    let claude = config.claude().clone();
+    let project_dir_name = claude
+        .auth
+        .isolation()
+        .map(|isolation| isolation.project_dir_name.clone());
+    let harness = if let Some(control_plane) = config.control_plane.clone() {
+        let api = HttpControlApi::new(
+            control_plane.url,
+            config.session,
+            control_plane.daemon_token,
         );
-        let store = JsonlTranscriptStore::new(config.transcript_dir.clone());
-        let started = start(&config, mount, store, agent).await?;
-        repl::run(started.session, started.outputs).await?;
-        return Ok(());
+        let sync = R2TranscriptSync::new(api, project_dir_name, agent.clone());
+        AcpHarness::claude(claude, mount, config.transcript_dir.clone(), sync)
+            .with_agent(agent.clone())
+    } else {
+        AcpHarness::claude(
+            claude,
+            mount,
+            config.transcript_dir.clone(),
+            claude_acp::NoopTranscriptSync,
+        )
+        .with_agent(agent.clone())
     };
-
-    tracing::info!(
-        url = %control_plane.url,
-        "reporting to the control plane over the session relay"
-    );
-    let ControlPlaneConfig { url, daemon_token } = control_plane;
-    let api = HttpControlApi::new(url, config.session, daemon_token);
-
-    let started = start(
-        &config,
-        mount,
-        RemoteTranscriptStore::new(api.clone()),
-        agent.clone(),
-    )
-    .await?;
-    let (terminal, terminal_out) = flyco_daemon::terminal::Terminal::spawn_as(
-        &config.terminal.shell,
-        &config.workdir,
-        agent.clone(),
-    )?;
-    let (desktop, desktop_out) =
-        flyco_daemon::desktop::spawn_at(&config.computer, desktop_socket, agent.clone());
-    Box::pin(wire::run(SessionRelay {
-        session_id: config.session,
-        deadlines: wire::Deadlines::default(),
-        session: started.session,
-        outputs: started.outputs,
-        api,
-        terminal,
-        terminal_out,
-        desktop,
-        desktop_out,
-        tui: flyco_daemon::tui::HarnessTui::resolve(&config, agent.clone()).await,
-        // The composer's `!` commands run in the same workspace as the agent,
-        // under the unprivileged agent user.
-        shell: config
-            .shell
-            .runner(config.workdir.clone())
-            .with_agent(agent.clone()),
-        repos: repos_of(&config, agent).await,
-        workspace: workspace_of(&config),
-        github: config.github.clone(),
-        disk: flyco_daemon::spot::HostDisk,
-        // Watched from here rather than from inside the relay: which
-        // endpoint carries a notice is a fact about the machine, and the
-        // relay's business is the session on it.
-        spot: flyco_daemon::spot::watch(config.spot_provider),
-        // And on exactly the machines whose filesystem goes with them:
-        // saving a session takes the whole grace period, and on a VM there
-        // is nothing at risk to spend it on (see [`flyco_daemon::stop`]).
-        stops: flyco_daemon::stop::watch(config.runtime),
-        machine: config.machine.clone(),
-        machine_origin: config.machine_origin,
-    }))
-    .await?;
-    Ok(())
+    let started = harness
+        .start(StartRequest {
+            workdir: config.workdir.clone(),
+            resume_session_id: config.resume_session_id.clone(),
+        })
+        .await?;
+    Box::pin(report(config, started, agent, desktop_socket)).await
 }
 
 /// Drives an ACP session — Codex, Devin, or any other agent the `[acp]`
@@ -985,26 +939,4 @@ async fn materialize_transcript(
         "landed the handed-off transcript"
     );
     Ok(())
-}
-
-/// Launches the Claude Code harness against a transcript store.
-async fn start<S: TranscriptStore>(
-    config: &DaemonConfig,
-    mount: Mount,
-    store: S,
-    agent: Option<AgentUser>,
-) -> Result<Started<impl flyco_daemon::harness::HarnessSession + use<S>>, Failure> {
-    let harness = ClaudeCodeHarness::new(
-        config.claude().clone(),
-        config.sidecar().clone(),
-        mount,
-        store,
-    )
-    .with_agent(agent);
-    Ok(harness
-        .start(StartRequest {
-            workdir: config.workdir.clone(),
-            resume_session_id: config.resume_session_id.clone(),
-        })
-        .await?)
 }

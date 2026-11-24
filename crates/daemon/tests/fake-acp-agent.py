@@ -175,18 +175,21 @@ def main() -> None:
                         "sessionId": SESSION,
                         "modes": MODES,
                         "configOptions": CONFIG_OPTIONS,
-                        # Extension field, flattened into the result: the
-                        # palette the session opens with.
-                        "availableCommands": [
-                            {
-                                "name": "cloudflare",
-                                "description": (
-                                    "Comprehensive Cloudflare platform skill "
-                                    "covering Workers, Pages, storage, and AI."
-                                ),
-                            }
-                        ],
                     },
+                }
+            )
+            update(
+                {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        {
+                            "name": "cloudflare",
+                            "description": (
+                                "Comprehensive Cloudflare platform skill "
+                                "covering Workers, Pages, storage, and AI."
+                            ),
+                        }
+                    ],
                 }
             )
         elif method == "session/resume":
@@ -220,7 +223,7 @@ def main() -> None:
                 if option["id"] == params.get("configId"):
                     option["currentValue"] = params.get("value")
             send({"id": msg["id"], "result": {"configOptions": options}})
-        elif method == "mcpServerStatus/list":
+        elif method == "_test/mcp_status":
             # What the agent mounted. The driver refuses the session unless
             # flyco's own server is here, connected, with its tools.
             tools = ["budget_status", "machine_resize"]
@@ -241,14 +244,16 @@ def main() -> None:
                     },
                 }
             )
-        elif method == "account/rateLimits/read":
+        elif method == "_test/rate_limits":
             send({"id": msg["id"], "result": readings.pop(0) if readings else USAGE_READINGS[-1]})
-        elif method == "thread/compact/start":
+        elif method == "_test/compact":
             if msg.get("params") != {"threadId": SESSION}:
                 sys.exit(1)
             send({"id": msg["id"], "result": {}})
         elif method == "session/prompt":
             prompt_id = msg["id"]
+            if "crash" in os.getcwd():
+                sys.exit(42)
             if "skillsreload" in os.getcwd():
                 # A skill appeared while the session was open; the palette
                 # update is how the driver learns the set moved.

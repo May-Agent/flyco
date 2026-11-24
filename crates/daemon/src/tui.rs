@@ -19,12 +19,11 @@ use crate::privilege::{AgentUser, chown_path};
 /// Why a harness TUI cannot be launched.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TuiError {
-    /// The sidecar's `node_modules` holds no `claude` binary.
-    #[error("no claude binary under {0}: the sidecar's `bun install` did not leave one")]
+    /// The configured or PATH-resolved native `claude` binary was not found.
+    #[error(
+        "no claude binary at {0}: install the native Claude Code CLI or set [claude].claude_path"
+    )]
     ClaudeMissing(PathBuf),
-    /// The sidecar's `node_modules` could not be listed at all.
-    #[error("could not list {0}")]
-    ClaudeUnreadable(PathBuf),
     /// The agent's `[acp]` table declares no TUI to bridge to.
     #[error("{0} has no TUI: its [acp.tui] table is empty, so there is nothing to launch")]
     NoTui(String),
@@ -37,9 +36,7 @@ pub enum TuiError {
 ///
 /// The CLI's own OAuth client requests this set at login; the token itself
 /// carries them server-side, and the credentials file repeats them so the
-/// resolved credential's `scopes` satisfies the rate-limit gate. The same
-/// list lives in `sidecar.ts`'s `SETUP_TOKEN_SCOPES` — the two writers
-/// cannot share a constant across languages.
+/// resolved credential's `scopes` satisfies the rate-limit gate.
 const SETUP_TOKEN_SCOPES: &[&str] = &[
     "org:create_api_key",
     "user:profile",
@@ -64,7 +61,7 @@ struct Credential<'a> {
     scopes: &'static [&'static str],
 }
 
-/// Writes the OAuth credential the launched CLI resolves.
+/// Writes the OAuth credential the launched `claude` CLI resolves.
 ///
 /// An env-injected `CLAUDE_CODE_OAUTH_TOKEN` resolves as env-quad auth,
 /// which the CLI's rate-limit gate treats as ineligible for plan limits —
@@ -74,16 +71,18 @@ struct Credential<'a> {
 /// read true. `claude setup-token` mints a long-lived grant with no
 /// refresh token, so the entry cannot expire or refresh from the CLI's
 /// side.
-fn provision_oauth(dir: &Path, token: &str, agent: Option<&AgentUser>) -> Result<(), TuiError> {
+pub(crate) fn provision_claude_oauth(
+    dir: &Path,
+    token: &str,
+    agent: Option<&AgentUser>,
+) -> std::io::Result<()> {
     use std::io::Write as _;
 
-    let io = |error: std::io::Error| TuiError::CredentialWrite(error.to_string());
-    std::fs::create_dir_all(dir).map_err(io)?;
+    std::fs::create_dir_all(dir)?;
     if let Some(user) = agent
         && user.needs_uid_switch()
     {
-        chown_path(dir, Some(user.uid), Some(user.gid))
-            .map_err(|error| TuiError::CredentialWrite(error.to_string()))?;
+        chown_path(dir, Some(user.uid), Some(user.gid)).map_err(std::io::Error::other)?;
     }
     let file = CredentialFile {
         claude_ai_oauth: Credential {
@@ -117,9 +116,14 @@ fn provision_oauth(dir: &Path, token: &str, agent: Option<&AgentUser>) -> Result
     })();
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(io(error));
+        return Err(error);
     }
     Ok(())
+}
+
+fn provision_oauth(dir: &Path, token: &str, agent: Option<&AgentUser>) -> Result<(), TuiError> {
+    provision_claude_oauth(dir, token, agent)
+        .map_err(|error| TuiError::CredentialWrite(error.to_string()))
 }
 
 /// How the session's harness TUI is launched.
@@ -162,9 +166,9 @@ enum Program {
     Bin(PathBuf),
     /// The agent has no TUI; the error is answered at launch instead.
     None(String),
-    /// The Agent SDK's bundled `claude`, resolved inside the sidecar's
-    /// `node_modules` at startup. A session whose sidecar lacks it still
-    /// runs headless; the error is answered at launch instead.
+    /// The native `claude` CLI binary resolved from `[claude].claude_path` or
+    /// `PATH` at startup. A session whose host lacks it still runs headless;
+    /// the error is answered at launch instead.
     Claude(Result<PathBuf, TuiError>),
 }
 
@@ -172,9 +176,9 @@ impl HarnessTui {
     /// Builds the launch description from the daemon's configuration.
     ///
     /// The driver the session runs decides which configuration speaks:
-    /// for Claude Code the SDK's bundled `claude` binary under the
-    /// sidecar's `node_modules`, for ACP the `[acp.tui]` table — which an
-    /// agent without a TUI simply does not have, and says so at launch.
+    /// for Claude Code the native `claude` binary, for ACP the `[acp.tui]`
+    /// table — which an agent without a TUI simply does not have, and says
+    /// so at launch.
     pub async fn resolve(config: &DaemonConfig, agent: Option<AgentUser>) -> Self {
         match config.harness {
             DriverKind::ClaudeCode => Self::claude(config, agent).await,
@@ -187,8 +191,7 @@ impl HarnessTui {
     /// # Errors
     ///
     /// Returns [`TuiError`] when the program itself could not be resolved —
-    /// the claude binary missing from the sidecar tree, or an agent with
-    /// no TUI at all.
+    /// a missing `claude` binary, or an agent with no TUI at all.
     pub async fn command(&self, resume: bool) -> Result<CommandBuilder, TuiError> {
         let program = match &self.program {
             Program::Bin(bin) => bin.clone(),
@@ -213,12 +216,11 @@ impl HarnessTui {
         Ok(command)
     }
 
-    /// The Claude Code TUI: the SDK's platform binary, the session's
+    /// The Claude Code TUI: the native `claude` binary, the session's
     /// isolated config tree and credential, and the session's model and
     /// permission mode as flags.
     async fn claude(config: &DaemonConfig, agent: Option<AgentUser>) -> Self {
         let claude = config.claude();
-        let sidecar = config.sidecar();
 
         let mut env: Vec<(OsString, OsString)> = Vec::new();
         if let Some(isolation) = claude.auth.isolation() {
@@ -250,8 +252,7 @@ impl HarnessTui {
             args.push("--model".into());
             args.push(model.into());
         }
-        // The SDK's camelCase spelling is the CLI's own spelling for the
-        // flag — both name the same vocabulary.
+        // The camelCase spelling matches Claude CLI's `--permission-mode`.
         let mode = serde_json::to_value(claude.permission_mode)
             .expect("a permission mode serializes")
             .as_str()
@@ -273,7 +274,7 @@ impl HarnessTui {
         }
 
         Self {
-            program: Program::Claude(find_sdk_claude(&sidecar.dir).await),
+            program: Program::Claude(resolve_claude_binary(claude.claude_path.as_deref()).await),
             args,
             resume_args,
             env,
@@ -353,31 +354,21 @@ impl HarnessTui {
     }
 }
 
-/// The `claude` binary the Agent SDK bundles for this platform.
-///
-/// The SDK ships one package per platform — `claude-agent-sdk-linux-x64`
-/// and its siblings — each holding the binary as `claude`. Whichever one
-/// `bun install` resolved for this machine is the only one present, so the
-/// glob answers with the single match.
-async fn find_sdk_claude(sidecar_dir: &Path) -> Result<PathBuf, TuiError> {
-    let packages = sidecar_dir.join("node_modules/@anthropic-ai");
-    let mut entries = match tokio::fs::read_dir(&packages).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TuiError::ClaudeMissing(packages));
+/// Resolves the native `claude` CLI binary from `[claude].claude_path` or `PATH`.
+async fn resolve_claude_binary(configured: Option<&Path>) -> Result<PathBuf, TuiError> {
+    if let Some(path) = configured {
+        if matches!(tokio::fs::metadata(path).await, Ok(meta) if meta.is_file()) {
+            return Ok(path.to_path_buf());
         }
-        Err(_) => return Err(TuiError::ClaudeUnreadable(packages)),
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("claude-agent-sdk-") {
-            continue;
-        }
-        let binary = entry.path().join("claude");
-        if matches!(tokio::fs::metadata(&binary).await, Ok(meta) if meta.is_file()) {
-            return Ok(binary);
+        return Err(TuiError::ClaudeMissing(path.to_path_buf()));
+    }
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            let candidate = dir.join("claude");
+            if matches!(tokio::fs::metadata(&candidate).await, Ok(meta) if meta.is_file()) {
+                return Ok(candidate);
+            }
         }
     }
-    Err(TuiError::ClaudeMissing(packages))
+    Err(TuiError::ClaudeMissing(PathBuf::from("claude")))
 }

@@ -406,31 +406,46 @@ impl Server<'_> {
     /// As ACP spells it in a session-lifecycle request.
     fn acp(self, name: &str) -> aither_acp::McpServer {
         match self {
-            Self::Flyco(flyco) => aither_acp::McpServerStdio::new(name, flyco.program())
-                .args(flyco.args.clone())
-                .into(),
+            Self::Flyco(flyco) => {
+                aither_acp::McpServer::Stdio(aither_acp::domain::McpServerStdio {
+                    name: name.to_owned(),
+                    command: flyco.program(),
+                    args: flyco.args.clone(),
+                    env: Vec::new(),
+                    meta: None,
+                    extra: BTreeMap::new(),
+                })
+            }
             Self::Registered(McpServerConfig::Stdio { command, args, env }) => {
-                aither_acp::McpServerStdio::new(name, command)
-                    .args(args.clone())
-                    .env(
-                        env.iter()
-                            .map(|entry| aither_acp::EnvVar {
-                                name: entry.key.clone(),
-                                value: entry.value.clone(),
-                            })
-                            .collect(),
-                    )
-                    .into()
+                aither_acp::McpServer::Stdio(aither_acp::domain::McpServerStdio {
+                    name: name.to_owned(),
+                    command: command.clone(),
+                    args: args.clone(),
+                    env: env
+                        .iter()
+                        .map(|entry| aither_acp::domain::EnvVar {
+                            name: entry.key.clone(),
+                            value: entry.value.clone(),
+                        })
+                        .collect(),
+                    meta: None,
+                    extra: BTreeMap::new(),
+                })
             }
             Self::Registered(McpServerConfig::Http { url, headers }) => {
-                aither_acp::McpServerHttp::new(name, url)
-                    .headers(
-                        headers
-                            .iter()
-                            .map(|header| aither_acp::HttpHeader::new(&header.name, &header.value))
-                            .collect(),
-                    )
-                    .into()
+                aither_acp::McpServer::Http(aither_acp::domain::McpServerHttp {
+                    name: name.to_owned(),
+                    url: url.clone(),
+                    headers: headers
+                        .iter()
+                        .map(|header| aither_acp::domain::HttpHeader {
+                            name: header.name.clone(),
+                            value: header.value.clone(),
+                        })
+                        .collect(),
+                    meta: None,
+                    extra: BTreeMap::new(),
+                })
             }
         }
     }
@@ -491,25 +506,10 @@ impl Server<'_> {
     }
 }
 
-/// One MCP server, in Claude Code's own vocabulary.
+/// One MCP server, in Claude Code's `managed-mcp.json` vocabulary.
 ///
-/// Every field is written even when it is empty, which makes the rendered
-/// documents a little longer and the contract exact: the SDK's own types
-/// distinguish "absent" from "present and empty" under
-/// `exactOptionalPropertyTypes`, and a protocol whose optionality had to be
-/// reconstructed on the far side is a protocol with two spellings for one
-/// server.
-///
-/// This is the SDK's `McpServerConfig` verbatim — `camelCase` fields and
-/// all — rather than a flycod-shaped restatement of it, which is why it is
-/// the one place the flycod⇄sidecar protocol does not spell a field
-/// `snake_case`. The reason is the same one that makes
-/// [`SidecarEvent::SdkMessage`] opaque: this value is not flycod's to
-/// interpret, it is Claude Code's, and one document travels from here into
-/// `managed-mcp.json` and through the sidecar into `Options.mcpServers`
-/// without either end restating it.
-///
-/// [`SidecarEvent::SdkMessage`]: crate::harness::claude::protocol::SidecarEvent::SdkMessage
+/// Every field is written even when empty so the rendered managed-policy
+/// document matches Claude Code's exact schema (`camelCase` fields).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeMcpServer {
@@ -579,8 +579,6 @@ impl ManagedPermissions {
                 "Write(//var/lib/flyco/codex/**)",
                 "Edit(//var/lib/flyco/devin-config/**)",
                 "Write(//var/lib/flyco/devin-config/**)",
-                "Edit(//var/lib/flyco/sidecar/**)",
-                "Write(//var/lib/flyco/sidecar/**)",
             ],
         }
     }
@@ -844,6 +842,14 @@ mod tests {
         );
     }
 
+    fn acp_name(server: &aither_acp::McpServer) -> &str {
+        match server {
+            aither_acp::McpServer::Stdio(stdio) => &stdio.name,
+            aither_acp::McpServer::Http(http) => &http.name,
+            aither_acp::McpServer::Custom(_, _) | aither_acp::McpServer::Unknown(_, _) => "",
+        }
+    }
+
     #[test]
     fn the_sdk_option_and_the_managed_file_name_one_set() {
         // Two renderings of one structure; if they could disagree, a
@@ -854,7 +860,7 @@ mod tests {
         let acp: Vec<String> = mount
             .acp_servers()
             .iter()
-            .map(|server| server.name().to_owned())
+            .map(|server| acp_name(server).to_owned())
             .collect();
         assert_eq!(sdk, ["deepwiki", "flyco", "git"]);
         assert_eq!(sdk, acp);
@@ -1000,7 +1006,7 @@ mod tests {
         let acp_names: Vec<String> = mount
             .acp_servers()
             .iter()
-            .map(|server| server.name().to_owned())
+            .map(|server| acp_name(server).to_owned())
             .collect();
         assert_eq!(acp_names, ["deepwiki", "flyco", "git"]);
     }

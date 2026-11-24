@@ -160,11 +160,28 @@ next_subid() {
 
 # ── The session image ──
 
+# Pinned session-runtime tool versions and SHA-256 digests.
+# Pinning versions and verifying hardcoded digests avoids per-boot unauthenticated
+# GitHub API lookups and guarantees reproducible VM and container builds.
+bun_version=1.3.4
+bun_sha256_x64=33c6996049e8d37e8b815959b14b05e5b6f496121352bf11bae7d047193c28bf
+bun_sha256_aarch64=c46e841fed85347521915b1b3904d6d175d8e2fd915e18e01c111318219115a4
+
+claude_version=2.1.331
+claude_dist_base=https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases
+claude_sha256_x64=4c00839cf46beb2b38ec310105f2d538f7f9321fe46c636299b74bcab94626b1
+claude_sha256_arm64=3e5afea76cf6ed53f42076d8b175c4ee3d9ab34cd9b90452da115d21ad0d5d31
+
+codex_version=rust-v0.172.0
+codex_sha256_x64=a2342a8f7f68f088be30620ccfe9cb84162c93a6b56177855961cda3ed6be392
+codex_sha256_aarch64=0b99526c185a4425fe96a2214fb7b6a6a7f7c1471883b7afbebe97e15e83e79e
+
 # Everything a session runs on, whether the machine is a VM or a container:
 # the packages, the runtime user, the directories the daemon writes, bun for
-# the Claude Code sidecar, codex, and the shell the terminal opens. The two
-# callers differ only in where `flycod` comes from and whether there is a
-# systemd to hand it to, so this is the one list and they add their own line.
+# MCP server aliases (`bunx`/`npx`/`node`), native `claude`, `codex`, `devin`,
+# and the shell the terminal opens. The two callers differ only in where
+# `flycod` comes from and whether there is a systemd to hand it to, so this is
+# the one list and they add their own line.
 install_session_runtime() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
@@ -187,57 +204,60 @@ install_session_runtime() {
   #   MCP broker and desktop IPC sockets; agent connects.
   # - Agent workspace and writable harness state (`flyco:flyco`).
   install -d -o root -g root -m 0700 /etc/flycod /var/lib/flyco/transcripts /var/lib/flyco/daemon-home
-  install -d -o root -g root -m 0755 /var/lib/flyco /var/lib/flyco/sidecar /var/lib/flyco/codex /var/lib/flyco/devin-config /etc/claude-code
+  install -d -o root -g root -m 0755 /var/lib/flyco /var/lib/flyco/codex /var/lib/flyco/devin-config /etc/claude-code
   install -d -o root -g "$runtime_group" -m 0750 /var/lib/flyco/run
   install -d -o "$runtime_user" -g "$runtime_group" -m 0755 /srv/flyco/work
   install -d -o "$runtime_user" -g "$runtime_group" -m 0750 /var/lib/flyco/claude /var/lib/flyco/devin
 
-  download https://github.com/oven-sh/bun/releases/latest/download/SHASUMS256.txt "$scratch/bun-sha256"
+  # Bun, kept for `bunx`/`npx`/`node` MCP server registrations.
   case "$artifact" in
-    flycod-linux-x86_64) bun_archive=bun-linux-x64.zip ;;
-    flycod-linux-aarch64) bun_archive=bun-linux-aarch64.zip ;;
+    flycod-linux-x86_64)
+      bun_archive=bun-linux-x64.zip
+      expected_bun_hash=$bun_sha256_x64
+      ;;
+    flycod-linux-aarch64)
+      bun_archive=bun-linux-aarch64.zip
+      expected_bun_hash=$bun_sha256_aarch64
+      ;;
   esac
-  download "https://github.com/oven-sh/bun/releases/latest/download/$bun_archive" "$scratch/$bun_archive"
-  expected_bun_hash=$(awk -v archive="$bun_archive" '$2 == archive { print $1 }' "$scratch/bun-sha256")
-  if [ -z "$expected_bun_hash" ]; then
-    echo "Bun release did not publish a checksum for $bun_archive" >&2
-    exit 1
-  fi
+  download "https://github.com/oven-sh/bun/releases/download/bun-v$bun_version/$bun_archive" "$scratch/$bun_archive"
   printf '%s  %s\n' "$expected_bun_hash" "$scratch/$bun_archive" | sha256sum --check -
   unzip -q "$scratch/$bun_archive" -d "$scratch/bun"
   install -d -o "$runtime_user" -g "$runtime_group" /home/flyco/.bun/bin
   install -m 0755 "$scratch/bun"/*/bun /home/flyco/.bun/bin/bun
   chown -R "$runtime_user:$runtime_group" /home/flyco/.bun
 
-  # Codex, straight from the release `npm install @openai/codex` resolves
-  # to: the npm package's own bin is a Node launcher that execs this same
-  # vendored binary, so installing the binary directly skips Node and npm
-  # entirely — several hundred megabytes of runtime nothing else used.
-  # `digest` in the release API is GitHub's own sha256 of the asset, the
-  # same verification `codex-package_SHA256SUMS` gives the bundle tarballs.
+  # Native Claude Code CLI, driven directly in-process by `flycod` via `claude-acp`.
   case "$artifact" in
-    flycod-linux-x86_64) codex_target=x86_64-unknown-linux-musl ;;
-    flycod-linux-aarch64) codex_target=aarch64-unknown-linux-musl ;;
+    flycod-linux-x86_64)
+      claude_platform=linux-x64
+      expected_claude_hash=$claude_sha256_x64
+      ;;
+    flycod-linux-aarch64)
+      claude_platform=linux-arm64
+      expected_claude_hash=$claude_sha256_arm64
+      ;;
   esac
-  download https://api.github.com/repos/openai/codex/releases/latest "$scratch/codex-release.json"
-  codex_meta=$(CODEX_RELEASE_JSON="$scratch/codex-release.json" CODEX_ASSET="codex-$codex_target.tar.gz" "$runtime_home/.bun/bin/bun" -e '
-const release = JSON.parse(require("fs").readFileSync(process.env.CODEX_RELEASE_JSON, "utf8"));
-const asset = (release.assets ?? []).find((a) => a.name === process.env.CODEX_ASSET);
-if (!asset || !asset.digest?.startsWith("sha256:")) process.exit(1);
-console.log(asset.browser_download_url, asset.digest.slice(7));
-')
-  read codex_url codex_sha256 <<EOF
-$codex_meta
-EOF
-  download "$codex_url" "$scratch/codex.tar.gz"
-  printf '%s  %s\n' "$codex_sha256" "$scratch/codex.tar.gz" | sha256sum --check -
+  download "$claude_dist_base/$claude_version/$claude_platform/claude" "$scratch/claude"
+  printf '%s  %s\n' "$expected_claude_hash" "$scratch/claude" | sha256sum --check -
+  install -m 0755 "$scratch/claude" "$install_root/claude"
+
+  # Native Codex CLI, driven directly in-process by `flycod` via `codex-acp`
+  # over `codex app-server` (no external Node/Bun ACP adapter package).
+  case "$artifact" in
+    flycod-linux-x86_64)
+      codex_target=x86_64-unknown-linux-musl
+      expected_codex_hash=$codex_sha256_x64
+      ;;
+    flycod-linux-aarch64)
+      codex_target=aarch64-unknown-linux-musl
+      expected_codex_hash=$codex_sha256_aarch64
+      ;;
+  esac
+  download "https://github.com/openai/codex/releases/download/$codex_version/codex-$codex_target.tar.gz" "$scratch/codex.tar.gz"
+  printf '%s  %s\n' "$expected_codex_hash" "$scratch/codex.tar.gz" | sha256sum --check -
   tar xzf "$scratch/codex.tar.gz" -C "$scratch"
   install -m 0755 "$scratch/codex-$codex_target" "$install_root/codex"
-
-  # Codex is driven over ACP: the adapter is a bun-installed package the
-  # runtime user owns, and it finds the binary installed above through
-  # CODEX_PATH. Global bun installs land on the image's PATH.
-  runuser -u "$runtime_user" -- env HOME=/home/flyco "$runtime_home/.bun/bin/bun" install -g @agentclientprotocol/codex-acp
 
   # Devin, from the manifest its own installer reads: the bundle is a
   # tarball carrying bin/devin, and the manifest carries its sha256.
@@ -268,19 +288,15 @@ EOF
   printf '#!/bin/sh\ncase "${1-}" in -y|--yes) shift ;; esac\nexec %s "$@"\n' "$install_root/bunx" >"$install_root/npx"
   printf '#!/bin/sh\nexec %s "$@"\n' "$runtime_home/.bun/bin/bun" >"$install_root/node"
   chmod 0755 "$install_root/npx" "$install_root/node"
-
-  download https://raw.githubusercontent.com/oh-my-fish/oh-my-fish/master/bin/install "$scratch/omf-install"
-  chown "$runtime_user:$runtime_group" "$scratch/omf-install"
-  runuser -u "$runtime_user" -- env HOME=/home/flyco fish "$scratch/omf-install" --noninteractive --yes
 }
 
 verify_session_runtime() {
   "$install_root/flycod" --version
   command -v fish >/dev/null
   runuser -u "$runtime_user" -- env HOME=/home/flyco /home/flyco/.bun/bin/bun --version
-  runuser -u "$runtime_user" -- env HOME=/home/flyco codex --version
-  runuser -u "$runtime_user" -- env HOME=/home/flyco PATH="$runtime_home/.bun/bin:/usr/local/bin:/usr/bin:/bin" codex-acp --version
-  runuser -u "$runtime_user" -- env HOME=/home/flyco devin --version
+  runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/claude" --version
+  runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/codex" --version
+  runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/devin" --version
 }
 
 install_session() {
