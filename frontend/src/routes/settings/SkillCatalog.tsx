@@ -13,7 +13,7 @@
  * empty: the control plane reads one on a queue, and "still being read"
  * and "offers nothing" are different answers.
  */
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js";
 import { A, useNavigate } from "@solidjs/router";
 import { ArrowLeft, Plus, Trash2 } from "lucide-solid";
 import SearchField from "../../components/SearchField";
@@ -21,6 +21,8 @@ import ProblemNotice from "../../components/ProblemNotice";
 import Skeleton from "../../components/Skeleton";
 import { createQuery } from "../../lib/query";
 import { cx } from "../../lib/cx";
+import { isDefinitiveFailure } from "../../api/events";
+import { ApiProblem } from "../../api/problem";
 import {
   addMarketplace,
   deleteMarketplace,
@@ -85,22 +87,61 @@ function PickPage() {
   }
 
   // A pending marketplace is work already running on the control plane's
-  // queue; the page follows it by itself rather than handing the user a
-  // button to press, which is a button whose only effect is load.
+  // queue; track a boolean memo so responses still containing `pending` do
+  // not reset the 2-minute deadline.
+  const hasPending = createMemo(() => (catalog()?.pending ?? []).length > 0);
   createEffect(() => {
-    if ((catalog()?.pending ?? []).length === 0) {
+    if (!hasPending()) {
       return;
     }
+    setGaveUp(false);
     const until = Date.now() + PENDING_DEADLINE_MS;
-    const timer = setInterval(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let active = true;
+
+    const schedule = (): void => {
+      if (!active) {
+        return;
+      }
+      const err = untrack(() => catalog.error);
+      if (isDefinitiveFailure(err)) {
+        return;
+      }
       if (Date.now() >= until) {
-        clearInterval(timer);
         setGaveUp(true);
         return;
       }
-      void refetch();
-    }, PENDING_POLL_MS);
-    onCleanup(() => clearInterval(timer));
+      const retryMs = err instanceof ApiProblem ? (err.retryAfterMs ?? 0) : 0;
+      const delay = Math.max(PENDING_POLL_MS, retryMs);
+      timer = setTimeout(() => {
+        timer = undefined;
+        if (!active) {
+          return;
+        }
+        if (Date.now() >= until) {
+          setGaveUp(true);
+          return;
+        }
+        void Promise.resolve(refetch()).finally(() => {
+          if (!active) {
+            return;
+          }
+          if (Date.now() >= until) {
+            setGaveUp(true);
+            return;
+          }
+          schedule();
+        });
+      }, delay);
+    };
+
+    schedule();
+    onCleanup(() => {
+      active = false;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    });
   });
 
   const matches = createMemo(() => {
@@ -148,7 +189,13 @@ function PickPage() {
 
       <ProblemNotice
         error={catalog.error ?? failure()}
-        action={{ label: "Retry", onClick: () => void refetch() }}
+        action={{
+          label: "Retry",
+          onClick: () => {
+            setGaveUp(false);
+            void refetch();
+          },
+        }}
       />
 
       <For each={catalog()?.failed ?? []}>

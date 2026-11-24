@@ -13,7 +13,7 @@
  * renaming a session is a one-word change and a dialog would be three
  * clicks around it. Escape abandons the edit; Enter and blur commit it.
  */
-import { For, Show, createMemo, createSignal } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
 import {
   Archive,
   Coffee,
@@ -452,9 +452,20 @@ function ReposChip(props: {
 }) {
   const [adding, setAdding] = createSignal(false);
   const [query, setQuery] = createSignal("");
+  const [debouncedQuery, setDebouncedQuery] = createSignal("");
   const [pickedBranch, setPickedBranch] = createSignal<Record<string, string | undefined>>({});
+
+  createEffect(() => {
+    const next = query();
+    if (next === debouncedQuery()) {
+      return;
+    }
+    const timer = setTimeout(() => setDebouncedQuery(next), 250);
+    onCleanup(() => clearTimeout(timer));
+  });
+
   const [results] = createQuery(
-    () => (adding() ? query() : undefined),
+    () => (adding() ? debouncedQuery() : undefined),
     (needle: string) => listRepos(needle),
   );
 

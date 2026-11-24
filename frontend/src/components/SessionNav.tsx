@@ -15,14 +15,115 @@
  * for a reply, because after a day's work that is every session there is.
  * A rail of forty coloured dots is a rail that says nothing.
  */
-import { For, Show, createMemo, createSignal, onCleanup } from "solid-js";
+import {
+  For,
+  Show,
+  createContext,
+  createEffect,
+  createMemo,
+  createSignal,
+  onCleanup,
+  untrack,
+  useContext,
+  type JSX,
+} from "solid-js";
 import { A, useMatch } from "@solidjs/router";
-import { createQuery } from "../lib/query";
+import { createQuery, type Query } from "../lib/query";
 import { listSessions, type SessionSummary } from "../api/client";
 import { cx } from "../lib/cx";
 import Skeleton from "./Skeleton";
 import { deriveStatus, isArchived, type StatusView } from "../lib/status";
 import styles from "./SessionNav.module.css";
+
+export interface SessionsStore {
+  sessions: Query<SessionSummary[]>;
+  refresh: () => Promise<SessionSummary[] | null | undefined>;
+  syncSession: (summary: SessionSummary) => void;
+}
+
+const SessionsContext = createContext<SessionsStore>();
+
+function mergeSessionList(
+  prev: SessionSummary[] | undefined,
+  updates: ReadonlyMap<string, SessionSummary>,
+): SessionSummary[] {
+  const base = prev ? [...prev] : [];
+  for (const next of updates.values()) {
+    const idx = base.findIndex((item) => item.id === next.id);
+    if (idx === -1) {
+      base.unshift(next);
+    } else {
+      base[idx] = { ...base[idx], ...next };
+    }
+  }
+  return base;
+}
+
+/**
+ * Shared session list owned by the app shell so `SessionNav`, `Home`, and
+ * `SessionDetail` read one query and stay in sync on create/rename/archive/state changes.
+ */
+export function SessionsProvider(props: {
+  enabled: () => boolean;
+  children: JSX.Element;
+}) {
+  const when = () => (props.enabled() ? true : undefined);
+  const [sessions, { refetch, mutate }] = createQuery(when, listSessions);
+  const pendingUpdates = new Map<string, SessionSummary>();
+
+  createEffect(() => {
+    const current = sessions();
+    if (current === undefined || pendingUpdates.size === 0) {
+      return;
+    }
+    const merged = mergeSessionList(current, pendingUpdates);
+    pendingUpdates.clear();
+    mutate(merged);
+  });
+
+  function syncSession(summary: SessionSummary): void {
+    untrack(() => {
+      if (sessions() === undefined) {
+        pendingUpdates.set(summary.id, summary);
+        return;
+      }
+      mutate((prev) => mergeSessionList(prev, new Map([[summary.id, summary]])));
+    });
+  }
+
+  return (
+    <SessionsContext.Provider
+      value={{
+        sessions,
+        refresh: async () => refetch(),
+        syncSession,
+      }}
+    >
+      {props.children}
+    </SessionsContext.Provider>
+  );
+}
+
+/**
+ * Reads the shared sessions store, falling back to an isolated query when a
+ * component is rendered outside `<SessionsProvider>` (e.g. standalone unit tests).
+ */
+export function useSessions(): SessionsStore {
+  const shared = useContext(SessionsContext);
+  if (shared !== undefined) {
+    return shared;
+  }
+  const [sessions, { refetch, mutate }] = createQuery(listSessions);
+  return {
+    sessions,
+    refresh: async () => refetch(),
+    syncSession(summary: SessionSummary) {
+      untrack(() => {
+        mutate((prev) => mergeSessionList(prev, new Map([[summary.id, summary]])));
+      });
+    },
+  };
+}
 
 /**
  * How often the rail re-reads the clock.
@@ -77,7 +178,7 @@ export interface SessionNavProps {
 }
 
 export default function SessionNav(props: SessionNavProps) {
-  const [sessions] = createQuery(listSessions);
+  const { sessions } = useSessions();
   const [query, setQuery] = createSignal("");
   const [showArchived, setShowArchived] = createSignal(false);
   const current = useMatch(() => "/sessions/:id");

@@ -127,4 +127,31 @@ describe("MemoryOutliner", () => {
       true,
     );
   });
+
+  it("ignores concurrent mutation clicks while busy", async () => {
+    let resolveDelete!: (res: Response) => void;
+    const base = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "DELETE") {
+        calls.push({ method, url: String(input), body: null });
+        return new Promise<Response>((resolve) => {
+          resolveDelete = resolve;
+        });
+      }
+      return base(input, init);
+    });
+
+    const view = render(() => <MemoryOutliner />);
+    await view.findByText("Rust");
+
+    const del = view.getByRole("button", { name: "Delete Rust" });
+    fireEvent.click(del);
+    fireEvent.click(del);
+    expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(1);
+    expect(del).toBeDisabled();
+
+    resolveDelete(new Response(null, { status: 204 }));
+    await waitFor(() => expect(view.queryByText("Rust")).toBeNull());
+  });
 });

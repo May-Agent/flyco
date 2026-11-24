@@ -20,7 +20,7 @@
  * frame of its own would make one machine look like a different kind of
  * thing from the account beside it.
  */
-import { Show, createEffect, createSignal, onCleanup, type JSX } from "solid-js";
+import { Show, createEffect, createMemo, createSignal, onCleanup, untrack, type JSX } from "solid-js";
 import { createQuery } from "../lib/query";
 import { A } from "@solidjs/router";
 import { Server } from "lucide-solid";
@@ -35,10 +35,12 @@ import {
   type MachineCatalogEntry,
   type ProviderAccountView,
 } from "../api/client";
+import { isBudgetExhausted } from "../api/events";
 import { ApiProblem } from "../api/problem";
 import { formatDate } from "../lib/dates";
 import { inUseRefusal, sessionsStillRunning, type InUseRefusal } from "../lib/inUse";
 import {
+  CATALOG_POLL_DEADLINE_MS,
   CATALOG_POLL_SECONDS,
   catalogNotReady,
   hourlyLabel,
@@ -176,14 +178,66 @@ export default function ComputeCard(props: ComputeCardProps) {
    * lands seconds later, so the cell says so and asks again rather than
    * showing a skeleton that never resolves.
    */
-  const reading = () => catalogNotReady(machine.error);
+  const reading = createMemo<boolean>(
+    (prev) => (machine.loading ? (prev ?? false) : catalogNotReady(machine.error)),
+    false,
+  );
+  const [timedOut, setTimedOut] = createSignal(false);
+  const [retryNonce, setRetryNonce] = createSignal(0);
 
   createEffect(() => {
+    retryNonce();
     if (!reading()) {
       return;
     }
-    const timer = setInterval(() => void reask(), CATALOG_POLL_SECONDS * 1000);
-    onCleanup(() => clearInterval(timer));
+    setTimedOut(false);
+    const until = Date.now() + CATALOG_POLL_DEADLINE_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let active = true;
+
+    const schedule = (): void => {
+      if (!active) {
+        return;
+      }
+      const err = untrack(() => machine.error);
+      if (isBudgetExhausted(err)) {
+        return;
+      }
+      if (Date.now() >= until) {
+        setTimedOut(true);
+        return;
+      }
+      const retryAfterMs = err instanceof ApiProblem ? (err.retryAfterMs ?? 0) : 0;
+      const delay = Math.max(CATALOG_POLL_SECONDS * 1000, retryAfterMs);
+      timer = setTimeout(() => {
+        timer = undefined;
+        if (!active) {
+          return;
+        }
+        if (Date.now() >= until) {
+          setTimedOut(true);
+          return;
+        }
+        void Promise.resolve(reask()).finally(() => {
+          if (!active) {
+            return;
+          }
+          if (Date.now() >= until) {
+            setTimedOut(true);
+            return;
+          }
+          schedule();
+        });
+      }, delay);
+    };
+
+    schedule();
+    onCleanup(() => {
+      active = false;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    });
   });
 
   const mark = () => PROVIDER_MARK[props.account.kind];
@@ -202,10 +256,10 @@ export default function ComputeCard(props: ComputeCardProps) {
       }
       title={props.account.label}
       meta={
-        <>
-          {PROVIDER_LABEL[props.account.kind]} · linked{" "}
-          {formatDate(props.account.linked_at_unix)}
-        </>
+        <span class={styles.factInline}>
+          <span>{PROVIDER_LABEL[props.account.kind]}</span>
+          <span>Linked {formatDate(props.account.linked_at_unix)}</span>
+        </span>
       }
       actions={
         // Nothing else while the question is up: the dialog under the card
@@ -268,11 +322,33 @@ export default function ComputeCard(props: ComputeCardProps) {
           other way round would take the card down and leave the cell blank.
         */}
         <Show
-          when={machine.error === undefined}
+          when={machine.error === undefined && !reading()}
           fallback={
-            <span class={styles.absent}>
-              {machineAbsence(machine.error, props.account.kind)}
-            </span>
+            <Show
+              when={timedOut()}
+              fallback={
+                <span class={styles.absent}>
+                  {reading()
+                    ? readingMachines([props.account.kind])
+                    : machineAbsence(machine.error, props.account.kind)}
+                </span>
+              }
+            >
+              <span class={styles.factInline}>
+                <span class={styles.absent}>Timed out reading machines.</span>
+                <button
+                  type="button"
+                  class={styles.action}
+                  onClick={() => {
+                    setTimedOut(false);
+                    setRetryNonce((n) => n + 1);
+                    void reask();
+                  }}
+                >
+                  Retry
+                </button>
+              </span>
+            </Show>
           }
         >
           <Show
@@ -280,15 +356,11 @@ export default function ComputeCard(props: ComputeCardProps) {
             fallback={<span class={styles.skeleton} aria-label="Reading the catalog" />}
           >
             {(chosen) => (
-              <>
-                {chosen().entry.machine_type}
-                <span class={styles.dim}>
-                  {" · "}
-                  {chosen().entry.region}
-                  {" · "}
-                  {hourlyLabel(chosen().entry, props.spot)}
-                </span>
-              </>
+              <span class={styles.factInline}>
+                <span>{chosen().entry.machine_type}</span>
+                <span class={styles.dim}>{chosen().entry.region}</span>
+                <span class={styles.dim}>{hourlyLabel(chosen().entry, props.spot)}</span>
+              </span>
             )}
           </Show>
         </Show>
@@ -318,9 +390,6 @@ export default function ComputeCard(props: ComputeCardProps) {
               checked={props.spot}
               onChange={props.onSpot}
             />
-            <span class={styles.dim}>
-              {props.spot ? "Cheaper; flyco handles eviction" : "Uninterruptible, and dearer"}
-            </span>
           </span>
         </Fact>
       </Show>
@@ -339,21 +408,18 @@ export default function ComputeCard(props: ComputeCardProps) {
                fact from one flyco cannot meter: the meter is running, it
                has just read nothing so far. */
             fallback={
-              <span class={styles.absent}>
-                No metered spend yet this period.
+              <span class={styles.factInline}>
+                <span class={styles.absent}>No metered spend yet this period.</span>
                 <CreditLeft usage={props.usage} />
               </span>
             }
           >
             {(row) => (
-              <>
+              <span class={styles.factInline}>
                 <strong>{formatUsd(row().spent)}</strong>
-                <span class={styles.dim}>
-                  {" since "}
-                  {formatDate(row().period_start_unix)}
-                  <CreditLeft usage={row()} />
-                </span>
-              </>
+                <span class={styles.dim}>since {formatDate(row().period_start_unix)}</span>
+                <CreditLeft usage={row()} />
+              </span>
             )}
           </Show>
         </Show>
@@ -380,13 +446,11 @@ function metered(usage: CloudUsageRow | undefined): CloudUsageRow | undefined {
   return usage !== undefined && usage.spent > 0 ? usage : undefined;
 }
 
-/** `· $80.00 credit left`, on whichever spend line has a credit to report. */
 function CreditLeft(props: { usage: CloudUsageRow | undefined }) {
   const credit = () => props.usage?.remaining_credit ?? null;
   return (
     <Show when={credit() !== null}>
-      {" · "}
-      {formatUsd(credit() ?? 0)} credit left
+      <span class={styles.dim}>{formatUsd(credit() ?? 0)} credit left</span>
     </Show>
   );
 }
@@ -400,12 +464,7 @@ function CreditLeft(props: { usage: CloudUsageRow | undefined }) {
  * that stands in for it before the host's facts arrive say the same words.
  */
 export function YourHardware() {
-  return (
-    <>
-      <strong>your hardware</strong>
-      <span class={styles.dim}> · a session here spends no budget</span>
-    </>
-  );
+  return <strong>your hardware</strong>;
 }
 
 /**

@@ -23,7 +23,10 @@ export const CHATGPT_SECURITY_SETTINGS_URL = "https://chatgpt.com/#settings/Secu
  * OpenAI states an interval and flyco obeys it, but a value it never sent —
  * or sent as zero — must not turn the card into a request loop.
  */
-export const MIN_POLL_INTERVAL_SECONDS = 1;
+export const MIN_POLL_INTERVAL_SECONDS = 2;
+
+/** Maximum client-side wait for a device code before giving up (15 minutes). */
+export const CODEX_POLL_DEADLINE_MS = 15 * 60 * 1000;
 
 /** What `POST .../codex/oauth/start` handed the card to show. */
 export interface CodexAttempt {
@@ -136,7 +139,11 @@ export function pollDelayMs(state: CodexSignIn): number | null {
   if (state.step !== "waiting") {
     return null;
   }
-  const seconds = Math.max(state.attempt.intervalSeconds, MIN_POLL_INTERVAL_SECONDS);
+  const raw = state.attempt.intervalSeconds;
+  const seconds =
+    Number.isFinite(raw) && raw >= MIN_POLL_INTERVAL_SECONDS
+      ? raw
+      : MIN_POLL_INTERVAL_SECONDS;
   return seconds * 1000;
 }
 

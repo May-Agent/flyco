@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CHATGPT_SECURITY_SETTINGS_URL,
+  CODEX_POLL_DEADLINE_MS,
   IDLE,
   MIN_POLL_INTERVAL_SECONDS,
   type CodexAttempt,
@@ -91,11 +92,15 @@ describe("pollDelayMs", () => {
   });
 
   it("never polls faster than the floor, whatever the server said", () => {
-    const impatient = nextSignIn(IDLE, {
-      kind: "started",
-      attempt: { ...ATTEMPT, intervalSeconds: 0 },
-    });
-    expect(pollDelayMs(impatient)).toBe(MIN_POLL_INTERVAL_SECONDS * 1000);
+    expect(MIN_POLL_INTERVAL_SECONDS).toBeGreaterThanOrEqual(2);
+    expect(CODEX_POLL_DEADLINE_MS).toBe(15 * 60 * 1000);
+    for (const intervalSeconds of [0, -5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const impatient = nextSignIn(IDLE, {
+        kind: "started",
+        attempt: { ...ATTEMPT, intervalSeconds },
+      });
+      expect(pollDelayMs(impatient)).toBe(MIN_POLL_INTERVAL_SECONDS * 1000);
+    }
   });
 
   it("stops the timer once there is nothing left to poll", () => {

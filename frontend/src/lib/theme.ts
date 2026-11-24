@@ -16,29 +16,35 @@ function isThemePreference(value: string): value is ThemePreference {
 }
 
 /**
- * Reads the stored preference. Defaults to "system" when nothing is
- * stored; throws on a stored value that isn't one of the three valid
- * preferences, since that can only mean the storage was corrupted or
- * written by an incompatible version of this module.
+ * Reads the stored preference. Defaults to "system" when nothing is stored,
+ * storage is blocked, or the stored value isn't one of the three valid
+ * preferences.
  */
 export function readStoredThemePreference(
-  storage: Pick<Storage, "getItem"> = localStorage,
+  storage?: Pick<Storage, "getItem">,
 ): ThemePreference {
-  const raw = storage.getItem(STORAGE_KEY);
-  if (raw === null) {
+  try {
+    const target = storage ?? localStorage;
+    const raw = target.getItem(STORAGE_KEY);
+    if (raw === null || !isThemePreference(raw)) {
+      return "system";
+    }
+    return raw;
+  } catch {
     return "system";
   }
-  if (!isThemePreference(raw)) {
-    throw new Error(`Invalid theme preference in storage: ${JSON.stringify(raw)}`);
-  }
-  return raw;
 }
 
 export function storeThemePreference(
   preference: ThemePreference,
-  storage: Pick<Storage, "setItem"> = localStorage,
+  storage?: Pick<Storage, "setItem">,
 ): void {
-  storage.setItem(STORAGE_KEY, preference);
+  try {
+    const target = storage ?? localStorage;
+    target.setItem(STORAGE_KEY, preference);
+  } catch {
+    // Blocked or full storage must not crash startup or preference changes.
+  }
 }
 
 /** Applies a preference to the document by setting or clearing `data-theme`. */

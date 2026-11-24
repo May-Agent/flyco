@@ -227,6 +227,7 @@ export interface SessionComposerProps {
 export default function SessionComposer(props: SessionComposerProps) {
   const [text, setText] = createSignal("");
   const [highlighted, setHighlighted] = createSignal(0);
+  const [sending, setSending] = createSignal(false);
   /**
    * Whether Escape has closed the palette for what is currently typed.
    *
@@ -297,6 +298,32 @@ export default function SessionComposer(props: SessionComposerProps) {
     setDismissed(false);
   }
 
+  function deliver(message: string): void {
+    if (sending()) {
+      return;
+    }
+    const taken = props.onSend(message);
+    if (taken === true) {
+      clear();
+      return;
+    }
+    if (taken === false) {
+      return;
+    }
+    setSending(true);
+    void taken
+      .then((ok) => {
+        if (ok) {
+          clear();
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        setSending(false);
+        field?.focus();
+      });
+  }
+
   /**
    * Runs one row, or writes it into the field when it wants an argument.
    *
@@ -304,8 +331,8 @@ export default function SessionComposer(props: SessionComposerProps) {
    * left to ask, so choosing it is sending it, while a command without
    * its argument would be a command that means nothing.
    */
-  function choose(entry: PaletteEntry): void {
-    if (entry.disabled === true) {
+  async function choose(entry: PaletteEntry): Promise<void> {
+    if (entry.disabled === true || sending()) {
       return;
     }
     if (entry.argumentHint !== null) {
@@ -315,16 +342,33 @@ export default function SessionComposer(props: SessionComposerProps) {
       field?.focus();
       return;
     }
-    clear();
     if (entry.run === "harness") {
-      props.onSend(`/${entry.name}`);
+      const result = props.onSend(`/${entry.name}`);
+      if (result === true) {
+        clear();
+      } else if (result !== false) {
+        setSending(true);
+        try {
+          if (await result) {
+            clear();
+          }
+        } catch {
+          // Caller surfaces the failure; keep draft.
+        } finally {
+          setSending(false);
+        }
+      }
     } else {
+      clear();
       props.onCommand(entry.run);
     }
     field?.focus();
   }
 
   function send(): void {
+    if (sending()) {
+      return;
+    }
     const message = text().trim();
     if (message === "" || blockedReason() !== null) {
       return;
@@ -341,16 +385,7 @@ export default function SessionComposer(props: SessionComposerProps) {
       field?.focus();
       return;
     }
-    const taken = props.onSend(message);
-    if (taken === true) {
-      clear();
-    } else if (taken !== false) {
-      void taken.then((ok) => {
-        if (ok) {
-          clear();
-        }
-      });
-    }
+    deliver(message);
   }
 
   function onInput(value: string): void {
@@ -381,7 +416,7 @@ export default function SessionComposer(props: SessionComposerProps) {
       event.preventDefault();
       const entry = rows[highlighted()];
       if (entry !== undefined) {
-        choose(entry);
+        void choose(entry);
       }
       return true;
     }
@@ -405,6 +440,7 @@ export default function SessionComposer(props: SessionComposerProps) {
       label="Message the agent"
       controls={props.controls}
       trailing={props.trailing}
+      disabled={sending()}
       onKeyDown={onKeyDown}
       ref={(element) => {
         field = element;
@@ -439,7 +475,7 @@ export default function SessionComposer(props: SessionComposerProps) {
                       entry.disabled === true && sessionStyles.commandDisabled,
                     )}
                     onMouseEnter={() => setHighlighted(index())}
-                    onClick={() => choose(entry)}
+                    onClick={() => void choose(entry)}
                   >
                     <span class={sessionStyles.commandName}>/{entry.name}</span>
                     <Show when={entry.argumentHint}>
@@ -463,7 +499,7 @@ export default function SessionComposer(props: SessionComposerProps) {
             <button
               type="button"
               class={styles.send}
-              disabled={text().trim() === "" || blockedReason() !== null}
+              disabled={sending() || text().trim() === "" || blockedReason() !== null}
               title="Send"
               aria-label="Send"
               onClick={send}

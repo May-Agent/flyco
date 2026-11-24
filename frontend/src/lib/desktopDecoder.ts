@@ -44,6 +44,7 @@ export class DesktopDecoder {
    * cannot span the gap.
    */
   private ready = false;
+  private disposed = false;
   private nextTimestamp = 0;
   private readonly onFrame: (frame: VideoFrame) => void;
   private readonly onError: (error: unknown) => void;
@@ -63,8 +64,11 @@ export class DesktopDecoder {
 
   /** Feeds one temporal unit. Deltas before the first keyframe are dropped. */
   push(data: Uint8Array, keyframe: boolean): void {
-    if (this.decoder === null) {
-      this.start();
+    if (this.disposed) {
+      return;
+    }
+    if (this.decoder === null || this.decoder.state === "closed") {
+      this.reset();
     }
     if (!this.ready) {
       if (!keyframe) {
@@ -72,10 +76,14 @@ export class DesktopDecoder {
       }
       this.ready = true;
     }
+    const decoder = this.decoder;
+    if (decoder === null || decoder.state === "closed") {
+      return;
+    }
     const timestamp = this.nextTimestamp;
     this.nextTimestamp += TIMESTAMP_STEP_US;
     try {
-      this.decoder?.decode(
+      decoder.decode(
         new EncodedVideoChunk({
           type: keyframe ? "key" : "delta",
           timestamp,
@@ -90,19 +98,43 @@ export class DesktopDecoder {
 
   /** Parks the decoder until the next keyframe. */
   reset(): void {
+    if (this.disposed) {
+      return;
+    }
     this.ready = false;
     this.nextTimestamp = 0;
     if (this.decoder !== null && this.decoder.state !== "closed") {
       this.decoder.close();
     }
-    this.decoder = new VideoDecoder({
-      output: (frame) => this.onFrame(frame),
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        if (this.disposed) {
+          frame.close();
+          return;
+        }
+        this.onFrame(frame);
+      },
       error: (error) => {
+        if (this.disposed) {
+          return;
+        }
         this.ready = false;
+        if (this.decoder === decoder) {
+          if (decoder.state !== "closed") {
+            try {
+              decoder.close();
+            } catch {
+              // Ignore close error on an errored decoder.
+            }
+          }
+          this.decoder = null;
+        }
         this.onError(error);
+        this.reset();
       },
     });
-    this.decoder.configure({
+    this.decoder = decoder;
+    decoder.configure({
       codec: AV1_CODEC,
       optimizeForLatency: true,
     });
@@ -110,6 +142,8 @@ export class DesktopDecoder {
 
   /** Closes the decoder for good. */
   dispose(): void {
+    this.disposed = true;
+    this.ready = false;
     if (this.decoder !== null && this.decoder.state !== "closed") {
       this.decoder.close();
     }

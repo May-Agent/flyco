@@ -12,7 +12,7 @@ import {
 import type { MachineCatalogEntry, MachineView } from "../api/client";
 import {
   MACHINE_STATE_LABEL,
-  capacityParts,
+  capacityLabel,
   hourlyLabel,
   runtimeOf,
   shortMachineType,
@@ -154,7 +154,32 @@ export default function MachinePanel(props: MachinePanelProps) {
           {MACHINE_STATE_LABEL[machine().state]}
         </span>
       </div>
-      <p class={styles.where}>{whereLabel(machine(), entry())}</p>
+      <dl class={styles.facts}>
+        <div class={styles.factRow}>
+          <dt class={styles.factLabel}>Provider</dt>
+          <dd>{PROVIDER_LABEL[machine().spec.provider]}</dd>
+        </div>
+        <div class={styles.factRow}>
+          <dt class={styles.factLabel}>Region</dt>
+          <dd>{machine().region}</dd>
+        </div>
+        <Show when={machineSize(entry())}>
+          {(size) => (
+            <div class={styles.factRow}>
+              <dt class={styles.factLabel}>Size</dt>
+              <dd>{size()}</dd>
+            </div>
+          )}
+        </Show>
+        <div class={styles.factRow}>
+          <dt class={styles.factLabel}>Capacity</dt>
+          <dd>{machine().spot ? "Spot" : "On-demand"}</dd>
+        </div>
+        <div class={styles.factRow}>
+          <dt class={styles.factLabel}>Rate</dt>
+          <dd>{hourlyPrice(machine(), entry())}</dd>
+        </div>
+      </dl>
       <ProblemNotice error={error()} />
       <div class={styles.actions}>
         <Show
@@ -199,30 +224,18 @@ export default function MachinePanel(props: MachinePanelProps) {
  */
 function machineName(view: MachineView, entry: MachineCatalogEntry | undefined): string {
   if (entry !== undefined && runtimeOf(entry) === "container") {
-    return ["Container", ...capacityParts(entry)].join(" · ");
+    return "Container";
   }
   return shortMachineType(view.spec.machine_type);
 }
 
-/**
- * Where the machine runs and what it costs, on one line.
- *
- * The price is the row's own hourly once the provider has answered, and
- * the catalog's before that — a machine still being reserved has no meter
- * yet, and "no metered price" on it would be a claim about a bill that has
- * not started. A machine the user owns has no meter at all, and says so.
- */
-function whereLabel(view: MachineView, entry: MachineCatalogEntry | undefined): string {
-  const price =
-    view.hourly !== null && view.hourly !== undefined
-      ? `${formatUsd(view.hourly)}/hr`
-      : entry === undefined
-        ? "no metered price"
-        : hourlyLabel(entry, view.spot);
-  return [
-    PROVIDER_LABEL[view.spec.provider],
-    view.region,
-    view.spot ? "Spot" : "On-demand",
-    price,
-  ].join(" · ");
+function machineSize(entry: MachineCatalogEntry | undefined): string | null {
+  return entry === undefined ? null : capacityLabel(entry);
+}
+
+function hourlyPrice(view: MachineView, entry: MachineCatalogEntry | undefined): string {
+  if (view.hourly !== null && view.hourly !== undefined) {
+    return `${formatUsd(view.hourly)}/hr`;
+  }
+  return entry === undefined ? "no metered price" : hourlyLabel(entry, view.spot);
 }

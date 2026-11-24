@@ -171,6 +171,7 @@ export type ClientEvent =
   | { type: "machine_connection"; connected: boolean }
   | { type: "usage"; usage: UsageReport }
   | { type: "terminal_output"; data: string }
+  | { type: "terminal_exited"; code: number | null }
   /**
    * A checkout has uncommitted changes and the agent is kept awake.
    *
@@ -232,7 +233,9 @@ export type ClientEvent =
    * anyone is driving now, and the panel reads it rather than tracking its
    * own button's answer.
    */
-  | { type: "desktop_takeover"; active: boolean };
+  | { type: "desktop_takeover"; active: boolean }
+  /** The session's `computer_use` capability was toggled. */
+  | { type: "computer_use_changed"; enabled: boolean };
 
 /**
  * The `ControlToDaemon` variants a browser may send through `send()`,
@@ -338,6 +341,7 @@ const CLIENT_EVENT_TYPES: ReadonlySet<string> = new Set([
   "machine_connection",
   "usage",
   "terminal_output",
+  "terminal_exited",
   "repo_dirty",
   "repo_added",
   "spot_notice",
@@ -350,4 +354,5 @@ const CLIENT_EVENT_TYPES: ReadonlySet<string> = new Set([
   "desktop_state",
   "desktop_active",
   "desktop_takeover",
+  "computer_use_changed",
 ]);

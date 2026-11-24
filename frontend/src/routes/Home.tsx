@@ -18,7 +18,8 @@ import { ChevronRight, Cpu, Sparkles } from "lucide-solid";
 import Composer from "../components/Composer";
 import ProblemNotice from "../components/ProblemNotice";
 import { useReadiness } from "../components/Readiness";
-import { getMe, listSessions } from "../api/client";
+import { useSessions } from "../components/SessionNav";
+import { getMe } from "../api/client";
 import { requestNewSession, type NewSessionInput } from "../api/sessions";
 import { welcomeDismissed } from "../lib/localPreferences";
 import styles from "./Home.module.css";
@@ -26,7 +27,7 @@ import styles from "./Home.module.css";
 export default function Home() {
   const navigate = useNavigate();
   const readiness = useReadiness();
-  const [sessions, { refetch }] = createQuery(listSessions);
+  const { sessions, syncSession } = useSessions();
   const [me] = createQuery(getMe);
 
   /** Sessions still holding a machine, which is what the cap counts. */
@@ -44,7 +45,7 @@ export default function Home() {
 
   async function onSend(input: NewSessionInput): Promise<void> {
     const created = await requestNewSession(input);
-    await refetch();
+    syncSession(created);
     navigate(`/sessions/${created.id}`);
   }
 

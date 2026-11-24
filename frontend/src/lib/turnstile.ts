@@ -23,6 +23,7 @@ export interface RenderOptions {
   execution?: "render" | "execute";
   callback?: (token: string) => void;
   "expired-callback"?: () => void;
+  "timeout-callback"?: () => void;
   "error-callback"?: (errorCode?: string) => void;
 }
 
@@ -81,9 +82,13 @@ export function loadTurnstile(): Promise<TurnstileApi> {
  * needs an interactive challenge it opens over the page where the widget
  * was rendered, hence the fixed corner anchor.
  */
+const TURNSTILE_TIMEOUT_MS = 30_000;
+
 interface HiddenWidget {
   api: TurnstileApi;
   id: string;
+  sitekey: string;
+  host: HTMLElement;
   next(token: string): void;
   fail(error: unknown): void;
 }
@@ -96,17 +101,63 @@ let queue: Promise<unknown> = Promise.resolve();
  * are single-use, so acquisitions serialize behind each other — two callers
  * can never share one.
  */
-export function acquireTurnstileToken(sitekey: string): Promise<string> {
-  const run = queue.then(() => acquire(sitekey));
+export function acquireTurnstileToken(
+  sitekey: string,
+  timeoutMs = TURNSTILE_TIMEOUT_MS,
+): Promise<string> {
+  const run = queue.then(() => acquire(sitekey, timeoutMs));
   queue = run.catch(() => undefined);
   return run;
 }
 
-async function acquire(sitekey: string): Promise<string> {
+async function acquire(sitekey: string, timeoutMs: number): Promise<string> {
+  if (hidden !== undefined && hidden.sitekey !== sitekey) {
+    try {
+      hidden.api.remove(hidden.id);
+    } catch {
+      // Ignore widget cleanup errors when rotating sitekeys.
+    }
+    hidden.host.remove();
+    hidden = undefined;
+  }
   const widget = (hidden ??= await renderHidden(sitekey));
   return new Promise<string>((resolve, reject) => {
-    widget.next = resolve;
-    widget.fail = reject;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      widget.next = () => {};
+      widget.fail = () => {};
+      try {
+        widget.api.reset(widget.id);
+      } catch {
+        // Ignore reset failure on timed-out widget.
+      }
+      reject(new Error("the human check timed out — try again"));
+    }, timeoutMs);
+
+    widget.next = (token: string) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      widget.next = () => {};
+      widget.fail = () => {};
+      resolve(token);
+    };
+    widget.fail = (error: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      widget.next = () => {};
+      widget.fail = () => {};
+      reject(error);
+    };
     widget.api.reset(widget.id);
     widget.api.execute(widget.id);
   });
@@ -122,6 +173,8 @@ async function renderHidden(sitekey: string): Promise<HiddenWidget> {
   const widget: HiddenWidget = {
     api,
     id: "",
+    sitekey,
+    host,
     next(_token: string): void {},
     fail(_error: unknown): void {},
   };
@@ -131,6 +184,10 @@ async function renderHidden(sitekey: string): Promise<HiddenWidget> {
     appearance: "execute",
     execution: "execute",
     callback: (token) => widget.next(token),
+    "expired-callback": () =>
+      widget.fail(new Error("the human check expired — try again")),
+    "timeout-callback": () =>
+      widget.fail(new Error("the human check timed out — try again")),
     "error-callback": () =>
       widget.fail(new Error("the human check could not run — try again")),
   });

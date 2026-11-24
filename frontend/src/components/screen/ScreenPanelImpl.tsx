@@ -23,7 +23,7 @@ import {
   Show,
 } from "solid-js";
 import { desktopInput, desktopTakeover } from "../../api/client";
-import { createDesktopFeed } from "../../api/desktop";
+import { createDesktopFeed, type DesktopFeed } from "../../api/desktop";
 import { ApiProblem } from "../../api/problem";
 import type { SessionRelay } from "../../api/relay";
 import type { DesktopInputEvent, DesktopStatus } from "../../api/wire";
@@ -129,30 +129,42 @@ export default function ScreenPanelImpl(props: ScreenPanelImplProps) {
     },
   });
 
-  const feed = createDesktopFeed(props.sessionId, {
-    listener: {
-      hello(hello) {
-        // A reconnect minted a new watcher — the old lease's takeover died
-        // with it, and the decoder restarts at the next keyframe anyway.
-        // The hello's takeover flag is also the room's freshest word on
-        // whether anyone drives, ahead of the relay's fold catching up.
-        setDriving(false);
-        setHeld(hello.takeover);
-        decoder.reset();
-        setPainted(false);
-      },
-      chunk(data, keyframe) {
-        decoder.push(data, keyframe);
-      },
-      resync() {
-        decoder.reset();
-        setPainted(false);
-      },
-    },
-  });
+  const [feed, setFeed] = createSignal<DesktopFeed | null>(null);
+  let unmounted = false;
 
   onMount(() => {
-    void desktopDecodeSupported().then(setSupported);
+    void desktopDecodeSupported().then((ok) => {
+      if (unmounted) {
+        return;
+      }
+      setSupported(ok);
+      if (!ok) {
+        return;
+      }
+      setFeed(
+        createDesktopFeed(props.sessionId, {
+          listener: {
+            hello(hello) {
+              // A reconnect minted a new watcher — the old lease's takeover died
+              // with it, and the decoder restarts at the next keyframe anyway.
+              // The hello's takeover flag is also the room's freshest word on
+              // whether anyone drives, ahead of the relay's fold catching up.
+              setDriving(false);
+              setHeld(hello.takeover);
+              decoder.reset();
+              setPainted(false);
+            },
+            chunk(data, keyframe) {
+              decoder.push(data, keyframe);
+            },
+            resync() {
+              decoder.reset();
+              setPainted(false);
+            },
+          },
+        }),
+      );
+    });
     // Wheel listeners default to passive, where preventDefault is a no-op —
     // while driving, the page scrolling under the cursor is exactly the
     // thing the wheel event is supposed to be replacing.
@@ -160,48 +172,56 @@ export default function ScreenPanelImpl(props: ScreenPanelImplProps) {
   });
 
   onCleanup(() => {
+    unmounted = true;
     stage?.removeEventListener("wheel", onWheel);
+    const currentFeed = feed();
     // Releasing the panel releases the wheel: the room drops takeover when
     // the watcher lapses anyway, but asking first keeps the screen honest
     // rather than waiting out the lease — and it has to happen before
     // `dispose`, which forgets the watcher id this request names.
-    if (driving()) {
-      const watcher = feed.watcher();
+    if (driving() && currentFeed !== null) {
+      const watcher = currentFeed.watcher();
       if (watcher !== null) {
         void desktopTakeover(props.sessionId, { watcher, active: false }).catch(
           () => {},
         );
       }
     }
-    feed.dispose();
-    decoder.dispose();
-    flushInput();
     if (flushTimer !== undefined) {
       clearTimeout(flushTimer);
+      flushTimer = undefined;
     }
+    pending.length = 0;
+    currentFeed?.dispose();
+    decoder.dispose();
   });
 
   // ---- input ----
 
   const pending: DesktopInputEvent[] = [];
   let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  let inputInFlight = false;
 
   function flushInput(): void {
     if (flushTimer !== undefined) {
       clearTimeout(flushTimer);
       flushTimer = undefined;
     }
-    if (pending.length === 0) {
+    if (inputInFlight || pending.length === 0 || unmounted) {
       return;
     }
-    const watcher = feed.watcher();
+    const watcher = feed()?.watcher() ?? null;
     if (watcher === null) {
       pending.length = 0;
       return;
     }
+    inputInFlight = true;
     const events = pending.splice(0, pending.length);
-    void desktopInput(props.sessionId, { watcher, events }).catch(
-      (error: unknown) => {
+    void desktopInput(props.sessionId, { watcher, events })
+      .catch((error: unknown) => {
+        if (unmounted) {
+          return;
+        }
         if (error instanceof ApiProblem && (error.status === 409 || error.status === 410)) {
           // 409: another watcher drives — the wheel moved. 410: our lease
           // died — a reconnect is already minting a new one. Either way
@@ -210,8 +230,18 @@ export default function ScreenPanelImpl(props: ScreenPanelImplProps) {
           return;
         }
         props.onError(error);
-      },
-    );
+      })
+      .finally(() => {
+        inputInFlight = false;
+        if (unmounted || pending.length === 0) {
+          return;
+        }
+        if (pending.some((event) => event.kind !== "move")) {
+          flushInput();
+        } else if (flushTimer === undefined) {
+          flushTimer = setTimeout(flushInput, INPUT_FLUSH_MS);
+        }
+      });
   }
 
   function pushInput(event: DesktopInputEvent): void {
@@ -224,7 +254,7 @@ export default function ScreenPanelImpl(props: ScreenPanelImplProps) {
       }
     }
     pending.push(event);
-    if (flushTimer === undefined) {
+    if (!inputInFlight && flushTimer === undefined) {
       flushTimer = setTimeout(flushInput, INPUT_FLUSH_MS);
     }
   }
@@ -305,43 +335,65 @@ export default function ScreenPanelImpl(props: ScreenPanelImplProps) {
   // ---- takeover ----
 
   async function takeOver(): Promise<void> {
-    const watcher = feed.watcher();
+    const watcher = feed()?.watcher() ?? null;
     if (watcher === null || takeoverBusy()) {
       return;
     }
     setTakeoverBusy(true);
     try {
       await desktopTakeover(props.sessionId, { watcher, active: true });
+      if (unmounted || feed()?.watcher() !== watcher) {
+        return;
+      }
       setDriving(true);
       stage?.focus();
     } catch (error) {
-      if (error instanceof ApiProblem && error.status === 410) {
-        props.onError(
-          "the screen connection dropped just as takeover was requested — try again once it reconnects",
-        );
-      } else {
-        props.onError(error);
+      if (!unmounted) {
+        if (error instanceof ApiProblem && error.status === 410) {
+          props.onError(
+            "the screen connection dropped just as takeover was requested — try again once it reconnects",
+          );
+        } else {
+          props.onError(error);
+        }
       }
     } finally {
-      setTakeoverBusy(false);
+      if (!unmounted) {
+        setTakeoverBusy(false);
+      }
     }
   }
 
   async function release(): Promise<void> {
-    const watcher = feed.watcher();
+    if (takeoverBusy()) {
+      return;
+    }
+    const watcher = feed()?.watcher() ?? null;
     if (watcher === null) {
       setDriving(false);
       return;
     }
+    setTakeoverBusy(true);
     try {
       await desktopTakeover(props.sessionId, { watcher, active: false });
+      if (unmounted || feed()?.watcher() !== watcher) {
+        return;
+      }
+      setDriving(false);
     } catch (error) {
-      // Releasing a lease that already lapsed is the success case.
-      if (!(error instanceof ApiProblem && error.status === 410)) {
-        props.onError(error);
+      if (!unmounted) {
+        // Releasing a lease that already lapsed is the success case.
+        if (error instanceof ApiProblem && error.status === 410) {
+          setDriving(false);
+        } else {
+          props.onError(error);
+        }
+      }
+    } finally {
+      if (!unmounted) {
+        setTakeoverBusy(false);
       }
     }
-    setDriving(false);
   }
 
   // ---- what the banner says ----
@@ -354,8 +406,12 @@ export default function ScreenPanelImpl(props: ScreenPanelImplProps) {
     if (lifecycle?.status === "failed") {
       return lifecycle.detail ?? "The desktop failed to start.";
     }
-    const stream = feed.state();
-    if (feed.failure() !== null || stream === "failed") {
+    const currentFeed = feed();
+    const stream = currentFeed?.state() ?? "connecting";
+    if (currentFeed?.failure() !== null && currentFeed?.failure() !== undefined) {
+      return "The screen stream failed.";
+    }
+    if (stream === "failed") {
       return "The screen stream failed.";
     }
     if (stream === "connecting") {
@@ -395,9 +451,9 @@ export default function ScreenPanelImpl(props: ScreenPanelImplProps) {
             <button
               type="button"
               class={styles.drive}
-              disabled={takeoverBusy() || feed.watcher() === null}
+              disabled={takeoverBusy() || (feed()?.watcher() ?? null) === null}
               title={
-                feed.watcher() === null
+                (feed()?.watcher() ?? null) === null
                   ? "The stream is reconnecting"
                   : "Take control of the machine's desktop"
               }
@@ -410,6 +466,7 @@ export default function ScreenPanelImpl(props: ScreenPanelImplProps) {
           <button
             type="button"
             class={styles.drive}
+            disabled={takeoverBusy()}
             onClick={() => void release()}
           >
             Release
@@ -423,6 +480,7 @@ export default function ScreenPanelImpl(props: ScreenPanelImplProps) {
         onPointerMove={onPointerMove}
         onPointerDown={(event) => {
           if (driving()) {
+            stage?.focus();
             // Capture keeps a drag honest: the release lands here even if
             // the pointer slips off the canvas mid-gesture.
             event.currentTarget.setPointerCapture(event.pointerId);

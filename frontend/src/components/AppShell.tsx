@@ -19,7 +19,7 @@ import Logomark, { FLYCO_MARK } from "./Logomark";
 import Popover from "./Popover";
 import ProblemNotice from "./ProblemNotice";
 import { ReadinessProvider } from "./Readiness";
-import SessionNav from "./SessionNav";
+import SessionNav, { SessionsProvider } from "./SessionNav";
 import SettingsNav from "./SettingsNav";
 import { getMe } from "../api/client";
 import { isSignedIn, onSessionChanged } from "../lib/session";
@@ -103,7 +103,8 @@ export default function AppShell(props: { children?: JSX.Element }) {
         fallback={<Navigate href={loginHref()} />}
       >
         <ReadinessProvider enabled={signedIn}>
-          <div class={styles.shell}>
+          <SessionsProvider enabled={() => signedIn() && !isBareRoute()}>
+            <div class={styles.shell}>
             <Show when={!isBareRoute()}>
               {/* The opener floats over the page rather than sitting in a
                   band of its own, so a phone spends its height on the work
@@ -161,7 +162,8 @@ export default function AppShell(props: { children?: JSX.Element }) {
               </nav>
             </Show>
             <main class={styles.main}>{props.children}</main>
-          </div>
+            </div>
+          </SessionsProvider>
         </ReadinessProvider>
       </Show>
     </Show>

@@ -11,7 +11,7 @@
  * prerequisites are present. A disabled button that does not say why is a
  * dead end, so the tooltip names the missing one.
  */
-import { For, Show, createEffect, createMemo, createSignal, onCleanup } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js";
 import { createQuery } from "../lib/query";
 import { A } from "@solidjs/router";
 import {
@@ -48,6 +48,8 @@ import {
   type RepoSummary,
 } from "../api/client";
 import { beginGithubLogin, githubTokenRevoked } from "../api/auth";
+import { isBudgetExhausted } from "../api/events";
+import { ApiProblem } from "../api/problem";
 import type { NewSessionInput, NewSessionRepo } from "../api/sessions";
 import { cx } from "../lib/cx";
 import { HARNESS_LABEL } from "../lib/harnesses";
@@ -60,6 +62,7 @@ import {
   spotPreference,
 } from "../lib/localPreferences";
 import {
+  CATALOG_POLL_DEADLINE_MS,
   CATALOG_POLL_SECONDS,
   billingMinimumSentence,
   catalogNotReady,
@@ -114,6 +117,7 @@ export default function Composer(props: ComposerProps) {
   const [modelChoice, setModelChoice] = createSignal<ModelChoice | null>(null);
   const [sending, setSending] = createSignal(false);
   const [error, setError] = createSignal<unknown>(null);
+  const [catalogTimedOut, setCatalogTimedOut] = createSignal(false);
 
   // The machine flyco would pick, re-asked when the spot preference moves:
   // spot changes both the price and, potentially, which type is cheapest.
@@ -163,28 +167,93 @@ export default function Composer(props: ComposerProps) {
       : linked.map((account) => account.kind);
   });
 
+  const isCatalogPending = createMemo(() => pendingKinds().length > 0);
+
   /** The one sentence a pending catalog shows, or `null` once it is read. */
   const pending = createMemo(() =>
-    pendingKinds().length === 0 ? null : readingMachines(pendingKinds()),
+    pendingKinds().length === 0
+      ? null
+      : catalogTimedOut()
+        ? "Could not finish reading machines."
+        : readingMachines(pendingKinds()),
   );
 
   /** The same wait, in the few words the chip has room for. */
   const pendingShort = createMemo(() =>
-    pendingKinds().length === 0 ? null : readingMachinesShort(pendingKinds()),
+    pendingKinds().length === 0
+      ? null
+      : catalogTimedOut()
+        ? "Catalog timed out"
+        : readingMachinesShort(pendingKinds()),
   );
 
+  const [catalogRetryNonce, setCatalogRetryNonce] = createSignal(0);
+
+  function retryCatalog(): void {
+    setCatalogTimedOut(false);
+    setCatalogRetryNonce((n) => n + 1);
+    void reaskCatalog();
+    void reaskDefault();
+  }
+
   // A pending catalog ends by itself, seconds later, so the screen asks
-  // again rather than making the user reload. The interval exists only
-  // while something is actually pending.
+  // again up to a finite deadline rather than polling forever, honoring
+  // Retry-After on 429 and stopping on budget exhaustion.
   createEffect(() => {
-    if (pending() === null) {
+    catalogRetryNonce();
+    if (!isCatalogPending()) {
       return;
     }
-    const timer = setInterval(() => {
-      void reaskCatalog();
-      void reaskDefault();
-    }, CATALOG_POLL_SECONDS * 1000);
-    onCleanup(() => clearInterval(timer));
+    setCatalogTimedOut(false);
+    const until = Date.now() + CATALOG_POLL_DEADLINE_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let active = true;
+
+    const schedule = (): void => {
+      if (!active) {
+        return;
+      }
+      const err = untrack(
+        () => catalog.error ?? (catalogNotReady(automatic.error) ? undefined : automatic.error),
+      );
+      if (isBudgetExhausted(err)) {
+        return;
+      }
+      if (Date.now() >= until) {
+        setCatalogTimedOut(true);
+        return;
+      }
+      const retryAfterMs = err instanceof ApiProblem ? (err.retryAfterMs ?? 0) : 0;
+      const delay = Math.max(CATALOG_POLL_SECONDS * 1000, retryAfterMs);
+      timer = setTimeout(() => {
+        timer = undefined;
+        if (!active) {
+          return;
+        }
+        if (Date.now() >= until) {
+          setCatalogTimedOut(true);
+          return;
+        }
+        void Promise.all([reaskCatalog(), reaskDefault()]).finally(() => {
+          if (!active) {
+            return;
+          }
+          if (Date.now() >= until) {
+            setCatalogTimedOut(true);
+            return;
+          }
+          schedule();
+        });
+      }, delay);
+    };
+
+    schedule();
+    onCleanup(() => {
+      active = false;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    });
   });
 
   /**
@@ -310,7 +379,7 @@ export default function Composer(props: ComposerProps) {
 
   async function send(): Promise<void> {
     const picked = repos();
-    if (blocker() !== null || picked.length === 0) {
+    if (sending() || blocker() !== null || picked.length === 0) {
       return;
     }
     setSending(true);
@@ -354,6 +423,7 @@ export default function Composer(props: ComposerProps) {
       onSubmit={() => void send()}
       placeholder="Describe a task"
       label="Describe a task"
+      disabled={sending()}
       controls={
         <div class={styles.chips}>
           <HarnessChip
@@ -370,6 +440,8 @@ export default function Composer(props: ComposerProps) {
             error={machineError()}
             pending={pending()}
             pendingShort={pendingShort()}
+            catalogTimedOut={catalogTimedOut()}
+            onRetryCatalog={retryCatalog}
             chosenKey={chosenKey()}
             spot={spot()}
             onChoose={setChosenKey}
@@ -530,6 +602,8 @@ function ComputeChip(props: {
   pending: string | null;
   /** The same wait as `pending`, sized for the chip. */
   pendingShort: string | null;
+  catalogTimedOut: boolean;
+  onRetryCatalog: () => void;
   chosenKey: string | null;
   spot: boolean;
   onChoose: (key: string | null) => void;
@@ -601,7 +675,13 @@ function ComputeChip(props: {
             error={props.error}
             pending={props.pending ?? undefined}
             codespaceHint
-          />
+          >
+            <Show when={props.catalogTimedOut}>
+              <button type="button" class={styles.option} onClick={props.onRetryCatalog}>
+                Retry
+              </button>
+            </Show>
+          </MachinePicker>
         )}
       </Popover>
     </Show>
@@ -628,8 +708,23 @@ function RepoChip(props: {
   onPrimary: (slug: string) => void;
   onBranch: (slug: string, branch: string | undefined) => void;
 }) {
+  const [opened, setOpened] = createSignal(false);
   const [query, setQuery] = createSignal("");
-  const [results] = createQuery(query, listRepos);
+  const [debouncedQuery, setDebouncedQuery] = createSignal("");
+
+  createEffect(() => {
+    const next = query();
+    if (next === debouncedQuery()) {
+      return;
+    }
+    const timer = setTimeout(() => setDebouncedQuery(next), 250);
+    onCleanup(() => clearTimeout(timer));
+  });
+
+  const [results] = createQuery(
+    () => (opened() ? debouncedQuery() : undefined),
+    (needle: string) => listRepos(needle),
+  );
   const recents = createMemo(() => recentRepos().slice(0, MAX_RECENT_REPOS));
 
   /** The picked slugs, for the check each listed row carries. */
@@ -664,7 +759,10 @@ function RepoChip(props: {
       trigger={(attrs) => (
         <button
           id={attrs.id}
-          onClick={attrs.onClick}
+          onClick={() => {
+            setOpened(true);
+            attrs.onClick();
+          }}
           aria-expanded={attrs.expanded()}
           aria-haspopup="dialog"
           type="button"

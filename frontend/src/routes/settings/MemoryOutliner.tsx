@@ -41,6 +41,7 @@ export default function MemoryOutliner() {
   const [editing, setEditing] = createSignal<string | null>(null);
   const [composingUnder, setComposingUnder] = createSignal<string | null>(null);
   const [loaded, setLoaded] = createSignal(false);
+  const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<unknown>(null);
 
   async function load(parent: string): Promise<void> {
@@ -72,6 +73,10 @@ export default function MemoryOutliner() {
   }
 
   async function save(node: MemoryNode, title: string, content: string): Promise<void> {
+    if (busy()) {
+      return;
+    }
+    setBusy(true);
     setError(null);
     try {
       const updated = await updateMemoryNode(node.id, { title, content });
@@ -79,20 +84,32 @@ export default function MemoryOutliner() {
       setEditing(null);
     } catch (err) {
       setError(err);
+    } finally {
+      setBusy(false);
     }
   }
 
   async function remove(node: MemoryNode): Promise<void> {
+    if (busy()) {
+      return;
+    }
+    setBusy(true);
     setError(null);
     try {
       await deleteMemoryNode(node.id);
       setChildren(forgetSubtree(children(), node.id));
     } catch (err) {
       setError(err);
+    } finally {
+      setBusy(false);
     }
   }
 
   async function create(parent: string, title: string): Promise<void> {
+    if (busy()) {
+      return;
+    }
+    setBusy(true);
     setError(null);
     try {
       await createMemoryNode({
@@ -109,6 +126,8 @@ export default function MemoryOutliner() {
       await load(parent);
     } catch (err) {
       setError(err);
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -164,6 +183,7 @@ export default function MemoryOutliner() {
                             <button
                               type="button"
                               class={styles.pill}
+                              disabled={busy()}
                               onClick={() => setEditing(row.node.id)}
                             >
                               Edit
@@ -171,6 +191,7 @@ export default function MemoryOutliner() {
                             <button
                               type="button"
                               class={styles.iconButton}
+                              disabled={busy()}
                               aria-label={`Add a note under ${row.node.title}`}
                               onClick={() => setComposingUnder(row.node.id)}
                             >
@@ -179,6 +200,7 @@ export default function MemoryOutliner() {
                             <button
                               type="button"
                               class={cx(styles.iconButton, styles.iconButtonDanger)}
+                              disabled={busy()}
                               aria-label={`Delete ${row.node.title}`}
                               onClick={() => void remove(row.node)}
                             >
@@ -190,6 +212,7 @@ export default function MemoryOutliner() {
                     >
                       <NodeEditor
                         node={row.node}
+                        busy={busy()}
                         onSave={(title, content) => void save(row.node, title, content)}
                         onCancel={() => setEditing(null)}
                       />
@@ -202,6 +225,7 @@ export default function MemoryOutliner() {
                     >
                       <NewNodeInput
                         label={`New note under ${row.node.title}`}
+                        busy={busy()}
                         onCreate={(title) => void create(row.node.id, title)}
                         onCancel={() => setComposingUnder(null)}
                       />
@@ -214,6 +238,7 @@ export default function MemoryOutliner() {
               <li class={styles.treeRow} style={{ "padding-left": "12px" }}>
                 <NewNodeInput
                   label="New note"
+                  busy={busy()}
                   onCreate={(title) => void create(ROOT_KEY, title)}
                   onCancel={() => setComposingUnder(null)}
                 />
@@ -224,6 +249,7 @@ export default function MemoryOutliner() {
             <button
               type="button"
               class={styles.pill}
+              disabled={busy()}
               onClick={() => setComposingUnder(ROOT_KEY)}
             >
               <Plus size={14} aria-hidden="true" />
@@ -239,6 +265,7 @@ export default function MemoryOutliner() {
 /** Renaming a note, and editing what it says, without leaving the row. */
 function NodeEditor(props: {
   node: MemoryNode;
+  busy: boolean;
   onSave: (title: string, content: string) => void;
   onCancel: () => void;
 }) {
@@ -251,7 +278,9 @@ function NodeEditor(props: {
       style={{ flex: "1", "min-width": "0" }}
       onSubmit={(event) => {
         event.preventDefault();
-        props.onSave(title(), content());
+        if (!props.busy) {
+          props.onSave(title(), content());
+        }
       }}
     >
       <div class={styles.field}>
@@ -259,6 +288,7 @@ function NodeEditor(props: {
         <input
           id={`memory-title-${props.node.id}`}
           value={title()}
+          disabled={props.busy}
           onInput={(event) => setTitle(event.currentTarget.value)}
           required
         />
@@ -269,14 +299,15 @@ function NodeEditor(props: {
           id={`memory-content-${props.node.id}`}
           rows="3"
           value={content()}
+          disabled={props.busy}
           onInput={(event) => setContent(event.currentTarget.value)}
         />
       </div>
       <div class={styles.formActions}>
-        <button type="submit" class={styles.pillPrimary}>
+        <button type="submit" class={styles.pillPrimary} disabled={props.busy}>
           Save
         </button>
-        <button type="button" class={styles.pill} onClick={props.onCancel}>
+        <button type="button" class={styles.pill} disabled={props.busy} onClick={props.onCancel}>
           Cancel
         </button>
       </div>
@@ -287,6 +318,7 @@ function NodeEditor(props: {
 /** One input that becomes a note: type a title, press Enter. */
 function NewNodeInput(props: {
   label: string;
+  busy: boolean;
   onCreate: (title: string) => void;
   onCancel: () => void;
 }) {
@@ -297,7 +329,7 @@ function NewNodeInput(props: {
       style={{ display: "flex", gap: "var(--space-2)", flex: "1", "min-width": "0" }}
       onSubmit={(event) => {
         event.preventDefault();
-        if (title().trim() !== "") {
+        if (!props.busy && title().trim() !== "") {
           props.onCreate(title().trim());
         }
       }}
@@ -307,6 +339,7 @@ function NewNodeInput(props: {
         aria-label={props.label}
         placeholder="Title"
         value={title()}
+        disabled={props.busy}
         onInput={(event) => setTitle(event.currentTarget.value)}
         onKeyDown={(event) => {
           if (event.key === "Escape") {
@@ -316,10 +349,10 @@ function NewNodeInput(props: {
         // The row appeared because the user asked to type in it.
         autofocus
       />
-      <button type="submit" class={styles.pillPrimary}>
+      <button type="submit" class={styles.pillPrimary} disabled={props.busy}>
         Add
       </button>
-      <button type="button" class={styles.pill} onClick={props.onCancel}>
+      <button type="button" class={styles.pill} disabled={props.busy} onClick={props.onCancel}>
         Cancel
       </button>
     </form>

@@ -672,6 +672,13 @@ export function foldTranscript(events: readonly TimedEvent[]): TranscriptItem[] 
           atUnix,
         );
         break;
+      case "computer_use_changed":
+        notice(
+          event.enabled ? "Computer use enabled." : "Computer use disabled.",
+          "info",
+          atUnix,
+        );
+        break;
       case "started":
       case "capabilities":
       case "models":
@@ -680,8 +687,12 @@ export function foldTranscript(events: readonly TimedEvent[]): TranscriptItem[] 
       case "machine_connection":
       case "usage":
       case "terminal_output":
+      case "terminal_exited":
+      case "desktop_state":
+      case "desktop_active":
+      case "desktop_takeover":
         // Rendered elsewhere (the header's status pill and rings, the
-        // terminal tab of the drawer).
+        // terminal and screen tabs of the drawer).
         break;
     }
   }

@@ -1,4 +1,4 @@
-import { For, Show, createSignal } from "solid-js";
+import { Index, Show, createEffect, createSignal } from "solid-js";
 import { Plus, X } from "lucide-solid";
 import { createQuery } from "../lib/query";
 import ProblemNotice from "./ProblemNotice";
@@ -12,18 +12,24 @@ import styles from "./EnvEditor.module.css";
  * rather than hard-coding the network-control caveat on the frontend.
  */
 export default function EnvEditor(props: { sessionId: string }) {
-  const [doc, { refetch }] = createQuery(() => props.sessionId, getSessionEnv);
+  const [doc, { mutate }] = createQuery(() => props.sessionId, getSessionEnv);
   const [entries, setEntries] = createSignal<EnvEntry[]>([]);
   const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<unknown>(null);
   const [loadedFor, setLoadedFor] = createSignal<string | null>(null);
 
   // Seed the editable draft from the fetched document, once per session switch.
-  const current = doc();
-  if (current !== undefined && loadedFor() !== props.sessionId) {
-    setEntries(current.entries);
-    setLoadedFor(props.sessionId);
-  }
+  createEffect(() => {
+    const id = props.sessionId;
+    if (doc.loading) {
+      return;
+    }
+    const current = doc();
+    if (current !== undefined && loadedFor() !== id) {
+      setEntries(current.entries);
+      setLoadedFor(id);
+    }
+  });
 
   function updateEntry(index: number, field: "key" | "value", value: string): void {
     setEntries((prev) => prev.map((entry, i) => (i === index ? { ...entry, [field]: value } : entry)));
@@ -38,14 +44,19 @@ export default function EnvEditor(props: { sessionId: string }) {
   }
 
   async function onSave(): Promise<void> {
+    if (saving()) {
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
-      await putSessionEnv(
+      const updated = await putSessionEnv(
         props.sessionId,
         entries().filter((entry) => entry.key.trim() !== ""),
       );
-      await refetch();
+      setEntries(updated.entries);
+      setLoadedFor(props.sessionId);
+      mutate(updated);
     } catch (err) {
       setError(err);
     } finally {
@@ -62,14 +73,14 @@ export default function EnvEditor(props: { sessionId: string }) {
             <>
               <p class={styles.tabDescription}>{document().warning}</p>
               <div class={styles.form}>
-                <For each={entries()}>
+                <Index each={entries()}>
                   {(entry, index) => (
                     <div class={styles.row}>
                       <input
                         class={styles.input}
                         aria-label="Variable name"
-                        value={entry.key}
-                        onInput={(event) => updateEntry(index(), "key", event.currentTarget.value)}
+                        value={entry().key}
+                        onInput={(event) => updateEntry(index, "key", event.currentTarget.value)}
                         placeholder="KEY"
                         autocomplete="off"
                         autocapitalize="off"
@@ -78,8 +89,8 @@ export default function EnvEditor(props: { sessionId: string }) {
                       <input
                         class={styles.input}
                         aria-label="Variable value"
-                        value={entry.value}
-                        onInput={(event) => updateEntry(index(), "value", event.currentTarget.value)}
+                        value={entry().value}
+                        onInput={(event) => updateEntry(index, "value", event.currentTarget.value)}
                         placeholder="value"
                         autocomplete="off"
                         autocapitalize="off"
@@ -88,14 +99,14 @@ export default function EnvEditor(props: { sessionId: string }) {
                       <button
                         type="button"
                         class={styles.remove}
-                        aria-label={entry.key ? `Remove ${entry.key}` : "Remove variable"}
-                        onClick={() => removeEntry(index())}
+                        aria-label={entry().key ? `Remove ${entry().key}` : "Remove variable"}
+                        onClick={() => removeEntry(index)}
                       >
                         <X size={14} aria-hidden="true" />
                       </button>
                     </div>
                   )}
-                </For>
+                </Index>
                 <ProblemNotice error={error()} />
                 <div class={styles.footer}>
                   <button type="button" class={styles.add} onClick={addEntry}>

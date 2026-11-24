@@ -36,12 +36,12 @@ function machine(overrides: Partial<MachineView> = {}): MachineView {
 }
 
 describe("machineChip", () => {
-  it("quotes the rate and which price it is while the machine runs", () => {
-    expect(machineChip(machine())).toBe("m7i-flex.xlarge · $0.15/hr · spot");
+  it("shows only the machine name while running, keeping price and spot inside the panel", () => {
+    expect(machineChip(machine())).toBe("m7i-flex.xlarge");
   });
 
-  it("says on-demand capacity by leaving the spot clause off", () => {
-    expect(machineChip(machine({ spot: false }))).toBe("m7i-flex.xlarge · $0.15/hr");
+  it("shows the same collapsed name regardless of capacity mode", () => {
+    expect(machineChip(machine({ spot: false }))).toBe("m7i-flex.xlarge");
   });
 
   it("quotes no price on hardware flyco meters nothing on", () => {
@@ -223,7 +223,7 @@ describe("machineChip on a container", () => {
       spot: false,
       hourly: 210_000,
     });
-    expect(machineChip(running)).toBe("Container · $0.21/hr");
+    expect(machineChip(running)).toBe("Container");
   });
 
   it("keeps calling the machine the user enrolled by its own name", () => {

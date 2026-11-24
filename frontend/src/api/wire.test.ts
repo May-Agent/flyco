@@ -32,6 +32,21 @@ describe("parseClientEvent", () => {
     expect(event.commands[1]?.argument_hint).toBeNull();
   });
 
+  it("parses computer_use_changed and terminal_exited frames", () => {
+    expect(parseClientEvent({ type: "computer_use_changed", enabled: true })).toEqual({
+      type: "computer_use_changed",
+      enabled: true,
+    });
+    expect(parseClientEvent({ type: "terminal_exited", code: 0 })).toEqual({
+      type: "terminal_exited",
+      code: 0,
+    });
+    expect(parseClientEvent({ type: "terminal_exited", code: null })).toEqual({
+      type: "terminal_exited",
+      code: null,
+    });
+  });
+
   it("refuses a frame this protocol version does not define", () => {
     expect(() => parseClientEvent({ type: "skills" })).toThrow("unrecognized type");
     expect(() => parseClientEvent(null)).toThrow("not a ClientEvent");

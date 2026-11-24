@@ -212,6 +212,17 @@ describe("EventStream dedup across two serializations of one event", () => {
     expect(stream.ingestCatchUp([stored(1, reordered)])).toEqual([]);
   });
 
+  it("consumes unsequenced live keys one-shot so repeated missed events are not dropped", () => {
+    const stream = freshStream();
+    const delta = { type: "harness", event: { type: "assistant_delta", turn_id: "t-1", text: "**" } };
+    expect(stream.ingestLive(live(delta, null))).not.toBeNull();
+
+    // First stored row matches the one unsequenced live delivery; the second
+    // identical stored row is a second occurrence and must be emitted.
+    const out = stream.ingestCatchUp([stored(1, delta), stored(2, delta)]);
+    expect(eventsOf(out)).toEqual([delta]);
+  });
+
   it("still tells two different events apart", () => {
     const stream = freshStream();
     expect(
@@ -250,6 +261,66 @@ describe("createSessionRelay catch-up", () => {
     expect((failure as Error).message).toContain("without advancing");
     expect(calls).toBe(200);
     relay.dispose();
+  });
+
+  it("merges catch-up gap fills in seq order, serializes catchUp, and unsubscribes on failure", async () => {
+    let listener!: Parameters<UserStream["subscribe"]>[1];
+    const unsubSpy = vi.fn();
+    let pageCalls = 0;
+    let resolvePage!: (res: Response) => void;
+
+    vi.stubGlobal("fetch", () => {
+      pageCalls += 1;
+      if (pageCalls === 1) {
+        return new Promise<Response>((resolve) => {
+          resolvePage = resolve;
+        });
+      }
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            events: [stored(3, notice), stored(4, usage), stored(5, started)],
+            more: false,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    });
+
+    const userStreamStub: UserStream = {
+      state: () => "live",
+      failure: () => null,
+      subscribe: (_session, l) => {
+        listener = l;
+        return unsubSpy;
+      },
+    };
+
+    const relay = createSessionRelay(SESSION, { stream: userStreamStub });
+    // Triggering state("live") while initial catchUp() is still in flight must serialize, not double-fetch concurrently.
+    listener.state("live");
+    expect(pageCalls).toBe(1);
+
+    // Live frame seq 5 arrives across a gap (3, 4 missing).
+    listener.event(live(started, 5));
+    expect(eventsOf(relay.events())).toEqual([started]);
+
+    // First catchUp resolves with seq 1, 2; serialized follow-up resolves with 3, 4, 5.
+    resolvePage(
+      new Response(JSON.stringify({ events: [stored(1, started), stored(2, usage)], more: false }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await settle();
+
+    expect(pageCalls).toBe(2);
+    expect(eventsOf(relay.events())).toEqual([started, usage, notice, usage, started]);
+
+    // Failure unsubscribes immediately rather than leaking the subscription.
+    listener.failed(problem(404));
+    expect(relay.state()).toBe("failed");
+    expect(unsubSpy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -296,9 +367,17 @@ describe("isDefinitiveFailure", () => {
     expect(isDefinitiveFailure(problem(403))).toBe(true);
   });
 
-  it("keeps retrying the two client statuses a retry can get past", () => {
-    expect(isDefinitiveFailure(problem(401))).toBe(false);
-    expect(isDefinitiveFailure(problem(429))).toBe(false);
+  it("stops on 401 and budget-exhausted 429s, and retries transient rate limits", () => {
+    expect(isDefinitiveFailure(problem(401, "https://flyco.dev/problems/unauthorized"))).toBe(true);
+    expect(
+      isDefinitiveFailure(problem(429, "https://flyco.dev/problems/request-budget-exhausted")),
+    ).toBe(true);
+    expect(
+      isDefinitiveFailure(problem(429, "https://flyco.dev/problems/row-budget-exhausted")),
+    ).toBe(true);
+    expect(isDefinitiveFailure(problem(429, "https://flyco.dev/problems/rate-limited"))).toBe(
+      false,
+    );
   });
 
   it("keeps retrying a server that is having a bad minute", () => {
