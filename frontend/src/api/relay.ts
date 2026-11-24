@@ -341,17 +341,19 @@ export function createSessionRelay(
     return catchUpInFlight;
   }
 
+  let unsubscribe: (() => void) | null = null;
+
   function onFailure(error: unknown): void {
     if (disposed) {
       return;
     }
     disposed = true;
-    unsubscribe();
     setFailure(error);
     setState("failed");
+    unsubscribe?.();
   }
 
-  const unsubscribe = user.subscribe(sessionId, {
+  unsubscribe = user.subscribe(sessionId, {
     event(envelope) {
       if (disposed) {
         return;
@@ -383,6 +385,10 @@ export function createSessionRelay(
     failed: onFailure,
   });
 
+  if (disposed) {
+    unsubscribe();
+  }
+
   // The recorded past renders whether or not the stream has opened yet, unless
   // an already-live shared stream just started catch-up inside subscribe().
   if (catchUpInFlight === null && !disposed) {
@@ -410,7 +416,7 @@ export function createSessionRelay(
 
   function dispose(): void {
     disposed = true;
-    unsubscribe();
+    unsubscribe?.();
     setState("closed");
   }
 

@@ -322,6 +322,38 @@ describe("createSessionRelay catch-up", () => {
     expect(relay.state()).toBe("failed");
     expect(unsubSpy).toHaveBeenCalledTimes(1);
   });
+
+  it("handles a UserStream that synchronously fails during subscribe without TDZ or leaked listener", async () => {
+    const unsubSpy = vi.fn();
+    let fetchCalled = false;
+    vi.stubGlobal("fetch", () => {
+      fetchCalled = true;
+      return Promise.resolve(
+        new Response(JSON.stringify({ events: [], more: false }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+
+    const authFailure = problem(401, "https://flyco.dev/problems/unauthorized");
+    const failedStream: UserStream = {
+      state: () => "failed",
+      failure: () => authFailure,
+      subscribe: (_session, listener) => {
+        listener.failed(authFailure);
+        return unsubSpy;
+      },
+    };
+
+    const relay = createSessionRelay(SESSION, { stream: failedStream });
+    await settle();
+
+    expect(relay.state()).toBe("failed");
+    expect(relay.failure()).toBe(authFailure);
+    expect(unsubSpy).toHaveBeenCalledTimes(1);
+    expect(fetchCalled).toBe(false);
+  });
 });
 
 describe("nextBackoffDelay", () => {
