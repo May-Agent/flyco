@@ -41,6 +41,8 @@
 //! its `seq`, so a machine can tell a job it is already running from one
 //! it has never seen.
 
+use std::time::Duration;
+
 use flyco_core::Problem;
 use flyco_core::host::HostFacts;
 use flyco_provider::host::{
@@ -63,6 +65,7 @@ use crate::problem::Outcome;
 use crate::respond::NoContent;
 use crate::room::{HEADER_INTERNAL, INTERNAL};
 use crate::schema_version::Cache;
+use crate::sse::Signal;
 
 /// Names the host a Worker→room call belongs to.
 pub const HEADER_HOST: &str = "x-flyco-host";
@@ -70,12 +73,15 @@ pub const HEADER_HOST: &str = "x-flyco-host";
 /// How long a host's presence marker survives its last contact.
 ///
 /// The same contract as the session room's: attach, every frames POST,
-/// and every poll of the command stream renew it, so expiry means a
+/// and the command stream's periodic refresh renew it, so expiry means a
 /// machine that has said nothing for this long.
 const PRESENCE_TTL_SECONDS: u64 = 30;
 
 /// How often the command stream renews the presence marker.
 const PRESENCE_REFRESH_SECONDS: u64 = 10;
+
+/// Most queued commands one SSE step reads at a time.
+const COMMAND_BATCH_LIMIT: u64 = 256;
 
 /// KV key holding the facts the machine last reported.
 const KEY_FACTS: &str = "host:facts";
@@ -131,12 +137,14 @@ struct PresenceRow {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[skyzen::durable_object]
 pub struct HostRoom {
-    /// The schema version this activation already verified — a memo,
-    /// reset with the object on every event, never a fact of its own: it
-    /// can only trail the `schema_meta` row, never lead it. Not part of
-    /// the state blob, which stays the `null` a rolled-back build reads.
+    /// The schema version this activation already verified — a memo shared
+    /// across every request on this activation, never part of the state
+    /// blob.
     #[serde(skip)]
     schema: Cache,
+    /// Wakes open command streams on new mailbox rows or a superseding attach.
+    #[serde(skip)]
+    commands: Signal,
 }
 
 impl DurableObject for HostRoom {
@@ -144,7 +152,7 @@ impl DurableObject for HostRoom {
     /// blob to load and save around an event.
     const PERSIST: bool = false;
 
-    fn fetch(&mut self) -> Router {
+    fn fetch(&self) -> Router {
         Route::new((
             "/internal/attach".post(attach_host),
             "/internal/commands".at(stream_commands),
@@ -153,6 +161,7 @@ impl DurableObject for HostRoom {
             "/internal/status".at(read_status),
         ))
         .with(State(self.schema.clone()))
+        .with(State(self.commands.clone()))
         .build()
     }
 }
@@ -169,10 +178,11 @@ async fn attach_host(
     headers: Headers,
     Json(attach): Json<HostAttach>,
     State(cache): State<Cache>,
+    State(commands): State<Signal>,
     db: DurableDb,
     kv: DurableKv,
 ) -> Outcome<Json<HostAttachResponse>> {
-    attach_inner(&headers, &attach, &db, &kv, &cache)
+    attach_inner(&headers, &attach, &db, &kv, &cache, &commands)
         .await
         .into()
 }
@@ -183,6 +193,7 @@ async fn attach_inner(
     db: &DurableDb,
     kv: &DurableKv,
     cache: &Cache,
+    commands: &Signal,
 ) -> Result<Json<HostAttachResponse>, ApiError> {
     internal(headers)?;
     ensure_schema(db, cache)
@@ -212,20 +223,22 @@ async fn attach_inner(
     put_facts(kv, &attach.facts)
         .await
         .map_err(|error| room_failed(&error))?;
+    commands.notify();
     tracing::info!(hostname = %attach.facts.hostname, epoch, "a host attached to its room");
     Ok(Json(HostAttachResponse { epoch }))
 }
 
 /// Holds a machine's command stream open: a cursor over `host_commands`,
-/// polled until the attach it serves is superseded. See [`crate::room`]
-/// for why storage is the rendezvous.
+/// woken by in-memory signals when commands land or the attach is
+/// superseded.
 async fn stream_commands(
     headers: Headers,
     Query(cursor): Query<HostCommandCursor>,
     State(cache): State<Cache>,
+    State(commands): State<Signal>,
     db: DurableDb,
 ) -> Outcome<Sse> {
-    open_command_stream(&headers, cursor.epoch, db, &cache)
+    open_command_stream(&headers, cursor.epoch, db, &cache, commands)
         .await
         .into()
 }
@@ -235,6 +248,7 @@ async fn open_command_stream(
     epoch: u64,
     db: DurableDb,
     cache: &Cache,
+    signal: Signal,
 ) -> Result<Sse, ApiError> {
     internal(headers)?;
     ensure_schema(&db, cache)
@@ -257,6 +271,7 @@ async fn open_command_stream(
     Ok(crate::sse::serve(
         CommandFeed {
             db,
+            signal,
             epoch,
             cursor: 0,
             superseded_announced: false,
@@ -270,6 +285,8 @@ async fn open_command_stream(
 /// The command stream's working state.
 struct CommandFeed {
     db: DurableDb,
+    /// Shared wakeup signal notified on new commands or a superseding attach.
+    signal: Signal,
     /// The attach this stream serves; a newer one ends it.
     epoch: u64,
     /// How far down `host_commands` this stream has handed over.
@@ -279,92 +296,132 @@ struct CommandFeed {
     /// host has not yet answered — the mailbox semantic the room owes.
     cursor: u64,
     /// Whether the supersession notice has already been emitted — the next
-    /// poll ends the body.
+    /// step ends the body.
     superseded_announced: bool,
     /// When presence was last renewed, seconds.
     last_touch: u64,
 }
 
-/// One poll of the host's command stream.
+/// One step of the host's command stream.
 fn poll_command_feed(feed: &mut CommandFeed) -> crate::sse::PollFn<'_> {
-    Box::pin(async move {
-        command_feed_step(feed)
-            .await
-            .unwrap_or(crate::sse::Poll::Idle)
-    })
+    Box::pin(command_feed_step(feed))
 }
 
-/// One poll step; a failed read is a warning and an idle tick, not a
-/// dead stream.
-async fn command_feed_step(feed: &mut CommandFeed) -> Result<crate::sse::Poll, ()> {
-    let now = now_unix();
+/// Helper to park a feed briefly after a transient storage failure.
+fn retry_wait(signal: &Signal, seen: u64) -> crate::sse::Poll {
+    crate::sse::Poll::Wait {
+        signal: Some((signal.clone(), seen)),
+        after: Some(crate::sse::RETRY_WAIT),
+    }
+}
+
+/// Checks supersession and renews host presence when due.
+///
+/// Returns `Some(poll)` when the step should immediately emit or end/wait,
+/// or `None` to proceed to reading `host_commands`.
+async fn step_host_presence(
+    feed: &mut CommandFeed,
+    seen: u64,
+    now: u64,
+) -> Option<crate::sse::Poll> {
     let db = &feed.db;
-    let presence = read_presence(db).await.map_err(|error| {
-        tracing::warn!(%error, "a host command stream could not read presence");
-    })?;
+    let presence = match read_presence(db).await {
+        Ok(presence) => presence,
+        Err(error) => {
+            tracing::warn!(%error, "a host command stream could not read presence");
+            return Some(retry_wait(&feed.signal, seen));
+        }
+    };
     if let Some(row) = presence
         && row.epoch != feed.epoch
     {
-        // The attach this stream serves was superseded. As in the session
-        // room the losing host is told outright before the stream ends —
-        // a bare EOF is indistinguishable from a dropped connection, and
-        // an uninformed loser re-attaches into the epoch that replaced it.
-        // The poll cannot emit and end in one step, so the command goes
-        // out this tick and `Poll::End` the next.
         if feed.superseded_announced {
-            return Ok(crate::sse::Poll::End);
+            return Some(crate::sse::Poll::End);
         }
         feed.superseded_announced = true;
-        let envelope = serde_json::to_string(&HostCommand {
+        let envelope = match serde_json::to_string(&HostCommand {
             seq: None,
             command: ControlToHost::Superseded,
-        })
-        .map_err(|error| {
-            tracing::warn!(%error, "a host command stream could not encode its supersession");
-        })?;
-        return Ok(crate::sse::Poll::Emit(vec![
+        }) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                tracing::warn!(%error, "a host command stream could not encode its supersession");
+                return Some(crate::sse::Poll::End);
+            }
+        };
+        return Some(crate::sse::Poll::Emit(vec![
             Event::data(envelope).event("command"),
         ]));
     }
     if now.saturating_sub(feed.last_touch) >= PRESENCE_REFRESH_SECONDS {
         let live_until = now.saturating_add(PRESENCE_TTL_SECONDS);
         let epoch = feed.epoch;
-        sql!(
+        if let Err(error) = sql!(
             db,
             "UPDATE host_presence SET live_until = {live_until} \
              WHERE id = 0 AND epoch = {epoch}"
         )
         .execute()
         .await
-        .map_err(|error| {
+        {
             tracing::warn!(%error, "a host command stream could not renew presence");
-        })?;
+            return Some(retry_wait(&feed.signal, seen));
+        }
         feed.last_touch = now;
+    }
+    None
+}
+
+/// One step of the host's command stream: checks the row budget before
+/// reading `host_commands`, debits rows returned, and closes cleanly on
+/// [`ApiError::RowBudgetExceeded`].
+async fn command_feed_step(feed: &mut CommandFeed) -> crate::sse::Poll {
+    let seen = feed.signal.version();
+    let now = now_unix();
+    if let Some(poll) = step_host_presence(feed, seen, now).await {
+        return poll;
+    }
+
+    let db = &feed.db;
+    if let Err(error) = crate::row_budget::check_budget(db).await {
+        if matches!(error, ApiError::RowBudgetExceeded) {
+            tracing::warn!("a host command stream closed: row budget exhausted");
+            return crate::sse::Poll::End;
+        }
+        tracing::warn!(%error, "a host command stream could not check the row budget");
+        return retry_wait(&feed.signal, seen);
     }
 
     let cursor = feed.cursor;
-    let rows: Vec<CommandRow> = sql!(
+    let limit = COMMAND_BATCH_LIMIT;
+    let rows: Vec<CommandRow> = match sql!(
         db,
-        "SELECT seq, json FROM host_commands WHERE seq > {cursor} ORDER BY seq"
+        "SELECT seq, json FROM host_commands WHERE seq > {cursor} ORDER BY seq LIMIT {limit}"
     )
     .fetch_all()
     .await
-    .map_err(|error| {
-        tracing::warn!(%error, "a host command stream could not poll its commands");
-    })?;
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "a host command stream could not poll its commands");
+            return retry_wait(&feed.signal, seen);
+        }
+    };
     if rows.is_empty() {
-        return Ok(crate::sse::Poll::Idle);
+        let refresh_in = PRESENCE_REFRESH_SECONDS
+            .saturating_sub(now.saturating_sub(feed.last_touch))
+            .max(1);
+        return crate::sse::Poll::Wait {
+            signal: Some((feed.signal.clone(), seen)),
+            after: Some(Duration::from_secs(refresh_in)),
+        };
     }
-    // The poll just drained `rows` of backlog — bill them. An idle poll
-    // reads nothing and is billed nothing: a stream's keepalive cadence
-    // must not spend the budget a backlog could.
-    crate::row_budget::charge_reads(db, rows.len() as u64)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "a host command stream hit the row budget");
-        })?;
+    if let Err(error) = crate::row_budget::debit_reads(db, rows.len() as u64).await {
+        tracing::warn!(%error, "a host command stream could not debit the row budget");
+        return retry_wait(&feed.signal, seen);
+    }
     feed.cursor = rows.last().map_or(feed.cursor, |row| row.seq);
-    Ok(crate::sse::Poll::Emit(
+    crate::sse::Poll::Emit(
         rows.iter()
             .map(|row| {
                 let envelope = serde_json::json!({
@@ -376,7 +433,7 @@ async fn command_feed_step(feed: &mut CommandFeed) -> Result<crate::sse::Poll, (
                     .id(row.seq.to_string())
             })
             .collect(),
-    ))
+    )
 }
 
 /// Accepts one batch of a machine's outbound frames.
@@ -507,6 +564,7 @@ async fn hold(
     container: Option<&str>,
     command: &ControlToHost,
     cache: &Cache,
+    commands: &Signal,
 ) -> Result<(), DurableObjectError> {
     let json = serde_json::to_string(command)
         .map_err(|error| DurableObjectError::Serialization(error.to_string()))?;
@@ -530,6 +588,7 @@ async fn hold(
         .await
         .map_err(|error| stored(&error)),
     }?;
+    commands.notify();
     Ok(())
 }
 
@@ -688,9 +747,12 @@ async fn run_command(
     headers: Headers,
     body: Bytes,
     State(cache): State<Cache>,
+    State(commands): State<Signal>,
     db: DurableDb,
 ) -> Outcome<NoContent> {
-    dispatch(&headers, &body, &db, &cache).await.into()
+    dispatch(&headers, &body, &db, &cache, &commands)
+        .await
+        .into()
 }
 
 /// Reads the command out of the body itself.
@@ -706,10 +768,11 @@ async fn dispatch(
     body: &[u8],
     db: &DurableDb,
     cache: &Cache,
+    commands: &Signal,
 ) -> Result<NoContent, ApiError> {
     let command: ControlToHost = serde_json::from_slice(body)
         .map_err(|error| ApiError::Room(format!("a host command did not decode: {error}")))?;
-    dispatch_command(headers, &command, db, cache).await
+    dispatch_command(headers, &command, db, cache, commands).await
 }
 
 async fn dispatch_command(
@@ -717,6 +780,7 @@ async fn dispatch_command(
     command: &ControlToHost,
     db: &DurableDb,
     cache: &Cache,
+    commands: &Signal,
 ) -> Result<NoContent, ApiError> {
     internal(headers)?;
     ensure_schema(db, cache)
@@ -729,7 +793,7 @@ async fn dispatch_command(
     let live = host_live(db).await.map_err(|error| room_failed(&error))?;
     match command {
         ControlToHost::Run { job } => {
-            hold(db, Some(job.container()), command, cache)
+            hold(db, Some(job.container()), command, cache, commands)
                 .await
                 .map_err(|error| room_failed(&error))?;
         }
@@ -744,7 +808,7 @@ async fn dispatch_command(
             ))));
         }
         _ if live => {
-            hold(db, None, command, cache)
+            hold(db, None, command, cache, commands)
                 .await
                 .map_err(|error| room_failed(&error))?;
         }

@@ -12,10 +12,9 @@
 //! addresses nothing but itself — and a browser holding one connection
 //! per session would pay a stream per open tab. The user object is the
 //! fan-in: session rooms stay session-shaped, and this object is the one
-//! place a user's whole event flow can be read from. It keeps the same
-//! contract the rooms keep: rows, not subscribers, because the object
-//! serving a stream shares no memory with the one that answered a
-//! publish.
+//! place a user's whole event flow can be read from. Rows persist the
+//! reconnect buffer across eviction while an in-memory [`Signal`] wakes
+//! live streams the moment a publish commits.
 //!
 //! # Retention
 //!
@@ -44,6 +43,7 @@ use crate::problem::Outcome;
 use crate::respond::NoContent;
 use crate::room::{EmittedEvent, HEADER_INTERNAL, INTERNAL};
 use crate::schema_version::Cache;
+use crate::sse::Signal;
 
 /// Names the user a Worker→object call belongs to.
 pub const HEADER_USER: &str = "x-flyco-user";
@@ -54,6 +54,9 @@ pub const HEADER_USER: &str = "x-flyco-user";
 /// past it, the client refills from the session's own `events?after=`
 /// history, which is the authoritative copy.
 const EVENT_TTL_SECONDS: u64 = 3600;
+
+/// Most buffered events one SSE step reads at a time.
+const EVENT_BATCH_LIMIT: u64 = 500;
 
 /// What the Worker publishes: the events one room call produced, with the
 /// session they belong to.
@@ -93,12 +96,14 @@ struct EventRow {
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[skyzen::durable_object]
 pub struct UserEvents {
-    /// The schema version this activation already verified — a memo,
-    /// reset with the object on every event, never a fact of its own: it
-    /// can only trail the `schema_meta` row, never lead it. Not part of
-    /// the state blob, which stays the `null` a rolled-back build reads.
+    /// The schema version this activation already verified — a memo shared
+    /// across every request on this activation, never part of the state
+    /// blob.
     #[serde(skip)]
     schema: Cache,
+    /// Wakes open SSE streams the moment a publish commits new rows.
+    #[serde(skip)]
+    signal: Signal,
 }
 
 impl DurableObject for UserEvents {
@@ -106,12 +111,13 @@ impl DurableObject for UserEvents {
     /// blob to load and save around an event.
     const PERSIST: bool = false;
 
-    fn fetch(&mut self) -> Router {
+    fn fetch(&self) -> Router {
         Route::new((
             "/internal/publish".post(publish),
             "/internal/stream".at(stream),
         ))
         .with(State(self.schema.clone()))
+        .with(State(self.signal.clone()))
         .build()
     }
 }
@@ -134,7 +140,7 @@ fn internal(headers: &Headers) -> Result<(), ApiError> {
 /// itself remembers having read it: checking an answer the object already
 /// holds costs nothing at all. Bump it when the DDL below changes so a
 /// buffer built by an older build upgrades once, on its next call.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Creates the buffer table if this is the object's first write.
 async fn ensure_schema(db: &DurableDb, cache: &Cache) -> Result<(), DurableObjectError> {
@@ -151,8 +157,11 @@ async fn ensure_schema(db: &DurableDb, cache: &Cache) -> Result<(), DurableObjec
             // The TTL sweep in `publish` deletes by `at_unix`; without this
             // index every publish scans the whole buffer.
             "CREATE INDEX IF NOT EXISTS user_events_at ON user_events (at_unix)",
+            // A `?session=` stream reads `WHERE session = ? AND seq > ? ORDER BY seq`;
+            // without this index it scans every sibling session's rows.
+            "CREATE INDEX IF NOT EXISTS user_events_session_seq ON user_events (session, seq)",
             // The user's row-read ledger — one row per UTC day, debited by
-            // `row_budget::charge_reads`, and the circuit breaker that keeps a
+            // `row_budget::debit_reads`, and the circuit breaker that keeps a
             // runaway reader here from spending the account's quota.
             crate::row_budget::SCHEMA,
         ],
@@ -168,9 +177,12 @@ async fn publish(
     headers: Headers,
     Json(body): Json<PublishEvents>,
     State(cache): State<Cache>,
+    State(signal): State<Signal>,
     db: DurableDb,
 ) -> Outcome<NoContent> {
-    publish_inner(&headers, body, &db, &cache).await.into()
+    publish_inner(&headers, body, &db, &cache, &signal)
+        .await
+        .into()
 }
 
 async fn publish_inner(
@@ -178,12 +190,14 @@ async fn publish_inner(
     body: PublishEvents,
     db: &DurableDb,
     cache: &Cache,
+    signal: &Signal,
 ) -> Result<NoContent, ApiError> {
     internal(headers)?;
     ensure_schema(db, cache)
         .await
         .map_err(|error| room_failed(&error))?;
 
+    let published = !body.events.is_empty();
     let session_id = body.session.to_string();
     let session = session_id.as_str();
     let now = now_unix();
@@ -210,6 +224,9 @@ async fn publish_inner(
         .execute()
         .await
         .map_err(|error| room_failed(&error))?;
+    if published {
+        signal.notify();
+    }
     Ok(NoContent)
 }
 
@@ -218,9 +235,10 @@ async fn stream(
     headers: Headers,
     Query(cursor): Query<StreamCursor>,
     State(cache): State<Cache>,
+    State(signal): State<Signal>,
     db: DurableDb,
 ) -> Outcome<Sse> {
-    open_stream(&headers, cursor.after, cursor.session, db, &cache)
+    open_stream(&headers, cursor.after, cursor.session, db, &cache, signal)
         .await
         .into()
 }
@@ -231,6 +249,7 @@ async fn open_stream(
     session: Option<SessionId>,
     db: DurableDb,
     cache: &Cache,
+    signal: Signal,
 ) -> Result<Sse, ApiError> {
     internal(headers)?;
     ensure_schema(&db, cache)
@@ -249,6 +268,7 @@ async fn open_stream(
     Ok(crate::sse::serve(
         EventFeed {
             db,
+            signal,
             cursor,
             session,
         },
@@ -260,68 +280,96 @@ async fn open_stream(
 /// The stream's working state.
 struct EventFeed {
     db: DurableDb,
+    /// Shared wakeup signal notified whenever `publish` inserts rows.
+    signal: Signal,
     /// How far down the buffer this stream has handed over.
     cursor: u64,
     /// The one session to emit, when the caller is following one.
     session: Option<SessionId>,
 }
 
-/// One poll of the user event stream.
+/// One step of the user event stream.
 fn poll_event_feed(feed: &mut EventFeed) -> crate::sse::PollFn<'_> {
-    Box::pin(async move {
-        event_feed_step(feed)
-            .await
-            .unwrap_or(crate::sse::Poll::Idle)
-    })
+    Box::pin(event_feed_step(feed))
 }
 
-/// One poll step; a failed read is a warning and an idle tick, not a
-/// dead stream.
-async fn event_feed_step(feed: &mut EventFeed) -> Result<crate::sse::Poll, ()> {
-    let cursor = feed.cursor;
-    let session = feed.session.map(|id| id.to_string());
+/// One step of the user event stream: checks the row budget before
+/// reading storage, debits the rows returned, and closes the stream
+/// cleanly on [`ApiError::RowBudgetExceeded`].
+async fn event_feed_step(feed: &mut EventFeed) -> crate::sse::Poll {
+    let seen = feed.signal.version();
     let db = &feed.db;
+    if let Err(error) = crate::row_budget::check_budget(db).await {
+        if matches!(error, ApiError::RowBudgetExceeded) {
+            tracing::warn!("an event stream closed: row budget exhausted");
+            return crate::sse::Poll::End;
+        }
+        tracing::warn!(%error, "an event stream could not check the row budget");
+        return crate::sse::Poll::Wait {
+            signal: Some((feed.signal.clone(), seen)),
+            after: Some(crate::sse::RETRY_WAIT),
+        };
+    }
+
+    let cursor = feed.cursor;
+    let limit = EVENT_BATCH_LIMIT;
+    let session = feed.session.map(|id| id.to_string());
     let rows: Vec<EventRow> = match session {
-        // Both filters read the same two indexes; written twice rather
-        // than composed, because a `sql!` parameter cannot express an
-        // optional clause.
-        Some(session) => sql!(
+        // Written twice rather than composed because a `sql!` parameter
+        // cannot express an optional clause.
+        Some(session) => match sql!(
             db,
             "SELECT seq, json FROM user_events \
-             WHERE seq > {cursor} AND session = {session} ORDER BY seq"
+             WHERE session = {session} AND seq > {cursor} ORDER BY seq LIMIT {limit}"
         )
         .fetch_all()
         .await
-        .map_err(|error| {
-            tracing::warn!(%error, "an event stream could not poll its buffer");
-        })?,
-        None => sql!(
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "an event stream could not poll its buffer");
+                return crate::sse::Poll::Wait {
+                    signal: Some((feed.signal.clone(), seen)),
+                    after: Some(crate::sse::RETRY_WAIT),
+                };
+            }
+        },
+        None => match sql!(
             db,
-            "SELECT seq, json FROM user_events WHERE seq > {cursor} ORDER BY seq"
+            "SELECT seq, json FROM user_events WHERE seq > {cursor} ORDER BY seq LIMIT {limit}"
         )
         .fetch_all()
         .await
-        .map_err(|error| {
-            tracing::warn!(%error, "an event stream could not poll its buffer");
-        })?,
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "an event stream could not poll its buffer");
+                return crate::sse::Poll::Wait {
+                    signal: Some((feed.signal.clone(), seen)),
+                    after: Some(crate::sse::RETRY_WAIT),
+                };
+            }
+        },
     };
     if rows.is_empty() {
-        return Ok(crate::sse::Poll::Idle);
+        return crate::sse::Poll::Wait {
+            signal: Some((feed.signal.clone(), seen)),
+            after: None,
+        };
     }
-    // The poll just drained `rows` of backlog — bill them. An idle poll
-    // reads nothing and is billed nothing: a stream's keepalive cadence
-    // must not spend the budget a backlog could.
-    crate::row_budget::charge_reads(db, rows.len() as u64)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "an event stream hit the row budget");
-        })?;
+    if let Err(error) = crate::row_budget::debit_reads(db, rows.len() as u64).await {
+        tracing::warn!(%error, "an event stream could not debit the row budget");
+        return crate::sse::Poll::Wait {
+            signal: Some((feed.signal.clone(), seen)),
+            after: Some(crate::sse::RETRY_WAIT),
+        };
+    }
     feed.cursor = rows.last().map_or(feed.cursor, |row| row.seq);
-    Ok(crate::sse::Poll::Emit(
+    crate::sse::Poll::Emit(
         rows.into_iter()
             .map(|row| Event::data(row.json).id(row.seq.to_string()))
             .collect(),
-    ))
+    )
 }
 
 fn room_failed(error: &impl core::fmt::Display) -> ApiError {

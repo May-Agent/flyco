@@ -54,7 +54,7 @@ use flyco_core::{
     ShellOutcome, ShellRunId, StopReason, Usd, WorkdirRequestId,
 };
 use futures_util::StreamExt as _;
-use rand::Rng as _;
+use rand::RngExt as _;
 use tokio::sync::mpsc;
 
 use crate::config::{GithubAccess, RepoConfig, valid_repo_dir};

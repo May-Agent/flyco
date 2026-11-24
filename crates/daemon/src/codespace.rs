@@ -144,13 +144,13 @@ async fn fetch(
     let mut wait = RETRY_INITIAL;
 
     loop {
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let asked = client
             .post(&url)
             .map(|request| request.bearer_auth(token.to_owned()))
             .and_then(|request| request.json_body(&ask(codespace_name)));
         match asked {
-            Ok(request) => match request.await {
+            Ok(request) => match request.await.map_err(zenwave::Error::from) {
                 Ok(response) => {
                     return response
                         .into_json::<CodespacesBootstrap>()

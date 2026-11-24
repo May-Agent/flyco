@@ -256,7 +256,7 @@ async fn a_manifest_that_disagrees_with_the_upload_is_refused(
     );
 
     // A refused complete neither finishes the row nor frees the machine.
-    assert!(queued(&queue).await.is_empty());
+    assert_eq!(queued(&queue).await, Vec::new());
     let session_id = session;
     let pending: Option<Option<i64>> = sql!(
         db,

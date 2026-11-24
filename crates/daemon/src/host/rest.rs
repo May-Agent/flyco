@@ -35,14 +35,14 @@ use crate::control::rest::{CommandStream, ControlApiError, command_stream, refus
 /// unknown, expired or already spent.
 pub async fn enroll(base: &Url, request: &EnrollHost) -> Result<EnrolledHost, ControlApiError> {
     let url = join(base, "v1/hosts/enroll")?;
-    let mut client = zenwave::client();
+    let mut client = zenwave::client().error_for_status();
     client
         .post(&url)
         .map_err(transport)?
         .json_body(request)
         .map_err(transport)?
         .await
-        .map_err(|error| refused("POST", &url, &error))?
+        .map_err(|error| refused("POST", &url, error))?
         .into_json::<EnrolledHost>()
         .await
         .map_err(transport)
@@ -93,7 +93,7 @@ impl HttpHostApi {
 impl JobResults for HttpHostApi {
     async fn report(&self, report: ReportJobResult) -> Result<(), ControlApiError> {
         let url = join(&self.base, &format!("v1/hosts/{}/job-results", self.host))?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -101,7 +101,7 @@ impl JobResults for HttpHostApi {
             .json_body(&report)
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -166,7 +166,7 @@ pub trait HostTransport: Send + Sync + 'static {
 impl HostTransport for HttpHostApi {
     async fn attach(&self, facts: &HostFacts) -> Result<HostAttached, ControlApiError> {
         let url = join(&self.base, &format!("v1/hosts/{}/relay/attach", self.host))?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -176,7 +176,7 @@ impl HostTransport for HttpHostApi {
             })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         response
             .into_json::<HostAttached>()
@@ -193,20 +193,20 @@ impl HostTransport for HttpHostApi {
             &self.base,
             &format!("v1/hosts/{}/relay/commands?epoch={epoch}", self.host),
         )?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .get(&url)
             .map_err(transport)?
             .bearer_auth(self.token.clone())
             .await
-            .map_err(|error| refused("GET", &url, &error))?;
+            .map_err(|error| refused("GET", &url, error))?;
 
         Ok(command_stream(response.into_body(), idle))
     }
 
     async fn frames(&self, batch: &HostFrames) -> Result<(), ControlApiError> {
         let url = join(&self.base, &format!("v1/hosts/{}/relay/frames", self.host))?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         client
             .post(&url)
             .map_err(transport)?
@@ -214,7 +214,7 @@ impl HostTransport for HttpHostApi {
             .json_body(batch)
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
         Ok(())
     }
 }

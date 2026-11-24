@@ -325,8 +325,7 @@ impl PriceCatalog {
                 prices
                     .iter()
                     .find(|(name, _)| name == machine_type)
-                    .map(|(_, prices)| *prices)
-                    .unwrap_or_default()
+                    .map_or_default(|(_, prices)| *prices)
             })
     }
 

@@ -597,7 +597,7 @@ fn describe_opened(
             .and_then(|value| {
                 serde_json::from_value::<Vec<aither_acp::AvailableCommand>>(value.clone()).ok()
             })
-            .map(|commands| {
+            .map_or_default(|commands| {
                 commands
                     .into_iter()
                     .map(|command| flyco_core::HarnessCommand {
@@ -606,8 +606,7 @@ fn describe_opened(
                         argument_hint: command.input.map(|input| input.hint),
                     })
                     .collect()
-            })
-            .unwrap_or_default(),
+            }),
         notice,
     }
 }
@@ -855,21 +854,18 @@ fn mounted_server(entry: &Value) -> Option<MountedServer> {
         .and_then(Value::as_str)
         .unwrap_or("notStarted")
         .to_owned();
-    let tools = entry
-        .get("tools")
-        .map(|tools| match tools {
-            Value::Object(map) => map.keys().cloned().collect(),
-            Value::Array(list) => list
-                .iter()
-                .filter_map(|tool| {
-                    tool.as_str()
-                        .map(str::to_owned)
-                        .or_else(|| tool.get("name").and_then(Value::as_str).map(str::to_owned))
-                })
-                .collect(),
-            _ => Vec::new(),
-        })
-        .unwrap_or_default();
+    let tools = entry.get("tools").map_or_default(|tools| match tools {
+        Value::Object(map) => map.keys().cloned().collect(),
+        Value::Array(list) => list
+            .iter()
+            .filter_map(|tool| {
+                tool.as_str()
+                    .map(str::to_owned)
+                    .or_else(|| tool.get("name").and_then(Value::as_str).map(str::to_owned))
+            })
+            .collect(),
+        _ => Vec::new(),
+    });
     Some(MountedServer {
         name,
         state: match status.as_str() {

@@ -1005,7 +1005,10 @@ mod tests {
         let mut archive =
             zip::ZipArchive::new(std::io::Cursor::new(packed)).expect("a readable archive");
         assert_eq!(archive.len(), 2);
-        let names: Vec<String> = archive.file_names().map(ToOwned::to_owned).collect();
+        let names: Vec<String> = archive
+            .file_names()
+            .map(|name| name.expect("valid archive entry name").into_owned())
+            .collect();
         assert!(names.contains(&"SKILL.md".to_owned()));
         assert!(names.contains(&"scripts/run.sh".to_owned()));
         let mut entry = archive.by_name("scripts/run.sh").expect("the script");

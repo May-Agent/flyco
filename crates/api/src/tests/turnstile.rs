@@ -109,7 +109,7 @@ async fn siteverify_failing_is_an_outage_not_a_sign_in(ctx: TestContext, kv: Kv,
         response.json::<flyco_core::Problem>().kind,
         "https://flyco.dev/problems/turnstile-unavailable"
     );
-    assert!(minted_states(&kv).await.is_empty());
+    assert_eq!(minted_states(&kv).await, [] as [std::string::String; 0]);
 }
 
 #[skyzen::test]

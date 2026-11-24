@@ -106,13 +106,20 @@ pub(crate) fn transport(error: impl core::fmt::Display) -> ControlApiError {
 
 /// Turns a zenwave failure into the richest error its body supports.
 ///
-/// zenwave answers a non-2xx with `Error::Http`, having already read the
-/// body — so the control plane's own RFC 9457 explanation is right there,
-/// and a refusal reaches the daemon's log saying *why* rather than showing
-/// a bare status line.
-pub(crate) fn refused(method: &'static str, path: &str, error: &zenwave::Error) -> ControlApiError {
+/// Clients opted into [`zenwave::ErrorForStatus`] answer a non-2xx with
+/// `Error::Http`, having already read the body — so the control plane's own
+/// RFC 9457 explanation is right there, and a refusal reaches the daemon's
+/// log saying *why* rather than showing a bare status line.
+pub(crate) fn refused(
+    method: &'static str,
+    path: &str,
+    error: impl Into<zenwave::Error>,
+) -> ControlApiError {
+    let error = error.into();
     let zenwave::Error::Http {
-        status, response, ..
+        status,
+        ref response,
+        ..
     } = error
     else {
         return ControlApiError::Transport(error.to_string());
@@ -581,7 +588,7 @@ impl ApprovalRaiser for HttpControlApi {
         payload: ApprovalPayload,
     ) -> Result<ApprovalId, ControlApiError> {
         let url = self.url("approvals")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -589,7 +596,7 @@ impl ApprovalRaiser for HttpControlApi {
             .json_body(&payload)
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         response
             .into_json::<ApprovalView>()
@@ -607,7 +614,7 @@ impl ControlApi for HttpControlApi {
         body: Vec<u8>,
     ) -> Result<(), ControlApiError> {
         let url = self.url(&format!("transcript/{stream}/batches/{seq}"))?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .put(&url)
             .map_err(transport)?
@@ -616,7 +623,7 @@ impl ControlApi for HttpControlApi {
             .map_err(transport)?
             .bytes_body(body)
             .await
-            .map_err(|error| refused("PUT", &url, &error))?;
+            .map_err(|error| refused("PUT", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -627,7 +634,7 @@ impl ControlApi for HttpControlApi {
         observation: HarnessObservation,
     ) -> Result<(), ControlApiError> {
         let url = self.url("harness-observations")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -635,7 +642,7 @@ impl ControlApi for HttpControlApi {
             .json_body(&observation)
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -652,7 +659,7 @@ impl ControlApi for HttpControlApi {
         }
 
         let url = self.url("usage-limit")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -660,7 +667,7 @@ impl ControlApi for HttpControlApi {
             .json_body(&Body { window })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -673,7 +680,7 @@ impl ControlApi for HttpControlApi {
         }
 
         let url = self.url("models")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .put(&url)
             .map_err(transport)?
@@ -681,7 +688,7 @@ impl ControlApi for HttpControlApi {
             .json_body(&Body { models })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("PUT", &url, &error))?;
+            .map_err(|error| refused("PUT", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -689,7 +696,7 @@ impl ControlApi for HttpControlApi {
 
     async fn report_startup_failure(&self, message: String) -> Result<(), ControlApiError> {
         let url = self.url("startup-failure")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -697,7 +704,7 @@ impl ControlApi for HttpControlApi {
             .json_body(&ReportStartupFailure { message })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -705,7 +712,7 @@ impl ControlApi for HttpControlApi {
 
     async fn report_spot_notice(&self, seconds_remaining: u32) -> Result<(), ControlApiError> {
         let url = self.url("spot-notice")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -713,7 +720,7 @@ impl ControlApi for HttpControlApi {
             .json_body(&ReportSpotNotice { seconds_remaining })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -721,7 +728,7 @@ impl ControlApi for HttpControlApi {
 
     async fn report_stopping(&self, reason: StopReason) -> Result<(), ControlApiError> {
         let url = self.url("stopping")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -729,7 +736,7 @@ impl ControlApi for HttpControlApi {
             .json_body(&ReportStopping { reason })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -737,7 +744,7 @@ impl ControlApi for HttpControlApi {
 
     async fn report_stage(&self, stage: ProvisioningStage) -> Result<(), ControlApiError> {
         let url = self.url("provisioning-stage")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -745,7 +752,7 @@ impl ControlApi for HttpControlApi {
             .json_body(&ReportProvisioningStage { stage })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -773,7 +780,7 @@ impl ControlApi for HttpControlApi {
         }
 
         let url = self.url("harness-session")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .put(&url)
             .map_err(transport)?
@@ -781,7 +788,7 @@ impl ControlApi for HttpControlApi {
             .json_body(&Body { harness_session_id })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("PUT", &url, &error))?;
+            .map_err(|error| refused("PUT", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -793,7 +800,7 @@ impl ControlApi for HttpControlApi {
         patch: Vec<u8>,
     ) -> Result<(), ControlApiError> {
         let url = self.patch_url(dir)?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .put(&url)
             .map_err(transport)?
@@ -802,7 +809,7 @@ impl ControlApi for HttpControlApi {
             .map_err(transport)?
             .bytes_body(patch)
             .await
-            .map_err(|error| refused("PUT", &url, &error))?;
+            .map_err(|error| refused("PUT", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -814,22 +821,19 @@ impl ControlApi for HttpControlApi {
     ) -> Result<Option<Vec<u8>>, ControlApiError> {
         let url = self.patch_url(dir)?;
         let mut client = zenwave::client();
-        let response = match client
+        let response = client
             .get(&url)
             .map_err(transport)?
             .bearer_auth(self.token.clone())
             .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                if let zenwave::Error::Http { status, .. } = &error
-                    && status.as_u16() == 404
-                {
-                    return Ok(None);
-                }
-                return Err(refused("GET", &url, &error));
-            }
-        };
+            .map_err(transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let response = response
+            .error_for_status()
+            .await
+            .map_err(|error| refused("GET", &url, error))?;
         let body = response.into_bytes().await.map_err(transport)?;
         Ok(Some(body.to_vec()))
     }
@@ -837,22 +841,19 @@ impl ControlApi for HttpControlApi {
     async fn get_handoff(&self) -> Result<Option<HandoffView>, ControlApiError> {
         let url = self.url("handoff")?;
         let mut client = zenwave::client();
-        let response = match client
+        let response = client
             .get(&url)
             .map_err(transport)?
             .bearer_auth(self.token.clone())
             .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                if let zenwave::Error::Http { status, .. } = &error
-                    && status.as_u16() == 404
-                {
-                    return Ok(None);
-                }
-                return Err(refused("GET", &url, &error));
-            }
-        };
+            .map_err(transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let response = response
+            .error_for_status()
+            .await
+            .map_err(|error| refused("GET", &url, error))?;
         response
             .into_json::<HandoffView>()
             .await
@@ -863,22 +864,19 @@ impl ControlApi for HttpControlApi {
     async fn get_handoff_transcript(&self) -> Result<Option<Vec<u8>>, ControlApiError> {
         let url = self.url("handoff/transcript")?;
         let mut client = zenwave::client();
-        let response = match client
+        let response = client
             .get(&url)
             .map_err(transport)?
             .bearer_auth(self.token.clone())
             .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                if let zenwave::Error::Http { status, .. } = &error
-                    && status.as_u16() == 404
-                {
-                    return Ok(None);
-                }
-                return Err(refused("GET", &url, &error));
-            }
-        };
+            .map_err(transport)?;
+        if response.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        let response = response
+            .error_for_status()
+            .await
+            .map_err(|error| refused("GET", &url, error))?;
         let body = response.into_bytes().await.map_err(transport)?;
         Ok(Some(body.to_vec()))
     }
@@ -889,25 +887,25 @@ impl ControlApi for HttpControlApi {
 
     async fn skill_bundle(&self, skill: SkillId) -> Result<Vec<u8>, ControlApiError> {
         let url = self.url(&format!("skills/{skill}/bundle"))?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .get(&url)
             .map_err(transport)?
             .bearer_auth(self.token.clone())
             .await
-            .map_err(|error| refused("GET", &url, &error))?;
+            .map_err(|error| refused("GET", &url, error))?;
         Ok(response.into_bytes().await.map_err(transport)?.to_vec())
     }
 
     async fn get_transcript(&self, stream: &str) -> Result<TranscriptRead, ControlApiError> {
         let url = self.url(&format!("transcript/{stream}"))?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .get(&url)
             .map_err(transport)?
             .bearer_auth(self.token.clone())
             .await
-            .map_err(|error| refused("GET", &url, &error))?;
+            .map_err(|error| refused("GET", &url, error))?;
 
         let batches = response
             .headers()
@@ -1046,13 +1044,21 @@ where
     use futures_util::StreamExt as _;
 
     let chunks = futures_util::stream::try_unfold(Box::pin(body), move |mut body| async move {
-        match tokio::time::timeout(idle, body.next()).await {
-            Ok(Some(Ok(bytes))) => Ok(Some((bytes, body))),
-            Ok(Some(Err(error))) => Err(ControlApiError::Transport(error.to_string())),
-            Ok(None) => Ok(None),
-            Err(_elapsed) => Err(ControlApiError::Transport(format!(
-                "the command stream went silent for {idle:?}"
-            ))),
+        loop {
+            match tokio::time::timeout(idle, body.next()).await {
+                Ok(Some(Ok(frame))) => {
+                    if let Some(bytes) = frame.as_data() {
+                        return Ok(Some((bytes.clone(), body)));
+                    }
+                }
+                Ok(Some(Err(error))) => return Err(ControlApiError::Transport(error.to_string())),
+                Ok(None) => return Ok(None),
+                Err(_elapsed) => {
+                    return Err(ControlApiError::Transport(format!(
+                        "the command stream went silent for {idle:?}"
+                    )));
+                }
+            }
         }
     });
     let stream = chunks.eventsource().map(|event| match event {
@@ -1067,7 +1073,7 @@ where
 impl RelayTransport for HttpControlApi {
     async fn attach(&self) -> Result<DaemonAttached, ControlApiError> {
         let url = self.url("relay/attach")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -1077,7 +1083,7 @@ impl RelayTransport for HttpControlApi {
             })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         response
             .into_json::<DaemonAttached>()
@@ -1091,20 +1097,20 @@ impl RelayTransport for HttpControlApi {
         idle: Duration,
     ) -> Result<CommandStream<DaemonCommand>, ControlApiError> {
         let url = self.url(&format!("relay/commands?epoch={epoch}"))?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .get(&url)
             .map_err(transport)?
             .bearer_auth(self.token.clone())
             .await
-            .map_err(|error| refused("GET", &url, &error))?;
+            .map_err(|error| refused("GET", &url, error))?;
 
         Ok(command_stream(response.into_body(), idle))
     }
 
     async fn frames(&self, batch: &DaemonFrames) -> Result<(), ControlApiError> {
         let url = self.url("relay/frames")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         client
             .post(&url)
             .map_err(transport)?
@@ -1112,7 +1118,7 @@ impl RelayTransport for HttpControlApi {
             .json_body(batch)
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
         Ok(())
     }
 }
@@ -1128,7 +1134,7 @@ impl AgentApi for HttpControlApi {
 
     async fn resize_machine(&self, machine_type: &str) -> Result<(), ControlApiError> {
         let url = self.url("agent/machine/resize")?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         let response = client
             .post(&url)
             .map_err(transport)?
@@ -1138,7 +1144,7 @@ impl AgentApi for HttpControlApi {
             })
             .map_err(transport)?
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
 
         debug_assert!(response.status().is_success());
         Ok(())
@@ -1156,13 +1162,13 @@ impl HttpControlApi {
         suffix: &str,
     ) -> Result<T, ControlApiError> {
         let url = self.url(suffix)?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         client
             .get(&url)
             .map_err(transport)?
             .bearer_auth(self.token.clone())
             .await
-            .map_err(|error| refused("GET", &url, &error))?
+            .map_err(|error| refused("GET", &url, error))?
             .into_json::<T>()
             .await
             .map_err(transport)
@@ -1170,13 +1176,13 @@ impl HttpControlApi {
 
     async fn post_empty(&self, suffix: &str) -> Result<(), ControlApiError> {
         let url = self.url(suffix)?;
-        let mut client = zenwave::client();
+        let mut client = zenwave::client().error_for_status();
         client
             .post(&url)
             .map_err(transport)?
             .bearer_auth(self.token.clone())
             .await
-            .map_err(|error| refused("POST", &url, &error))?;
+            .map_err(|error| refused("POST", &url, error))?;
         Ok(())
     }
 }

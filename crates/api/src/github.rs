@@ -1387,7 +1387,7 @@ mod tests {
             parse_scopes("repo, read:org, "),
             vec!["repo".to_owned(), "read:org".to_owned()]
         );
-        assert!(parse_scopes("").is_empty());
+        assert_eq!(parse_scopes(""), [] as [std::string::String; 0]);
     }
 
     #[test]

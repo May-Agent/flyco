@@ -184,7 +184,10 @@ async fn unlinking_an_account_with_a_live_machine_counts_what_it_would_strand(
     // Gone from everywhere an account is offered…
     let listed = client.get("/v1/providers").bearer(&token).send().await;
     listed.assert_status(200);
-    assert!(listed.json::<Vec<ProviderAccountView>>().is_empty());
+    assert_eq!(
+        listed.json::<Vec<ProviderAccountView>>(),
+        [] as [flyco_core::ProviderAccountView; 0]
+    );
 
     // …and gone as something to provision through, which is what the
     // scrubbed credential means. Naming it by id is a 404 like any account
@@ -262,7 +265,10 @@ async fn an_unlinked_account_is_offered_by_nothing_that_provisions(
         .send()
         .await;
     catalog.assert_status(200);
-    assert!(!catalog.json::<MachineCatalog>().entries.is_empty());
+    assert_ne!(
+        catalog.json::<MachineCatalog>().entries,
+        [] as [flyco_core::MachineCatalogEntry; 0]
+    );
     client
         .get("/v1/machines/default")
         .bearer(&token)
@@ -286,7 +292,10 @@ async fn an_unlinked_account_is_offered_by_nothing_that_provisions(
         .send()
         .await;
     catalog.assert_status(200);
-    assert!(catalog.json::<MachineCatalog>().entries.is_empty());
+    assert_eq!(
+        catalog.json::<MachineCatalog>().entries,
+        [] as [flyco_core::MachineCatalogEntry; 0]
+    );
 
     let default = client
         .get("/v1/machines/default")
@@ -302,7 +311,10 @@ async fn an_unlinked_account_is_offered_by_nothing_that_provisions(
     // Usage reads the same accounts, so an unlinked one meters nothing.
     let usage = client.get("/v1/usage/cloud").bearer(&token).send().await;
     usage.assert_status(200);
-    assert!(usage.json::<Vec<flyco_core::CloudUsageView>>().is_empty());
+    assert_eq!(
+        usage.json::<Vec<flyco_core::CloudUsageView>>(),
+        [] as [flyco_core::CloudUsageView; 0]
+    );
 }
 
 #[skyzen::test]

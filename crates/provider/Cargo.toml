@@ -37,7 +37,7 @@ utoipa.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys.workspace = true
-wasm-bindgen = "0.2"
+wasm-bindgen = { version = "0.2", default-features = false, features = ["std"] }
 # Turns on the feature `rsa`'s transitive `getrandom` needs to compile for
 # wasm32 at all. See the workspace manifest for why it is a dependency rather
 # than a feature of one.

@@ -53,7 +53,7 @@ impl Room {
     }
 
     /// Records one event the way a control-plane broadcast does.
-    async fn record(&mut self, event: &ClientEvent) {
+    async fn record(&self, event: &ClientEvent) {
         let request = self.request(
             Method::POST,
             "/internal/broadcast",
@@ -72,7 +72,7 @@ impl Room {
     ///
     /// The returned future owns its request and router rather than
     /// borrowing the room, so the walk can hold it across pages.
-    fn events(&mut self, after: u64) -> impl Future<Output = Result<EventPage, ApiError>> + use<> {
+    fn events(&self, after: u64) -> impl Future<Output = Result<EventPage, ApiError>> + use<> {
         let router = self.object.fetch();
         let request = self.request(
             Method::GET,
@@ -115,7 +115,7 @@ fn usage() -> UsageReport {
 
 #[skyzen::test]
 async fn a_short_tail_bills_the_rows_the_walk_read() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
     // One turn's worth of stream: the message that opened it, its start,
     // and its completion.
     for event in [
@@ -153,7 +153,7 @@ async fn a_short_tail_bills_the_rows_the_walk_read() {
 
 #[skyzen::test]
 async fn a_long_tail_stops_at_the_row_bound_with_a_cursor() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
     // A tail a page and a half long: one open turn's unbroken deltas.
     let rows = usize::try_from(EVENT_PAGE_LIMIT).expect("a usize") + 100;
     for _ in 0..rows {

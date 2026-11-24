@@ -87,7 +87,7 @@ impl Room {
         request
     }
 
-    async fn call(&mut self, method: Method, path: &str, body: Option<Vec<u8>>) -> (u16, Vec<u8>) {
+    async fn call(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> (u16, Vec<u8>) {
         let response = self
             .object
             .fetch()
@@ -103,7 +103,7 @@ impl Room {
         (status, bytes.to_vec())
     }
 
-    async fn call_streaming(&mut self, path: &str) -> skyzen::Response {
+    async fn call_streaming(&self, path: &str) -> skyzen::Response {
         self.object
             .fetch()
             .go(self.request(Method::GET, path, None))
@@ -204,7 +204,7 @@ impl Room {
         self.out_seq += frames.len() as u64;
     }
 
-    async fn deliver_raw(&mut self, batch: &HostFrames) -> (u16, Vec<u8>) {
+    async fn deliver_raw(&self, batch: &HostFrames) -> (u16, Vec<u8>) {
         self.call(
             Method::POST,
             "/internal/frames",
@@ -214,7 +214,7 @@ impl Room {
     }
 
     /// Posts a command, the way the Worker does.
-    async fn command(&mut self, command: &ControlToHost) -> u16 {
+    async fn command(&self, command: &ControlToHost) -> u16 {
         let (status, _) = self
             .call(
                 Method::POST,
@@ -225,7 +225,7 @@ impl Room {
         status
     }
 
-    async fn status(&mut self) -> HostStatus {
+    async fn status(&self) -> HostStatus {
         let (status, body) = self.call(Method::GET, "/internal/status", None).await;
         assert_eq!(status, 200, "a status read");
         serde_json::from_slice(&body).expect("a host status")
@@ -341,7 +341,7 @@ async fn a_stream_or_batch_naming_a_superseded_epoch_is_refused() {
 
 #[skyzen::test]
 async fn frames_from_a_machine_that_never_attached_are_refused() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
     let (status, _) = room
         .deliver_raw(&HostFrames {
             epoch: 1,
@@ -451,7 +451,7 @@ async fn the_oldest_answer_for_a_container_retires_the_oldest_job() {
 
 #[skyzen::test]
 async fn a_revocation_forgets_every_outstanding_job() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
     let machine = MachineId::generate();
 
     // Planned while away — the mailbox is holding them.
@@ -470,7 +470,7 @@ async fn a_revocation_forgets_every_outstanding_job() {
 
 #[skyzen::test]
 async fn a_command_that_is_not_container_work_is_dropped_for_an_offline_host() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
 
     // `Revoked` is the one non-job command; a host that is away is a host
     // whose token will not work again — nothing is held for it. The jobs

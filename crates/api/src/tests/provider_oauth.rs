@@ -163,7 +163,7 @@ async fn an_azure_sign_in_starts_at_microsoft_with_this_deployments_own_client(
         scope.contains("graph.microsoft.com"),
         "creating the service principal needs Graph: {scope}"
     );
-    assert!(!state_of(&started).is_empty());
+    assert_ne!(state_of(&started), "");
 }
 
 #[skyzen::test]

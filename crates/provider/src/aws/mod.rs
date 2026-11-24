@@ -1391,8 +1391,7 @@ pub fn json_refusal(response: &HttpResponse) -> ProviderError {
     let code = document
         .get("__type")
         .and_then(serde_json::Value::as_str)
-        .map(|shape| shape.rsplit('#').next().unwrap_or(shape).to_owned())
-        .unwrap_or_default();
+        .map_or_default(|shape| shape.rsplit('#').next().unwrap_or(shape).to_owned());
     let message = document
         .get("message")
         .or_else(|| document.get("Message"))

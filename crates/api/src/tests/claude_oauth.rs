@@ -101,7 +101,7 @@ async fn a_sign_in_starts_at_claude_with_a_challenge_and_a_state(ctx: TestContex
         query.get("redirect_uri").map(String::as_str),
         Some(crate::anthropic::REDIRECT_URI)
     );
-    assert!(!state.is_empty());
+    assert_ne!(state, "");
     // The verifier is the half that must never leave the control plane.
     assert!(!started.authorize_url.contains("code_verifier"));
 

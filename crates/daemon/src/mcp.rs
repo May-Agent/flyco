@@ -45,7 +45,7 @@ use flyco_core::{MachineOrigin, SessionMachine};
 use rmcp::handler::server::common::{schema_for_empty_input, schema_for_input};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::service::RequestContext;
@@ -969,8 +969,8 @@ fn refusal(text: &str) -> CallToolResult {
 }
 
 impl<A: AgentApi, T: TreeStatus + 'static> ServerHandler for FlycoTools<A, T> {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("flyco", env!("CARGO_PKG_VERSION")))
     }
 

@@ -92,7 +92,7 @@ impl Room {
     }
 
     /// Calls one of the room's HTTP routes, the way the Worker does.
-    async fn call(&mut self, method: Method, path: &str, body: Option<Vec<u8>>) -> (u16, Vec<u8>) {
+    async fn call(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> (u16, Vec<u8>) {
         let response = self
             .object
             .fetch()
@@ -109,7 +109,7 @@ impl Room {
     }
 
     /// Calls a route and keeps the response, for a body that is a stream.
-    async fn call_streaming(&mut self, path: &str) -> skyzen::Response {
+    async fn call_streaming(&self, path: &str) -> skyzen::Response {
         self.object
             .fetch()
             .go(self.request(Method::GET, path, None))
@@ -119,7 +119,7 @@ impl Room {
 
     /// Posts to a route and keeps the response, for a body that is a
     /// stream — the held-open answer of a workdir question.
-    async fn post_streaming(&mut self, path: &str, body: Option<Vec<u8>>) -> skyzen::Response {
+    async fn post_streaming(&self, path: &str, body: Option<Vec<u8>>) -> skyzen::Response {
         self.object
             .fetch()
             .go(self.request(Method::POST, path, body))
@@ -246,7 +246,7 @@ impl Room {
 
     /// Posts one batch with an explicit position, for the ordering tests
     /// that must lie about where they resume.
-    async fn deliver_raw(&mut self, batch: &DaemonFrames) -> (u16, Vec<u8>) {
+    async fn deliver_raw(&self, batch: &DaemonFrames) -> (u16, Vec<u8>) {
         self.call(
             Method::POST,
             "/internal/frames",
@@ -259,7 +259,7 @@ impl Room {
     ///
     /// The answer names the events the command produced — the echoes a
     /// browser watching the session is owed.
-    async fn command(&mut self, command: &ControlToDaemon) -> Emitted {
+    async fn command(&self, command: &ControlToDaemon) -> Emitted {
         let (status, body) = self
             .call(
                 Method::POST,
@@ -301,7 +301,7 @@ impl Room {
             .collect()
     }
 
-    async fn events(&mut self, after: u64) -> EventPage {
+    async fn events(&self, after: u64) -> EventPage {
         let (status, body) = self
             .call(
                 Method::GET,
@@ -376,7 +376,7 @@ async fn an_attach_mints_an_epoch_and_announces_the_machine() {
 
 #[skyzen::test]
 async fn a_daemon_speaking_another_protocol_version_is_refused() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
     let (status, _) = room
         .call(
             Method::POST,
@@ -397,7 +397,7 @@ async fn a_daemon_speaking_another_protocol_version_is_refused() {
 
 #[skyzen::test]
 async fn frames_from_a_daemon_that_never_attached_are_refused() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
     let (status, _) = room
         .deliver_raw(&DaemonFrames {
             epoch: 1,
@@ -596,7 +596,7 @@ async fn a_command_stream_for_a_superseded_epoch_is_refused() {
 
 #[skyzen::test]
 async fn a_command_stream_opened_before_any_attach_is_refused() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
     let response = room.call_streaming("/internal/commands?epoch=1").await;
     assert_eq!(response.status().as_u16(), 502);
 }
@@ -866,7 +866,7 @@ async fn a_shell_command_is_recorded_named_and_handed_to_the_daemon() {
 
 #[skyzen::test]
 async fn a_shell_command_with_no_daemon_to_run_it_is_answered_rather_than_dropped() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
 
     // No attach: the machine is still being provisioned, or its daemon is
     // mid-reconnect. Nothing runs the command, and the user is told so
@@ -1125,7 +1125,7 @@ async fn a_state_change_held_for_an_offline_daemon_is_delivered_on_attach() {
 
 #[skyzen::test]
 async fn an_instant_command_for_an_offline_daemon_is_dropped_and_announced() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
 
     let emitted = room.command(&ControlToDaemon::Interrupt).await;
 
@@ -1540,7 +1540,7 @@ async fn the_worker_side_times_out_with_the_held_stream() {
 
 #[skyzen::test]
 async fn a_workdir_question_for_an_offline_daemon_is_refused_rather_than_held() {
-    let mut room = Room::open().await;
+    let room = Room::open().await;
 
     let (status, body) = room
         .call(
@@ -1569,7 +1569,7 @@ async fn a_workdir_question_for_an_offline_daemon_is_refused_rather_than_held() 
 // ── The desktop ──
 
 /// Opens the watcher stream and reads its hello, returning both.
-async fn watch(room: &mut Room) -> (SseStream, serde_json::Value) {
+async fn watch(room: &Room) -> (SseStream, serde_json::Value) {
     let response = room.call_streaming("/internal/desktop/watch").await;
     assert_eq!(response.status().as_u16(), 200, "the watch stream opened");
     let mut stream = response.into_body().into_sse();
@@ -1589,13 +1589,15 @@ async fn next_watch_event(stream: &mut SseStream) -> Option<skyzen::http_kit::ss
         .and_then(|item| item.and_then(Result::ok))
 }
 
-/// Expires every watcher row, the state a closed browser tab leaves.
+/// Expires every watcher row, the state a closed browser tab leaves, and
+/// wakes the command stream so reconciliation runs deterministically.
 async fn expire_watchers(room: &Room) {
     let db = DurableDb::new(room.db.clone());
     skyzen::sql!(db, "UPDATE desktop_watchers SET live_until = 0")
         .execute()
         .await
         .expect("watchers were expired");
+    room.object.notify_commands();
 }
 
 #[skyzen::test]
@@ -1606,7 +1608,7 @@ async fn a_watcher_joining_turns_the_encoder_on() {
     // nobody watches.
     room.expect_quiet().await;
 
-    let (_stream, hello) = watch(&mut room).await;
+    let (_stream, hello) = watch(&room).await;
     assert_eq!(hello["takeover"], false, "a watcher joins not driving");
     let watcher = hello["watcher"].as_u64().expect("a watcher id");
     assert!(watcher > 0, "a watcher id is a real row id");
@@ -1623,7 +1625,7 @@ async fn a_watcher_joining_turns_the_encoder_on() {
 async fn a_chunk_never_becomes_a_transcript_event() {
     let mut room = Room::open().await;
     room.greet().await;
-    let (_stream, _hello) = watch(&mut room).await;
+    let (_stream, _hello) = watch(&room).await;
     room.next_command().await; // the audience command
 
     let emitted = room
@@ -1666,7 +1668,7 @@ async fn a_watch_stream_replays_the_latest_gop() {
     })
     .await;
 
-    let (mut stream, _hello) = watch(&mut room).await;
+    let (mut stream, _hello) = watch(&room).await;
     let mut seen = Vec::new();
     while let Some(item) = next_watch_event(&mut stream).await {
         if item.event() != Some("chunk") {
@@ -1709,7 +1711,7 @@ async fn next_command_matching(room: &mut Room, want: &ControlToDaemon) -> Daemo
 async fn a_takeover_is_recorded_and_handed_down() {
     let mut room = Room::open().await;
     room.greet().await;
-    let (_stream, hello) = watch(&mut room).await;
+    let (_stream, hello) = watch(&room).await;
 
     let watcher = hello["watcher"].as_u64().expect("a watcher id");
     let (status, body) = room
@@ -1751,7 +1753,7 @@ async fn a_takeover_is_recorded_and_handed_down() {
 async fn input_needs_the_takeover_the_watcher_owns() {
     let mut room = Room::open().await;
     room.greet().await;
-    let (_stream, hello) = watch(&mut room).await;
+    let (_stream, hello) = watch(&room).await;
     let watcher = hello["watcher"].as_u64().expect("a watcher id");
 
     let input = || {
@@ -1813,7 +1815,7 @@ async fn input_needs_the_takeover_the_watcher_owns() {
 async fn a_lapsed_watcher_releases_the_screen() {
     let mut room = Room::open().await;
     room.greet().await;
-    let (_stream, hello) = watch(&mut room).await;
+    let (_stream, hello) = watch(&room).await;
     let watcher = hello["watcher"].as_u64().expect("a watcher id");
     room.call(
         Method::POST,
@@ -1858,7 +1860,7 @@ async fn a_lapsed_watcher_releases_the_screen() {
 async fn a_dead_watcher_is_a_gone() {
     let mut room = Room::open().await;
     room.greet().await;
-    let (_stream, hello) = watch(&mut room).await;
+    let (_stream, hello) = watch(&room).await;
     let watcher = hello["watcher"].as_u64().expect("a watcher id");
     expire_watchers(&room).await;
 
@@ -1887,7 +1889,7 @@ async fn a_dead_watcher_is_a_gone() {
 async fn a_fresh_attach_hears_the_room_is_driven() {
     let mut room = Room::open().await;
     room.greet().await;
-    let (_stream, hello) = watch(&mut room).await;
+    let (_stream, hello) = watch(&room).await;
     let watcher = hello["watcher"].as_u64().expect("a watcher id");
     room.call(
         Method::POST,
@@ -1929,7 +1931,14 @@ async fn a_quiet_stream_still_says_it_is_alive() {
     struct Idle;
     let sse = crate::sse::serve(
         Idle,
-        |_feed: &mut Idle| -> crate::sse::PollFn<'_> { Box::pin(async { crate::sse::Poll::Idle }) },
+        |_feed: &mut Idle| -> crate::sse::PollFn<'_> {
+            Box::pin(async {
+                crate::sse::Poll::Wait {
+                    signal: None,
+                    after: None,
+                }
+            })
+        },
         Duration::from_millis(80),
     );
 
@@ -1946,7 +1955,9 @@ async fn a_quiet_stream_still_says_it_is_alive() {
         futures_util::pin_mut!(next);
         match futures_util::future::select(next, deadline.as_mut()).await {
             futures_util::future::Either::Left((Some(Ok(chunk)), _)) => {
-                seen.extend_from_slice(&chunk);
+                if let Some(bytes) = chunk.as_data() {
+                    seen.extend_from_slice(bytes);
+                }
                 if seen.windows(2).any(|pair| pair == b"\n:") || seen.starts_with(b":") {
                     return;
                 }

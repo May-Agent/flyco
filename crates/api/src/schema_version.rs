@@ -18,14 +18,14 @@ use skyzen_services::DurableDb;
 /// What an activation remembers about its object's schema: the highest
 /// version it has already verified.
 ///
-/// The cell lives on the `#[durable_object]` struct, which skyzen rebuilds
-/// from `Default` around every event — the objects keep every durable fact
-/// in storage and opt out of the state blob with `PERSIST = false` — so
-/// the memo is per activation: it is what lets the poll steps of a held
-/// stream, and every call a handler makes after its first, answer without
-/// a statement. `fetch` mounts a clone on every route as `State<Cache>`;
-/// the `Arc` is what makes a handler's [`Cache::record`] land in the same
-/// cell the next call in the activation reads.
+/// The cell lives on the `#[durable_object]` struct, which skyzen
+/// constructs once from `Default` on an activation's first event and keeps
+/// alive across every concurrent `fetch(&self)` until eviction (the
+/// objects keep every durable fact in storage and opt out of the state
+/// blob with `PERSIST = false`). `fetch` mounts a clone on every route as
+/// `State<Cache>`; the `Arc` ensures the first request's [`Cache::record`]
+/// lands in the cell every subsequent request on the activation reads,
+/// verifying the schema once per activation rather than once per call.
 ///
 /// Nothing is written to the blob because the objects that hold this went
 /// through a release as unit structs, which read back from `null` alone: a

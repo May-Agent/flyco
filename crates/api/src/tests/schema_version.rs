@@ -72,6 +72,10 @@ impl DurableDbBackend for LoggedDb {
     async fn database_size(&self) -> Result<u64, DurableDbError> {
         self.inner.database_size().await
     }
+
+    async fn sync(&self) -> Result<(), DurableDbError> {
+        self.inner.sync().await
+    }
 }
 
 /// The meta-table statements one cold `ensure` costs: the read that

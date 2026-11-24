@@ -263,7 +263,7 @@ async fn a_package_install_runs_through_npx(ctx: TestContext, kv: Kv, db: Db) {
                     "/workspace"
                 ]
             );
-            assert!(env.is_empty());
+            assert_eq!(env.as_slice(), []);
         }
         other @ McpServerConfig::Http { .. } => panic!("expected a stdio config, got {other:?}"),
     }

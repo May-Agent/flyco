@@ -220,6 +220,9 @@ async fn deployed_wire_version(channel: Channel) -> Result<u32> {
     let url = channel.health_url();
     let response = zenwave::get(url.as_str())
         .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .await
         .with_context(|| format!("GET {url}"))?;
     let health: Health = response
         .into_json()
@@ -353,6 +356,9 @@ async fn verify(release: &Release) -> Result<()> {
             .with_context(|| format!("reading {}", object.file.display()))?;
         let url = release.channel.verification_url(object.name(), nonce);
         let response = zenwave::get(url.as_str())
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .error_for_status()
             .await
             .with_context(|| format!("GET {url}"))?;
         let served_type = response

@@ -570,6 +570,6 @@ mod tests {
         let cleared = normalizer.on_plan_usage(&json!({
             "rateLimits": {"primary": {"usedPercent": 40, "windowDurationMins": 300}}
         }));
-        assert!(cleared.is_empty());
+        assert_eq!(cleared, [] as [flyco_core::HarnessEvent; 0]);
     }
 }

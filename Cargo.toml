@@ -21,9 +21,9 @@ flyco-core = { path = "crates/core" }
 flyco-provider = { path = "crates/provider" }
 
 # Skyzen's traits and macros cross crate boundaries, so the family must
-# resolve to one release: the 2026-09-05 one, which carries zen-rs/skyzen#54
-# (Worker queue sends).
-skyzen = "0.3.0"
+# resolve to one release line (`0.6.x` / `0.4.x`), carrying `&self`
+# `DurableObject::fetch` activations (#362).
+skyzen = { version = "0.6.1", default-features = false }
 # Backend-free: `skyzen-services` defaults to every native sqlx driver
 # (postgres, mysql, sqlite), and the Worker build has no business compiling
 # any of them — its database is D1. The one target that needs a real driver,
@@ -31,28 +31,28 @@ skyzen = "0.3.0"
 # `sqlite` itself in `crates/api`. Declared here rather than per member
 # because a member may not turn a workspace dependency's default features
 # off, only leave them off.
-skyzen-services = { version = "0.2.1", default-features = false }
-skyzen-test = "0.2.1"
-skyzen-cloudflare = "0.3.0"
+skyzen-services = { version = "0.4.0", default-features = false }
+skyzen-test = { version = "0.4.0", default-features = false, features = ["sqlite"] }
+skyzen-cloudflare = { version = "0.6.1", default-features = false }
 # Select the native TLS backend in native crates below. Keeping the shared
 # dependency backend-free lets the Worker use Zenwave's built-in Fetch backend
 # without compiling an inapplicable native TLS stack.
-zenwave = { version = "0.5.3", default-features = false }
+zenwave = { version = "0.12.0", default-features = false }
 # The daemon's side of the SSE command streams: parses the byte stream a
 # zenwave response body is into events.
-eventsource-stream = "0.2.3"
+eventsource-stream = { version = "0.2.3", default-features = false }
 
 # Provider drivers render structured documents — cloud-init YAML, podman
 # scripts — from compiled templates rather than string concatenation, so a
 # dropped field fails the build instead of emitting a broken document.
-askama = "0.14"
+askama = { version = "0.16", default-features = false, features = ["config", "derive", "std"] }
 # One timer that works on both sides: a real timer natively, `setTimeout` on
 # the Worker. Provider polling loops honour `Retry-After` with it.
-futures-timer = { version = "3", features = ["wasm-bindgen"] }
+futures-timer = { version = "3", default-features = false, features = ["wasm-bindgen"] }
 # Quoting what goes into a rendered podman script. Pure Rust and
 # target-independent, so a container job renders to the same text on the
 # Worker that planned it and on the machine that runs it.
-shell-escape = "0.1"
+shell-escape = { version = "0.1", default-features = false }
 # Calendar arithmetic, for the one place flyco needs it: the start of the
 # billing month a cloud provider meters against. No clock is read from it —
 # the caller supplies the instant — so it compiles on wasm32 untouched.
@@ -62,24 +62,38 @@ time = { version = "0.3", default-features = false, features = ["formatting"] }
 # with a dozen ways to be subtly wrong; these are the vendor's own crates and
 # both compile on wasm32, so the driver builds an `HttpRequest`, has it
 # signed, and sends it through the same transport as everything else.
-aws-sigv4 = { version = "1.5", default-features = false, features = ["http1", "sign-http"] }
-aws-credential-types = "1.2"
+aws-sigv4 = { version = "1.6", default-features = false, features = ["http1", "sign-http"] }
+aws-credential-types = { version = "1.3", default-features = false }
 # EC2 speaks the AWS Query protocol and answers in XML — there is no JSON
 # dialect of it — so one XML reader earns its place. Deserialization only:
 # requests are form-encoded, never XML.
-quick-xml = { version = "0.38", default-features = false, features = ["serialize"] }
+quick-xml = { version = "0.42", default-features = false, features = ["serialize"] }
 # The RS256 half of a Google service-account assertion. `rsa` + `sha2` are
 # pure Rust and sign without an RNG (PKCS#1 v1.5 is deterministic), which is
 # what makes a minted assertion assertable in a test.
-rsa = { version = "0.9", features = ["sha2"] }
+rsa = { version = "0.9", default-features = false, features = ["std", "pem", "u64_digit", "sha2"] }
 
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tracing = "0.1"
+serde = { version = "1", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+thiserror = { version = "2", default-features = false, features = ["std"] }
+tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
+# Worker builds only use `registry` + `fmt` (console output via `tracing-web`);
+# native binaries opt into `env-filter` and `ansi` on their own edges so the
+# wasm32 Worker does not pull `regex-automata`, `matchers`, `nu-ansi-term`, or
+# `tracing-log`.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "fmt"] }
 uuid = { version = "1", default-features = false, features = ["v4", "serde", "js"] }
-utoipa = { version = "5.4", default-features = false, features = ["macros"] }
-futures-core = "0.3"
+utoipa = { version = "5.5", default-features = false, features = ["macros"] }
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+toml = { version = "1.2", default-features = false, features = ["std", "serde", "parse", "display"] }
+# Skill bundles are zips: the control plane builds one when a skill is
+# installed from a marketplace, and the daemon unpacks them on the session
+# machine. Default features off: the archives the control plane builds are
+# stored rather than deflated, so no compression backend is linked into the
+# Worker — `flyco-daemon` enables `deflate` on its own edge, because an
+# uploaded bundle may be compressed.
+zip = { version = "9.8", default-features = false }
 
 # Execution plane only (native). Nothing here may reach the Worker graph.
 # ACP: the protocol every non-Claude harness is driven through. Pinned to
@@ -88,31 +102,37 @@ futures-core = "0.3"
 # the driver is written against, and it is not on crates.io yet.
 aither-acp = { git = "https://github.com/lexoliu/aither.git", rev = "a6fc88b" }
 aither-mcp = { git = "https://github.com/lexoliu/aither.git", rev = "a6fc88b" }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
 # The CLI's pickers: a `flyco claude` with no flags asks its way through the
 # choices a session needs, and dialoguer is the library that asks.
-dialoguer = "0.12"
+dialoguer = { version = "0.12", default-features = false }
 # `flyco login` opens the approval page in the user's browser when there is
 # one to open.
-open = "5"
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-rand = "0.9"
-rust-embed = { version = "8", features = ["debug-embed", "include-exclude"] }
-portable-pty = "0.9"
+open = { version = "5", default-features = false }
+rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
+rust-embed = { version = "8", default-features = false, features = ["debug-embed", "include-exclude"] }
+portable-pty = { version = "0.9", default-features = false }
 # The handful of syscalls the execution plane makes directly. Today that is
 # `statvfs`, which is how an enrolled host measures the space left where
 # Podman keeps its containers.
-rustix = { version = "1", features = ["fs", "event", "system", "termios"] }
+rustix = { version = "1", default-features = false, features = ["std", "fs", "event", "system", "termios"] }
 # The official Rust MCP SDK, for flycod's local stdio server. Only the
 # server half and the stdio transport: the daemon is spoken *to* by the
 # harness it supervises and never speaks MCP itself, and `macros` is off
 # because every tool flyco exposes describes itself from a compiled askama
 # template rather than from a string literal in an attribute.
-rmcp = { version = "3.2", default-features = false, features = [
+rmcp = { version = "3.11", default-features = false, features = [
     "server",
     "transport-io",
 ] }
-tokio = { version = "1", features = [
+tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-std",
     "io-util",
@@ -124,41 +144,32 @@ tokio = { version = "1", features = [
     "sync",
     "time",
 ] }
-toml = "0.9"
-# Skill bundles are zips: the control plane builds one when a skill is
-# installed from a marketplace, and the daemon unpacks them on the session
-# machine. Default features off: the archives the control plane builds are
-# stored rather than deflated, so no compression backend is linked into the
-# Worker — `flyco-daemon` enables `deflate` on its own edge, because an
-# uploaded bundle may be compressed.
-zip = { version = "8.6", default-features = false }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Auth stack: pure-Rust crypto and encodings, all verified on wasm32.
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-base64 = "0.22"
-getrandom = { version = "0.4", features = ["wasm_js"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
+getrandom = { version = "0.4", default-features = false, features = ["wasm_js"] }
 # The throwaway login key every Azure machine is created with: Azure refuses
 # a Linux machine that has neither a password nor a key, and flyco sets no
 # passwords and keeps no private keys, so one is minted per machine and its
 # private half dropped on the floor. `rand_core` 0.6 is what `ssh-key` 0.6
 # draws from; its `getrandom` feature reaches the 0.2 line above on wasm32.
 ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "std"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 # `rsa` reaches `getrandom` through the 0.2 line, which refuses to compile for
 # wasm32 at all unless its `js` feature is on — a `compile_error!`, not a
 # runtime failure. Nothing calls it (PKCS#1 v1.5 signing is deterministic and
 # takes no RNG); this entry exists solely to turn that feature on, and it is
 # scoped to the wasm32 target so a native build never sees it.
-getrandom-0-2 = { package = "getrandom", version = "0.2", features = ["js"] }
-hex = "0.4"
+getrandom-0-2 = { package = "getrandom", version = "0.2", default-features = false, features = ["js"] }
+hex = { version = "0.4", default-features = false, features = ["std"] }
 # GitHub signs every webhook delivery with HMAC-SHA256 over the raw body;
 # `Mac::verify_slice` is the constant-time comparison that check needs.
 hmac = { version = "0.12", default-features = false }
-http = "1"
-js-sys = "0.3"
+http = { version = "1", default-features = false, features = ["std"] }
+js-sys = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false }
-url = { version = "2", features = ["serde"] }
+url = { version = "2", default-features = false, features = ["serde"] }
 jwt-compact = { version = "0.9.0-beta.1", default-features = false, features = ["p256", "std"] }
 web-push-native = { version = "0.5", default-features = false }
 
@@ -169,11 +180,11 @@ web-push-native = { version = "0.5", default-features = false }
 # `anyhow` because a task's failure is a message to an operator rather than
 # something a caller matches on; the decisions worth typing (an unknown
 # channel, a wire-protocol mismatch) are their own `thiserror` types.
-anyhow = "1"
+anyhow = { version = "1", default-features = false, features = ["std"] }
 # Where cargo writes build output is cargo's answer to give, not something to
 # reconstruct from the environment.
-cargo_metadata = "0.23"
-which = "8"
+cargo_metadata = { version = "0.23", default-features = false }
+which = { version = "8", default-features = false, features = ["real-sys"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"

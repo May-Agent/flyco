@@ -250,7 +250,7 @@ async fn a_catalog_reports_pending_until_the_queue_has_read_the_marketplace(
         .send()
         .await
         .json::<SkillCatalog>();
-    assert!(pending.skills.is_empty());
+    assert_eq!(pending.skills, [] as [flyco_core::CatalogSkill; 0]);
     assert_eq!(pending.pending.len(), 2);
     assert!(pending.pending.contains(&MARKET.to_owned()));
     assert!(pending.pending.contains(&BUILT_IN_MARKETPLACE.to_owned()));
@@ -265,7 +265,7 @@ async fn a_catalog_reports_pending_until_the_queue_has_read_the_marketplace(
         .send()
         .await
         .json::<SkillCatalog>();
-    assert!(read.pending.is_empty());
+    assert_eq!(read.pending, [] as [std::string::String; 0]);
     // The built-in marketplace is not in the fake GitHub, so it is a
     // failure rather than an empty success.
     assert_eq!(read.failed.len(), 1);
@@ -373,7 +373,10 @@ async fn installing_a_skill_stores_its_directory_as_one_row(
         .expect("the bundle is stored");
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(bundle.body)).expect("a readable archive");
-    let mut names: Vec<String> = archive.file_names().map(ToOwned::to_owned).collect();
+    let mut names: Vec<String> = archive
+        .file_names()
+        .map(|name| name.expect("valid archive entry name").into_owned())
+        .collect();
     names.sort();
     assert_eq!(names, vec!["SKILL.md", "scripts/convert.py"]);
     let mut entry = archive.by_name("SKILL.md").expect("the skill file");
@@ -465,7 +468,10 @@ async fn a_skill_of_a_plugin_in_another_repository_installs_from_that_repository
         .expect("the bundle is stored");
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(bundle.body)).expect("a readable archive");
-    let names: Vec<String> = archive.file_names().map(ToOwned::to_owned).collect();
+    let names: Vec<String> = archive
+        .file_names()
+        .map(|name| name.expect("valid archive entry name").into_owned())
+        .collect();
     assert_eq!(names, vec!["SKILL.md"]);
     let mut entry = archive.by_name("SKILL.md").expect("the skill file");
     let mut body = Vec::new();
