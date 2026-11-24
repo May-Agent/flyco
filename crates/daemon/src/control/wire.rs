@@ -693,6 +693,23 @@ struct Connection<S, T, A, W, D, H, X> {
     /// the backoff ladder says (issue #342). Taken by the reconnect loop,
     /// so it applies to exactly the reconnect after the refusal.
     retry_hint: Option<Duration>,
+    /// Lowest command sequence refused during `paused` or `reclaiming`.
+    ///
+    /// `ack_through` is a single monotonic watermark, so once a command is
+    /// deferred the cursor must not advance past it or the room would delete
+    /// the deferred row from `daemon_commands`.
+    deferred_seq: Option<u64>,
+}
+
+/// Outcome of dispatching one control-plane command.
+enum DispatchOutcome {
+    /// The command was accepted and applied; advance `applied`.
+    Applied,
+    /// The command was refused while paused or reclaiming; keep it unacked
+    /// in `daemon_commands` for later delivery.
+    Deferred,
+    /// The command ended the attachment.
+    Ended(Ended),
 }
 
 /// Why one connection ended.
@@ -843,10 +860,15 @@ impl<
     /// the attach: command sequences are global rather than per-epoch, so
     /// a command whose acknowledgement was lost is redelivered on the next
     /// stream and must be recognized rather than applied a second time.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the single select! loop multiplexes every relay event source on one connection"
+    )]
     async fn pump(
         &mut self,
         attach: &mut Attachment,
         queue: &mut mpsc::Receiver<Outbound>,
+        collector: &mut Option<tokio::task::JoinHandle<Result<(), WireError>>>,
         pending: &mut VecDeque<DaemonToControl>,
         applied: &mut u64,
     ) -> Result<Ended, WireError> {
@@ -877,15 +899,32 @@ impl<
                 () = tokio::time::sleep_until(flush_deadline), if flush_at.is_some() => {
                     // The window closed: the loop head posts the batch.
                 }
+                collected = async {
+                    collector
+                        .as_mut()
+                        .expect("collector arm is guarded by collector.is_some()")
+                        .await
+                }, if collector.is_some() => {
+                    *collector = None;
+                    match collected {
+                        Ok(Ok(())) => {
+                            // Clean collector exit: let `queue.recv()` drain
+                            // any buffered frames before `on_outbound(None)`
+                            // observes the closed channel.
+                        }
+                        Ok(Err(error)) => return Err(error),
+                        Err(error) => return Err(WireError::Harness(error.to_string())),
+                    }
+                }
                 outbound = queue.recv(), if self.alive.harness.armed() => {
-                    if let Some(ending) = self.on_outbound(outbound, pending).await? {
+                    if let Some(ending) = self.on_outbound(outbound, pending, collector).await? {
                         return Ok(ending);
                     }
                     // A busy harness fills the queue faster than one
                     // frame per turn; draining what is already there is
                     // what makes a burst one POST rather than one each.
                     while let Ok(outbound) = queue.try_recv() {
-                        if let Some(ending) = self.on_outbound(Some(outbound), pending).await? {
+                        if let Some(ending) = self.on_outbound(Some(outbound), pending, collector).await? {
                             return Ok(ending);
                         }
                     }
@@ -901,20 +940,38 @@ impl<
                             return Ok(Ended::Disconnected);
                         }
                     };
-                    if let Some(seq) = command.seq {
-                        if seq <= *applied {
-                            // An acknowledgement that never reached the
-                            // room redelivers the command on the next
-                            // stream. Applied is applied: running it again
-                            // would put a second copy of a user message in
-                            // the conversation.
-                            continue;
-                        }
-                        *applied = seq;
+                    if let Some(seq) = command.seq
+                        && seq <= *applied
+                    {
+                        // An acknowledgement that never reached the
+                        // room redelivers the command on the next
+                        // stream. Applied is applied: running it again
+                        // would put a second copy of a user message in
+                        // the conversation.
+                        continue;
                     }
                     match self.dispatch_before(command.command).await? {
-                        Ended::Disconnected => {}
-                        ended => return Ok(ended),
+                        DispatchOutcome::Applied => {
+                            if let Some(seq) = command.seq
+                                && self.deferred_seq.is_none_or(|first| seq < first)
+                            {
+                                *applied = (*applied).max(seq);
+                            }
+                        }
+                        DispatchOutcome::Deferred => {
+                            if let Some(seq) = command.seq {
+                                self.deferred_seq =
+                                    Some(self.deferred_seq.map_or(seq, |first| first.min(seq)));
+                            }
+                        }
+                        DispatchOutcome::Ended(ended) => {
+                            if let Some(seq) = command.seq
+                                && self.deferred_seq.is_none_or(|first| seq < first)
+                            {
+                                *applied = (*applied).max(seq);
+                            }
+                            return Ok(ended);
+                        }
                     }
                 }
                 output = self.terminal_out.recv() => {
@@ -1092,8 +1149,16 @@ impl<
         &mut self,
         outbound: Option<Outbound>,
         pending: &mut VecDeque<DaemonToControl>,
+        collector: &mut Option<tokio::task::JoinHandle<Result<(), WireError>>>,
     ) -> Result<Option<Ended>, WireError> {
         let Some(outbound) = outbound else {
+            if let Some(handle) = collector.take() {
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(error),
+                    Err(error) => return Err(WireError::Harness(error.to_string())),
+                }
+            }
             self.alive.harness = Producing::No;
             if self
                 .trees
@@ -1227,6 +1292,9 @@ impl<
         // Before anything else, so a user message that arrives during the
         // flush is refused rather than opening a turn nothing will record.
         self.reclaiming = true;
+        if let Some((_, running)) = self.running_shell.take() {
+            running.cancel();
+        }
 
         self.session.interrupt().await.map_err(harness)?;
         self.session.flush().await.map_err(harness)?;
@@ -1403,7 +1471,10 @@ impl<
     /// here ends the daemon with a sentence the session can show, which is
     /// the whole difference between a page that says what went wrong and
     /// one that spins for ever (issue #201).
-    async fn dispatch_before(&mut self, command: ControlToDaemon) -> Result<Ended, WireError> {
+    async fn dispatch_before(
+        &mut self,
+        command: ControlToDaemon,
+    ) -> Result<DispatchOutcome, WireError> {
         let named = command.name();
         match tokio::time::timeout(self.deadlines.harness_deadline(), self.dispatch(command)).await
         {
@@ -1415,9 +1486,9 @@ impl<
         }
     }
 
-    async fn dispatch(&mut self, command: ControlToDaemon) -> Result<Ended, WireError> {
+    async fn dispatch(&mut self, command: ControlToDaemon) -> Result<DispatchOutcome, WireError> {
         match command {
-            ControlToDaemon::UserMessage { text, .. } => self.user_message(text).await?,
+            ControlToDaemon::UserMessage { text, .. } => return self.user_message(text).await,
             ControlToDaemon::ShellCommand { .. } => {
                 // The room reissues a browser's request as `RunShell` with
                 // the identity it assigned; an unidentified one reaching a
@@ -1441,7 +1512,7 @@ impl<
                 if self.refuse_while_paused("context compaction")
                     || self.refuse_while_reclaiming("context compaction")
                 {
-                    return Ok(Ended::Disconnected);
+                    return Ok(DispatchOutcome::Deferred);
                 }
                 self.session.compact().await.map_err(harness)?;
             }
@@ -1456,27 +1527,24 @@ impl<
                 // Refused on the same terms as a compaction: both reach the
                 // harness, and a session that has stopped accepting work or
                 // is about to lose its machine has no harness to reach.
-                // The control plane has already recorded the model, so the
-                // change is redelivered on the next attach rather than
-                // lost — `survives_a_disconnect` is what makes that true.
+                // Leaving it unacked keeps the command in `daemon_commands`
+                // until a live harness can apply it.
                 if self.refuse_while_paused("a model change")
                     || self.refuse_while_reclaiming("a model change")
                 {
-                    return Ok(Ended::Disconnected);
+                    return Ok(DispatchOutcome::Deferred);
                 }
                 self.session.set_model(model).await.map_err(harness)?;
             }
             ControlToDaemon::SetPermissionMode { mode } => {
                 // Refused on the same terms as a model change: the harness
                 // applies it, and a session that has stopped accepting work
-                // has no harness to reach. The control plane has already
-                // recorded the mode, so the change is redelivered on the
-                // next attach rather than lost — `survives_a_disconnect`
-                // is what makes that true.
+                // has no harness to reach. Leaving it unacked keeps it in
+                // `daemon_commands` until a live harness can apply it.
                 if self.refuse_while_paused("a permission mode change")
                     || self.refuse_while_reclaiming("a permission mode change")
                 {
-                    return Ok(Ended::Disconnected);
+                    return Ok(DispatchOutcome::Deferred);
                 }
                 self.session
                     .set_permission_mode(mode)
@@ -1485,15 +1553,15 @@ impl<
             }
             ControlToDaemon::TerminalInput { data } => {
                 if self.refuse_while_paused("terminal input") {
-                    return Ok(Ended::Disconnected);
+                    return Ok(DispatchOutcome::Deferred);
                 }
                 self.terminal.write(&data)?;
             }
             ControlToDaemon::TerminalHarness { resume } => {
                 if self.refuse_while_paused("the harness TUI") {
-                    return Ok(Ended::Disconnected);
+                    return Ok(DispatchOutcome::Deferred);
                 }
-                self.launch_harness_tui(resume)?;
+                self.launch_harness_tui(resume).await?;
             }
             // A size is a fact about the pane, not work; a paused session's
             // shell may still be looked at.
@@ -1525,16 +1593,31 @@ impl<
                 self.add_repo(slug, branch, dir).await?;
             }
             ControlToDaemon::Archive { preserve_workdir } => {
-                if preserve_workdir {
-                    self.snapshot_all().await?;
-                }
-                tracing::info!(session = %self.session_id, "the control plane archived this session");
-                self.terminal.shutdown()?;
-                return Ok(Ended::Archived);
+                return self.archive(preserve_workdir).await;
             }
-            ControlToDaemon::Superseded => return self.superseded(),
+            ControlToDaemon::Superseded => return self.superseded().await,
         }
-        Ok(Ended::Disconnected)
+        Ok(DispatchOutcome::Applied)
+    }
+
+    /// Cancels any running shell, quiesces and snapshots when requested,
+    /// and shuts down the terminal before ending the attachment.
+    async fn archive(&mut self, preserve_workdir: bool) -> Result<DispatchOutcome, WireError> {
+        if let Some((_, running)) = self.running_shell.take() {
+            running.cancel();
+        }
+        if preserve_workdir {
+            if let Err(error) = self.session.interrupt().await {
+                tracing::warn!(%error, "the harness did not interrupt before archive snapshot");
+            }
+            if let Err(error) = self.session.flush().await {
+                tracing::warn!(%error, "the harness did not flush before archive snapshot");
+            }
+            self.snapshot_all().await?;
+        }
+        tracing::info!(session = %self.session_id, "the control plane archived this session");
+        self.terminal.shutdown().await?;
+        Ok(DispatchOutcome::Ended(Ended::Archived))
     }
 
     /// The room's last word to a stream serving a superseded epoch.
@@ -1543,13 +1626,13 @@ impl<
     /// row, never redelivered. What it means is decided here rather than
     /// inferred: another daemon holds the room, and this one standing
     /// down is the whole point of the signal.
-    fn superseded(&mut self) -> Result<Ended, WireError> {
+    async fn superseded(&mut self) -> Result<DispatchOutcome, WireError> {
         tracing::warn!(
             session = %self.session_id,
             "a newer attach owns this session's room; this daemon is a spare"
         );
-        self.terminal.shutdown()?;
-        Ok(Ended::Superseded)
+        self.terminal.shutdown().await?;
+        Ok(DispatchOutcome::Ended(Ended::Superseded))
     }
 
     /// Snapshots every checkout's work to the control plane.
@@ -1690,11 +1773,11 @@ impl<
     /// as one of its own: the agent must know what machine it is on before
     /// it starts working, and a message carrying only that would open a
     /// turn about nothing.
-    async fn user_message(&mut self, text: String) -> Result<(), WireError> {
+    async fn user_message(&mut self, text: String) -> Result<DispatchOutcome, WireError> {
         if self.refuse_while_paused("a user message")
             || self.refuse_while_reclaiming("a user message")
         {
-            return Ok(());
+            return Ok(DispatchOutcome::Deferred);
         }
         let text = match self.opening.take() {
             Some(notice) => OpeningMessage { notice, text }
@@ -1702,7 +1785,11 @@ impl<
                 .map_err(|error| notice_failed(&error))?,
             None => text,
         };
-        self.session.send_user_message(text).await.map_err(harness)
+        self.session
+            .send_user_message(text)
+            .await
+            .map_err(harness)?;
+        Ok(DispatchOutcome::Applied)
     }
 
     /// Tells the agent its machine changed.
@@ -1852,8 +1939,8 @@ impl<
     /// A launch that cannot be built — the claude binary missing from the
     /// sidecar tree — is a line in the terminal, where a failed `claude`
     /// would have printed.
-    fn launch_harness_tui(&mut self, resume: bool) -> Result<(), WireError> {
-        match self.tui.command(resume) {
+    async fn launch_harness_tui(&mut self, resume: bool) -> Result<(), WireError> {
+        match self.tui.command(resume).await {
             Ok(command) => self.terminal.launch_harness(command)?,
             Err(error) => self.terminal.print(&format!("\r\nflycod: {error}\r\n"))?,
         }
@@ -2153,7 +2240,12 @@ where
 {
     let (sender, mut queue) = mpsc::channel(QUEUE_DEPTH);
     let (standing, granted) = mpsc::unbounded_channel();
-    let collector = tokio::spawn(collect(relay.outputs, sender, relay.api.clone(), granted));
+    let mut collector = Some(tokio::spawn(collect(
+        relay.outputs,
+        sender,
+        relay.api.clone(),
+        granted,
+    )));
 
     // Rendered before the first frame moves, so a session that cannot state
     // what machine it is on fails here rather than running an agent that was
@@ -2206,6 +2298,7 @@ where
         opening: Some(opening),
         deadlines: relay.deadlines,
         retry_hint: None,
+        deferred_seq: None,
     };
     let mut attempt = 0_u32;
     // Frames produced but never confirmed stored. They outlive the attach
@@ -2227,11 +2320,16 @@ where
     let ending = loop {
         // A collector failure is fatal and must not wait for a reconnect
         // that will never help: an overflowed queue only grows.
-        if collector.is_finished() {
-            break match collector.await {
-                Ok(result) => result.map(|()| Ended::HarnessStopped),
-                Err(error) => Err(WireError::Harness(error.to_string())),
-            };
+        if let Some(handle) = collector.take_if(|handle| handle.is_finished()) {
+            match handle.await {
+                Ok(Ok(())) => {
+                    if queue.is_empty() && pending.is_empty() {
+                        break Ok(Ended::HarnessStopped);
+                    }
+                }
+                Ok(Err(error)) => break Err(error),
+                Err(error) => break Err(WireError::Harness(error.to_string())),
+            }
         }
 
         let mut attachment = match attach(&connection.api, connection.deadlines).await {
@@ -2264,7 +2362,13 @@ where
             ready_announced = true;
         }
         match connection
-            .pump(&mut attachment, &mut queue, &mut pending, &mut applied)
+            .pump(
+                &mut attachment,
+                &mut queue,
+                &mut collector,
+                &mut pending,
+                &mut applied,
+            )
             .await
         {
             Ok(Ended::Disconnected) => {
@@ -2292,12 +2396,24 @@ where
         }
     };
 
-    // Whatever ended the loop, the harness stops cleanly: `shutdown` is what
-    // flushes the transcript store, which the harness's own task owns.
-    let ending = ending?;
-    if let Err(error) = connection.session.shutdown().await {
-        tracing::warn!(%error, "the harness did not shut down cleanly");
+    // Whatever ended the loop (including `Err` paths), cancel any running
+    // shell and shut down the harness within the platform's grace bound so
+    // transcript flushing never hangs indefinitely.
+    if let Some((_, running)) = connection.running_shell.take() {
+        running.cancel();
     }
+    match tokio::time::timeout(crate::stop::GRACE, connection.session.shutdown()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "the harness did not shut down cleanly"),
+        Err(_) => tracing::warn!(
+            grace = ?crate::stop::GRACE,
+            "the harness shutdown outlasted the grace period"
+        ),
+    }
+    if let Err(error) = connection.terminal.shutdown().await {
+        tracing::warn!(%error, "the terminal did not shut down cleanly");
+    }
+    let ending = ending?;
     say_goodbye(&ending);
     Ok(())
 }

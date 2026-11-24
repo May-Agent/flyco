@@ -197,6 +197,7 @@ async fn execute(
         }
     };
 
+    let mut group = ProcessGroupGuard::new(child.id());
     let mut budget = Budget {
         remaining: bash.max_output_bytes,
         truncated: false,
@@ -204,22 +205,28 @@ async fn execute(
     let stopped = stream(&bash, &mut child, run, updates, &mut budget, cancel).await;
     let outcome = match stopped {
         Some(outcome) => {
+            group.kill();
             if let Err(error) = child.kill().await {
                 tracing::warn!(%error, "a stopped shell command could not be killed");
             }
+            let _ = child.wait().await;
             outcome
         }
         None => match child.wait().await {
             Ok(status) => {
+                group.disarm();
                 status
                     .code()
                     .map_or(ShellOutcome::Signalled, |code| ShellOutcome::Exited {
                         code,
                     })
             }
-            Err(error) => ShellOutcome::Failed {
-                error: error.to_string(),
-            },
+            Err(error) => {
+                group.kill();
+                ShellOutcome::Failed {
+                    error: error.to_string(),
+                }
+            }
         },
     };
 
@@ -233,10 +240,58 @@ async fn execute(
     );
 }
 
-/// Starts `bash -c command` with both pipes captured.
+/// Kills the process group created by [`spawn`] if the command is cancelled,
+/// times out, or its task is dropped mid-run.
+struct ProcessGroupGuard {
+    pgid: Option<u32>,
+}
+
+impl ProcessGroupGuard {
+    const fn new(pgid: Option<u32>) -> Self {
+        Self { pgid }
+    }
+
+    const fn disarm(&mut self) {
+        self.pgid = None;
+    }
+
+    fn kill(&mut self) {
+        if let Some(pgid) = self.pgid.take() {
+            kill_process_group(pgid);
+        }
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group(pgid: u32) {
+    // POSIX `SIGKILL` is 9 on Linux and macOS.
+    const SIGKILL: i32 = 9;
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    if let Ok(pgid) = i32::try_from(pgid)
+        && pgid > 0
+    {
+        // SAFETY: `kill(-pgid, SIGKILL)` takes no pointers and a positive
+        // `pgid` guarantees `-pgid < -1`, targeting only the process group
+        // created by `.process_group(0)`.
+        let _ = unsafe { kill(-pgid, SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pgid: u32) {}
+
+/// Starts `bash -c command` with both pipes captured in its own process group.
 fn spawn(bash: &Bash, command: &str) -> std::io::Result<tokio::process::Child> {
-    Command::new(&bash.program)
-        .arg("-c")
+    let mut cmd = Command::new(&bash.program);
+    cmd.arg("-c")
         .arg(command)
         .current_dir(&bash.workdir)
         .stdin(Stdio::null())
@@ -245,8 +300,10 @@ fn spawn(bash: &Bash, command: &str) -> std::io::Result<tokio::process::Child> {
         // A daemon that stops mid-run must not leave the command behind on
         // the machine: the handle is dropped when this task ends, whatever
         // ended it.
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.spawn()
 }
 
 /// Streams both pipes until they end, and answers with what stopped them.
@@ -538,6 +595,52 @@ mod tests {
         assert!(
             matches!(outcome, ShellOutcome::Failed { .. }),
             "{outcome:?} must name the failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_command_kills_its_entire_process_group() {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+
+        let (sender, mut updates) = mpsc::unbounded_channel();
+        let handle = bash(Duration::from_secs(60), 4096).start(
+            ShellRunId::generate(),
+            "sleep 60 & echo $!; wait".to_owned(),
+            sender,
+        );
+
+        let child_pid: i32 = loop {
+            let update = tokio::time::timeout(Duration::from_secs(5), updates.recv())
+                .await
+                .expect("pid arrived")
+                .expect("stream open");
+            if let ShellEvent::Output { data, .. } = update.event
+                && let Ok(pid) = data.trim().parse::<i32>()
+            {
+                break pid;
+            }
+        };
+
+        handle.cancel();
+        let (_, _, outcome, _) = collect(&mut updates).await;
+        assert_eq!(outcome, ShellOutcome::Cancelled);
+
+        // Give the kernel a moment to reap the SIGKILLed grandchild.
+        let mut alive = true;
+        for _ in 0..40 {
+            // SAFETY: signal 0 probes process existence without delivering a signal.
+            if unsafe { kill(child_pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !alive,
+            "grandchild process {child_pid} survived process-group cancellation"
         );
     }
 }

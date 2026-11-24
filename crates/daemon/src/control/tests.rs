@@ -2134,7 +2134,102 @@ async fn nothing_opens_a_turn_between_the_notice_and_the_machine_going() {
         TerminalCall::Write("ls\n".to_owned())
     );
 
+    // Neither the refused `UserMessage` (seq 1) nor `Compact` (seq 2) — nor
+    // the later `TerminalInput` (seq 3) — may advance `ack_through`, so the
+    // room retains the deferred user message for the replacement machine.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), harness.room.next())
+            .await
+            .is_err(),
+        "deferred commands must not advance ack_through"
+    );
+
     harness.archive().await.expect("the run ended cleanly");
+}
+
+#[tokio::test]
+async fn collector_error_propagates_immediately_on_dirty_tree_and_runs_shutdown() {
+    let mut harness = Harness::start(AttachAnswer::Accept).await;
+    harness.handshake().await;
+
+    // Make the working tree dirty: previously, a collector failure closed the
+    // queue and `on_outbound(None)` kept the dirty session hanging forever.
+    harness
+        .repo_inject
+        .send((None, " M src/lib.rs\n".to_owned()))
+        .expect("dirty status");
+    assert!(matches!(
+        harness.room.next_frame().await,
+        DaemonToControl::RepoDirty { .. }
+    ));
+
+    // Drop the turn-notification receiver so `api.notify_turn_started()` fails
+    // inside `collect()` while `pump()` is actively connected.
+    let Harness {
+        notifications,
+        mut calls,
+        outputs,
+        run,
+        ..
+    } = harness;
+    drop(notifications);
+
+    outputs
+        .send(SessionOutput::Event {
+            event: HarnessEvent::TurnStarted {
+                turn_id: "1".to_owned(),
+            },
+        })
+        .await
+        .expect("emit turn started");
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("collector error must end wire::run promptly even on a dirty tree")
+        .expect("wire::run did not panic");
+    assert!(
+        matches!(ended, Err(WireError::ControlApi(_))),
+        "collector error must propagate as Err, got {ended:?}"
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), calls.recv())
+            .await
+            .expect("shutdown ran on Err exit path"),
+        Some(Call::Shutdown)
+    );
+}
+
+#[tokio::test]
+async fn archive_cancels_running_shell_and_flushes_harness_before_snapshot() {
+    let mut harness = Harness::start(AttachAnswer::Accept).await;
+    harness.handshake().await;
+
+    let shell_run = flyco_core::ShellRunId::generate();
+    harness.command(ControlToDaemon::RunShell {
+        run: shell_run,
+        command: "sleep 60".to_owned(),
+    });
+    let started = tokio::time::timeout(Duration::from_secs(5), harness.shell_runs.recv())
+        .await
+        .expect("shell started")
+        .expect("shell channel open");
+
+    harness.command(ControlToDaemon::Archive {
+        preserve_workdir: true,
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), started.cancelled)
+        .await
+        .expect("running shell cancelled before archive snapshot")
+        .expect("cancel signal delivered");
+    assert_eq!(harness.next_call().await, Call::Interrupt);
+    assert_eq!(harness.next_call().await, Call::Flush);
+    assert_eq!(
+        harness.next_call().await,
+        Call::WorkdirPatchStored(None, WORKDIR_PATCH.len() + 41)
+    );
+    assert_eq!(harness.next_call().await, Call::Shutdown);
+    harness.ended().await.expect("archive ended cleanly");
 }
 
 #[tokio::test]

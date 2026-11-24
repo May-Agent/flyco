@@ -180,6 +180,34 @@ async fn fetch(
     }
 }
 
+/// Whether a non-empty persisted configuration already lives at `path`.
+async fn has_persisted_config(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+}
+
+/// Ensures `config_path` holds this session's configuration, reusing a
+/// persisted file on codespace restart so one-time `bootstrap_enc` is only
+/// consumed on first boot.
+async fn ensure_config(
+    config_path: &Path,
+    control_plane: &Url,
+    codespace_name: &str,
+    token: &str,
+    deadline: Duration,
+) -> Result<(), CodespaceError> {
+    if has_persisted_config(config_path).await {
+        tracing::info!(
+            config = %config_path.display(),
+            "reusing persisted daemon configuration on codespace restart"
+        );
+        return Ok(());
+    }
+    let config_toml = fetch(control_plane, codespace_name, token, deadline).await?;
+    write_config(config_path, &config_toml)
+}
+
 /// Fetches this session's configuration, writes it where `flycod run`
 /// reads it, and launches the daemon detached.
 ///
@@ -189,38 +217,78 @@ async fn fetch(
 /// child is given its own process group and a log file so nothing about
 /// the hook that launched it can take it down.
 ///
+/// If `CONFIG_PATH` already exists and is non-empty (a codespace restart),
+/// the persisted configuration is reused without calling the one-time
+/// bootstrap endpoint again.
+///
 /// # Errors
 ///
 /// Returns [`CodespaceError`] describing which of the three steps failed.
 pub async fn bootstrap() -> Result<(), CodespaceError> {
+    let config_path = Path::new(CONFIG_PATH);
+    if has_persisted_config(config_path).await {
+        tracing::info!(
+            config = CONFIG_PATH,
+            "reusing persisted daemon configuration on codespace restart"
+        );
+        return launch();
+    }
+
     let control_plane = required("FLYCO_CONTROL_PLANE")?;
     let codespace_name = required("CODESPACE_NAME")?;
     let token = required("GITHUB_TOKEN")?;
 
     let control_plane =
         Url::parse(&control_plane).map_err(|_| CodespaceError::ControlPlaneUrl(control_plane))?;
-    let config_toml = fetch(&control_plane, &codespace_name, &token, DEADLINE).await?;
-
-    write_config(Path::new(CONFIG_PATH), &config_toml)?;
+    ensure_config(
+        config_path,
+        &control_plane,
+        &codespace_name,
+        &token,
+        DEADLINE,
+    )
+    .await?;
     launch()
 }
 
-/// Writes the configuration `0600` — the document carries the session's
-/// daemon token, and the codespace's other users have no business reading
-/// it.
+/// Writes the configuration atomically as `0600` via a sibling temp file,
+/// `sync_all`, and rename — the document carries the session's daemon token,
+/// and the codespace's other users have no business reading it.
 fn write_config(path: &Path, contents: &str) -> Result<(), CodespaceError> {
+    use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .and_then(|mut file| std::io::Write::write_all(&mut file, contents.as_bytes()))
-        .map_err(|source| CodespaceError::Write {
-            path: CONFIG_PATH,
-            source,
-        })
+
+    let map_err = |source| CodespaceError::Write {
+        path: CONFIG_PATH,
+        source,
+    };
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if let Some(directory) = path.parent() {
+        std::fs::create_dir_all(directory).map_err(map_err)?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let tmp_path = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(map_err(error));
+    }
+    Ok(())
 }
 
 /// Starts `flycod run` as a new session leader and returns.
@@ -466,5 +534,30 @@ mod tests {
             .expect_err("the body does not parse");
 
         assert!(matches!(error, CodespaceError::Malformed(_)));
+    }
+
+    #[tokio::test]
+    async fn restart_reuses_persisted_config_without_refetching() {
+        let (url, hits, _) = serve(&[(410, "{\"error\":\"already consumed\"}")]).await;
+        let path = std::env::temp_dir().join(format!(
+            "flycod-codespace-restart-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        write_config(&path, "token = \"persisted\"\n").expect("seed config");
+
+        ensure_config(&path, &url, "lexo-flyco-abc", "gho_injected", DEADLINE)
+            .await
+            .expect("existing config is reused");
+
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "bootstrap endpoint must not be called when persisted config exists"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "token = \"persisted\"\n"
+        );
+        std::fs::remove_file(&path).expect("cleanup");
     }
 }
