@@ -1,12 +1,9 @@
 //! The harness abstraction flycod drives sessions through.
 //!
-//! Flyco supports two drivers and never builds its own agent: Claude Code
-//! keeps its dedicated Agent SDK sidecar ([`claude`]), and every other
-//! harness — Codex, Devin, anything that speaks the Agent Client
-//! Protocol — is driven by the generic ACP driver ([`acp`]). The session
-//! loop, approvals routing, and relay are written once against this shape,
-//! so a provisioned `[acp]` config slots in beside [`claude`] without
-//! touching them.
+//! Every harness flycod supervises — Claude Code (in-process `claude-acp`),
+//! Codex (in-process `codex-acp`), Devin, and any external agent speaking the
+//! Agent Client Protocol — is driven through [`acp`]. The session loop,
+//! approvals routing, and relay are written once against this shape.
 //!
 //! Everything a harness produces is normalized to
 //! [`flyco_core::HarnessEvent`], except the two things that are not events:
@@ -16,7 +13,6 @@
 //! [`flyco_core::wire::DaemonToControl`].
 
 pub mod acp;
-pub mod claude;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -87,10 +83,7 @@ pub enum SessionOutput {
     },
     /// The capability tokens this harness build advertises.
     ///
-    /// Feature detection reads these and never a version string. Separate
-    /// from [`Self::Started`] because Claude Code reports them only on a
-    /// turn's `system/init` frame, so they arrive late by construction —
-    /// see [`claude`] for what that means for gating. The newest set wins.
+    /// Feature detection reads these and never a version string. The newest set wins.
     Capabilities {
         /// The capability tokens, as the harness names them.
         capabilities: Vec<String>,

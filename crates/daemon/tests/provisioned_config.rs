@@ -16,9 +16,10 @@
 use flyco_core::{
     BillingMinimum, DriverKind, MachineOrigin, PermissionMode, Runtime, SessionId, Usd,
 };
-use flyco_daemon::config::{ClaudeAuth, DaemonConfig};
+use flyco_daemon::config::{ClaudeAuth, DaemonConfig, InProcessAgent};
 use flyco_provider::flycod::{
-    self, CLAUDE_CONFIG_DIR, CLAUDE_MANAGED_DIR, CLAUDE_PROJECT_DIR_NAME, CODEX_HOME, WORKDIR,
+    self, CLAUDE_BIN, CLAUDE_CONFIG_DIR, CLAUDE_MANAGED_DIR, CLAUDE_PROJECT_DIR_NAME, CODEX_BIN,
+    CODEX_HOME, WORKDIR,
 };
 use flyco_provider::{
     CheckoutSpec, ClaudeCredential, CodexCredential, DaemonBootstrap, DevinCredential, GitAccess,
@@ -85,9 +86,11 @@ fn a_provisioned_configuration_is_one_this_daemon_accepts() {
     assert_eq!(config.session, bootstrap.session);
     assert_eq!(config.harness, DriverKind::ClaudeCode);
     assert_eq!(config.workdir, std::path::PathBuf::from(WORKDIR));
+    let claude = config.claude.as_ref().expect("claude");
+    assert_eq!(claude.permission_mode, PermissionMode::Auto);
     assert_eq!(
-        config.claude.as_ref().expect("claude").permission_mode,
-        PermissionMode::Auto
+        claude.claude_path,
+        Some(std::path::PathBuf::from(CLAUDE_BIN))
     );
 }
 
@@ -322,6 +325,27 @@ fn a_provisioned_codex_configuration_is_one_this_daemon_accepts() {
     assert!(config.claude.is_none());
     let acp = config.acp.as_ref().expect("acp");
     assert_eq!(acp.agent, "codex");
+    assert_eq!(acp.in_process, Some(InProcessAgent::Codex));
+    assert_eq!(acp.program, std::path::PathBuf::from(CODEX_BIN));
+    assert_eq!(
+        acp.methods.mcp_status.as_ref().map(|m| m.call.as_str()),
+        Some("_codex/mcp_status")
+    );
+    assert_eq!(
+        acp.methods.usage.as_ref().map(|m| m.call.as_str()),
+        Some("_codex/rate_limits")
+    );
+    assert_eq!(
+        acp.methods.compact.as_ref().map(|m| m.call.as_str()),
+        Some("_codex/compact")
+    );
+    let plan = acp.modes.get(&PermissionMode::Plan).expect("plan mode");
+    assert!(
+        plan.options
+            .iter()
+            .any(|o| o.option == "collaboration_mode" && o.value == "plan"),
+        "plan mode sets collaboration_mode = plan: {plan:?}"
+    );
 
     // The grant arrives as the `auth.json` the daemon writes under the
     // isolated `CODEX_HOME`, carrying the same four values Codex's own

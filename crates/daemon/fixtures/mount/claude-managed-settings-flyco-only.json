@@ -26,9 +26,7 @@
       "Edit(//var/lib/flyco/codex/**)",
       "Write(//var/lib/flyco/codex/**)",
       "Edit(//var/lib/flyco/devin-config/**)",
-      "Write(//var/lib/flyco/devin-config/**)",
-      "Edit(//var/lib/flyco/sidecar/**)",
-      "Write(//var/lib/flyco/sidecar/**)"
+      "Write(//var/lib/flyco/devin-config/**)"
     ]
   },
   "hooks": {

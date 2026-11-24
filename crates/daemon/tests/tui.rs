@@ -64,13 +64,12 @@ fn parse(bootstrap: &DaemonBootstrap) -> DaemonConfig {
     })
 }
 
-/// A scratch dir holding a fake SDK package tree for `find_sdk_claude`.
-fn sidecar_with_claude(root: &Path) -> PathBuf {
-    let package = root.join("node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64");
-    std::fs::create_dir_all(&package).expect("sdk package dir");
-    let binary = package.join("claude");
-    std::fs::write(&binary, "#!/bin/sh\n").expect("the bundled binary");
-    root.to_path_buf()
+/// A scratch dir holding a fake native `claude` binary.
+fn fake_claude_binary(root: &Path) -> PathBuf {
+    std::fs::create_dir_all(root).expect("binary dir");
+    let binary = root.join("claude");
+    std::fs::write(&binary, "#!/bin/sh\n").expect("the native binary");
+    binary
 }
 
 fn args_of(command: &CommandBuilder) -> Vec<String> {
@@ -82,15 +81,16 @@ fn args_of(command: &CommandBuilder) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_claude_launch_names_the_sdk_binary_the_model_and_the_mode() {
+async fn a_claude_launch_names_the_native_binary_the_model_and_the_mode() {
     let root = std::env::temp_dir().join(format!("flycod-tui-{}", std::process::id()));
     let config_dir = root.join("claude-config");
+    let binary = fake_claude_binary(&root);
     let mut config = parse(&bootstrap(HarnessCredential::ClaudeCode(
         ClaudeCredential::OauthToken {
             token: OAUTH_TOKEN.to_owned(),
         },
     )));
-    config.sidecar.as_mut().expect("sidecar").dir = sidecar_with_claude(&root);
+    config.claude.as_mut().expect("claude").claude_path = Some(binary.clone());
     // The provisioned path is the machine's, not this host's — point the
     // credential's isolated tree at the scratch dir instead.
     match &mut config.claude.as_mut().expect("claude").auth {
@@ -106,9 +106,8 @@ async fn a_claude_launch_names_the_sdk_binary_the_model_and_the_mode() {
     let argv = args_of(&command);
     assert_eq!(
         argv[0],
-        root.join("node_modules/@anthropic-ai/claude-agent-sdk-darwin-arm64/claude")
-            .to_string_lossy(),
-        "the SDK's bundled binary, not a PATH lookup: {argv:?}"
+        binary.to_string_lossy(),
+        "the configured native binary, not a PATH lookup: {argv:?}"
     );
     assert!(
         argv.windows(2).any(|w| w == ["--model", "sonnet"]),
@@ -172,9 +171,10 @@ async fn a_claude_launch_names_the_sdk_binary_the_model_and_the_mode() {
 #[tokio::test]
 async fn a_claude_resume_continues_or_names_the_session() {
     let root = std::env::temp_dir().join(format!("flycod-tui-resume-{}", std::process::id()));
+    let binary = fake_claude_binary(&root);
     let mut bootstrap = bootstrap(HarnessCredential::ClaudeCode(ClaudeCredential::Inherit));
     let mut config = parse(&bootstrap);
-    config.sidecar.as_mut().expect("sidecar").dir = sidecar_with_claude(&root);
+    config.claude.as_mut().expect("claude").claude_path = Some(binary.clone());
 
     // No harness-native id recorded: re-entry is `--continue`, the CLI's
     // own "latest conversation" spelling.
@@ -187,7 +187,7 @@ async fn a_claude_resume_continues_or_names_the_session() {
     // the whole reason the field exists.
     bootstrap.resume_session_id = Some("a-harness-session-id".to_owned());
     let mut config = parse(&bootstrap);
-    config.sidecar.as_mut().expect("sidecar").dir = sidecar_with_claude(&root);
+    config.claude.as_mut().expect("claude").claude_path = Some(binary);
     let tui = HarnessTui::resolve(&config, None).await;
     let argv = args_of(&tui.command(true).await.expect("the resume resolves"));
     assert!(
@@ -202,11 +202,11 @@ async fn a_claude_resume_continues_or_names_the_session() {
 #[tokio::test]
 async fn a_missing_claude_binary_is_an_error_not_a_guess() {
     let root = std::env::temp_dir().join(format!("flycod-tui-missing-{}", std::process::id()));
-    std::fs::create_dir_all(&root).expect("an empty sidecar dir");
+    std::fs::create_dir_all(&root).expect("an empty dir");
     let mut config = parse(&bootstrap(HarnessCredential::ClaudeCode(
         ClaudeCredential::Inherit,
     )));
-    config.sidecar.as_mut().expect("sidecar").dir = root.clone();
+    config.claude.as_mut().expect("claude").claude_path = Some(root.join("missing-claude"));
 
     let tui = HarnessTui::resolve(&config, None).await;
     let error = tui.command(false).await.expect_err("no binary, no launch");

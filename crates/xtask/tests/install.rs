@@ -195,3 +195,49 @@ fn the_host_unit_runs_as_root_so_the_host_token_can_stay_root_only() {
         "a revoked host exits 0 and must stay stopped: {unit}"
     );
 }
+
+#[test]
+fn the_session_installer_pins_and_verifies_native_harnesses_without_sidecar_or_unpinned_scripts() {
+    let script = asset(INSTALLER.name);
+
+    assert!(
+        script.contains("claude_version="),
+        "native claude CLI version is pinned: {script}"
+    );
+    assert!(
+        script.contains("claude_sha256_x64=") && script.contains("claude_sha256_arm64="),
+        "native claude CLI carries pinned sha256 digests: {script}"
+    );
+    assert!(
+        script.contains("codex_version="),
+        "native codex CLI version is pinned: {script}"
+    );
+    assert!(
+        script.contains("codex_sha256_x64=") && script.contains("codex_sha256_aarch64="),
+        "native codex CLI carries pinned sha256 digests: {script}"
+    );
+    assert!(
+        script.contains("bun_version="),
+        "bun version is pinned: {script}"
+    );
+    assert!(
+        !script.contains("@agentclientprotocol/codex-acp"),
+        "external codex-acp bun package must be removed: {script}"
+    );
+    assert!(
+        !script.contains("api.github.com/repos/openai/codex/releases/latest"),
+        "unauthenticated per-boot GitHub releases/latest lookup must be removed: {script}"
+    );
+    assert!(
+        !script.contains("oh-my-fish"),
+        "unverified oh-my-fish master execution must be removed: {script}"
+    );
+    assert!(
+        !script.contains("/var/lib/flyco/sidecar"),
+        "sidecar directory must be removed: {script}"
+    );
+    assert!(
+        script.contains("$install_root/claude"),
+        "native claude binary is installed and verified: {script}"
+    );
+}

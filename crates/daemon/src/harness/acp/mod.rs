@@ -1,96 +1,88 @@
-//! The generic ACP driver — every harness but Claude Code.
+//! The unified ACP driver — Claude Code, Codex, Devin, and any external ACP
+//! agent.
 //!
-//! ACP, the Agent Client Protocol, is how flycod talks to Codex, to Devin,
-//! and to any other agent a config points it at: a long-lived JSON-RPC
-//! process over stdio. One driver serves them all because the protocol
-//! standardizes the conversation — `initialize`, `session/new`,
-//! `session/prompt`, `session/update` — and what it does not standardize
-//! is written down in the `[acp]` table rather than in vendor branches
-//! here: which config-option ids carry the model and the effort, how each
-//! flyco permission mode is expressed, and which extension methods answer
-//! compaction, plan usage, and MCP introspection.
-//!
-//! # Shape
-//!
-//! [`aither_acp::AcpClient`] owns the JSON-RPC routing, so this driver is
-//! thinner than a hand-rolled protocol loop: the agent's notifications and
-//! requests arrive on [`AgentHandler`], which forwards them as
-//! [`AgentEvent`]s to the one task that owns session state. Prompts and
-//! extension calls are futures spawned onto that same channel, so the
-//! driver loop keeps reading updates while a turn is in flight. There is
-//! no shared state and therefore no lock — the single atomic the handler
-//! carries is the replay flag, written once around `session/load`.
+//! Claude Code and Codex run in-process on [`aither_acp`]'s zero-serde direct
+//! lane via [`claude_acp::ClaudeAgent::into_server`] and
+//! [`codex_acp::CodexAgent::into_server`], spawning their native CLIs under
+//! [`AgentUser`] privilege isolation through custom connectors in
+//! [`transport`]. External ACP agents such as Devin run as child processes over
+//! newline-delimited JSON-RPC.
 //!
 //! # Mounting
 //!
-//! MCP servers reach the agent on the session-lifecycle request itself —
-//! `session/new`'s `mcpServers` — which is the mount the protocol
-//! sanctions. Proving it differs by agent: where [`AcpMethods::mcp_status`]
-//! names an introspection method the driver asks and refuses a session
-//! without flyco's tools; where it does not, the driver's [`observe`] phase
-//! watches the agent's own output for a bounded window and fails only on
-//! evidence of failure.
+//! MCP servers reach the agent on the session-lifecycle request itself (or
+//! through Claude Code's managed policy directory when configured). Proving it
+//! differs by agent: where [`AcpMethods::mcp_status`] names an introspection
+//! method the driver asks with bounded pagination and deadline and refuses a
+//! session without flyco's tools; where it does not, [`observe_mount`] watches
+//! the agent's notifications for a bounded window and fails on evidence of
+//! failure.
 
 pub mod normalize;
+mod transport;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use aither_acp::{
-    AcpClient, ClientCapabilities, ClientError, ClientHandler, ContentBlock, Implementation,
-    PermissionOption, PermissionOptionKind, RequestPermissionOutcome, RequestPermissionParams,
-    RequestPermissionResult, SessionNewParams, SessionNotification, SessionResumeParams,
-    SessionSetConfigOptionParams, SessionSetModeParams, TextContent,
+use aither_acp::SessionEvent;
+use aither_acp::client::{Client, ClientError, ClientSession, SessionEvents, TurnOutcome};
+use aither_acp::domain::{
+    CancelledOutcome, ConfigValue, ConfigValueById, ExtMethod, Implementation, McpServer, Open,
+    PermissionOption, PermissionOptionKind, PermissionOutcome, PermissionRequest,
+    PermissionSubject, SelectedOutcome, SessionId,
 };
-use aither_mcp::protocol::{
-    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpError,
-};
-use aither_mcp::transport::{BidirectionalTransport, Transport};
+use aither_acp::rpc::Notification;
+use claude_acp::{ClaudeAcpConfig, ClaudeAgent, SessionConnector};
+use claude_acp_sdk::{AnyTranscriptSync, SpawnConfig as ClaudeSpawnConfig, TranscriptSync};
+use codex_acp::{AnyAppServerConnector, AppServerConnector, CodexAcpConfig, CodexAgent};
+use codex_sdk::SpawnConfig as CodexSpawnConfig;
 use flyco_core::{ApprovalId, ContextUsage, HarnessEvent, ModelChoice, PermissionMode};
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+use futures_lite::StreamExt as _;
+use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use self::normalize::Normalizer;
+use self::transport::{ClaudeProcessConnector, CodexProcessConnector, TokioChildTransport};
 use super::{Harness, HarnessSession, SessionOutput, StartRequest, Started, ToolApproval};
-use crate::config::{AcpConfig, AcpMethodCall};
+use crate::config::{
+    AcpConfig, AcpMethodCall, AcpMethods, AcpMode, ClaudeAuth, ClaudeConfig, InProcessAgent,
+};
 use crate::mount::{Mount, MountState, MountedServer};
 use crate::privilege::{AgentUser, chown_path};
 
-/// Capacity of the driver's command channel.
+/// Capacity of the driver's command and output channels.
 const CHANNEL_DEPTH: usize = 256;
 
 /// How long a clean shutdown may take before the driver gives up on it.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// How long the driver waits for an agent's MCP servers to stop dialling.
-///
-/// Same rule the Codex driver held: a server that is still starting is not
-/// a failure yet, and a deadline is what stops one that never will from
-/// holding the session open.
 const MOUNT_SETTLE: Duration = Duration::from_secs(10);
 
 /// How often a still-dialling mount is re-asked.
 const MOUNT_POLL: Duration = Duration::from_millis(250);
 
-/// How long [`observe`] watches a mount-reportless agent for evidence.
-///
-/// Only negative evidence is waited on — an agent that never mentions its
-/// MCP servers is one whose mount is provisioned but unprovable, which is
-/// logged rather than made fatal.
+/// Hard ceiling on cursor pages walked during a single MCP mount query.
+const MAX_MOUNT_PAGES: usize = 32;
+
+/// How long [`observe_mount`] watches a mount-reportless agent for evidence.
 const MOUNT_OBSERVE: Duration = Duration::from_secs(15);
 
-/// The generic ACP driver failed.
+/// How long a best-effort `_claude/context_usage` query may take before the
+/// driver falls back to the cached window summary.
+const CONTEXT_USAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The unified ACP driver failed.
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
-    /// An `[acp.files]` entry could not be materialized.
+    /// An `[acp.files]` entry or managed policy file could not be materialized.
     #[error("could not write the agent's file at {path}")]
     File {
         /// Where the write was aimed.
-        path: std::path::PathBuf,
+        path: PathBuf,
         /// The underlying cause.
         #[source]
         source: std::io::Error,
@@ -99,13 +91,13 @@ pub enum AcpError {
     #[error("could not create the session workdir at {path}")]
     Workdir {
         /// The directory that could not be created.
-        path: std::path::PathBuf,
+        path: PathBuf,
         /// The underlying cause.
         #[source]
         source: std::io::Error,
     },
     /// The agent process could not be spawned.
-    #[error("could not run the ACP agent `{program}`")]
+    #[error("could not run the ACP agent `{program}`: {detail}")]
     Spawn {
         /// The configured program.
         program: String,
@@ -120,6 +112,12 @@ pub enum AcpError {
         /// The failure.
         #[source]
         source: ClientError,
+    },
+    /// A configured extension method name does not start with `_`.
+    #[error("extension method `{method}` must start with `_`")]
+    InvalidMethod {
+        /// The configured method name.
+        method: String,
     },
     /// The agent closed its connection or exited.
     #[error("the ACP agent's connection closed")]
@@ -158,10 +156,7 @@ pub enum AcpError {
     /// The session's task is gone, so no command can be delivered.
     #[error("the ACP session has stopped")]
     Stopped,
-    /// A second prompt was sent while a turn was still running.
-    ///
-    /// Flyco's transcript is serial — one turn, then the next — so a second
-    /// message mid-turn is a control-plane bug, not something to queue.
+    /// A second prompt or compaction was asked for while a turn was still running.
     #[error("a turn is already in flight")]
     TurnInFlight,
     /// The agent's mount report could not be read as a server list.
@@ -178,42 +173,147 @@ pub enum AcpError {
     UnknownApproval(ApprovalId),
 }
 
+/// Optional custom Claude connector erased behind a closure for tests.
+type ClaudeConnectorOverride =
+    Arc<dyn Fn(ClaudeAcpConfig) -> ClaudeAcpConfig + Send + Sync + 'static>;
+
+/// Which backend [`AcpHarness`] drives.
+enum Backend {
+    /// Generic external ACP subprocess or in-process Codex server configured
+    /// via `[acp]`.
+    Acp {
+        config: Box<AcpConfig>,
+        codex_connector: Option<AnyAppServerConnector>,
+    },
+    /// In-process Claude Code server configured via `[claude]`.
+    Claude {
+        config: Box<ClaudeConfig>,
+        transcript_dir: PathBuf,
+        transcript_sync: AnyTranscriptSync,
+        connector: Option<ClaudeConnectorOverride>,
+    },
+}
+
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Acp { config, .. } => f
+                .debug_struct("Backend::Acp")
+                .field("agent", &config.agent)
+                .field("in_process", &config.in_process)
+                .finish_non_exhaustive(),
+            Self::Claude {
+                config,
+                transcript_dir,
+                ..
+            } => f
+                .debug_struct("Backend::Claude")
+                .field("config", config)
+                .field("transcript_dir", transcript_dir)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
 /// A configured, not-yet-started ACP harness.
 #[derive(Debug)]
 pub struct AcpHarness {
-    config: AcpConfig,
+    backend: Backend,
     mount: Mount,
     agent: Option<AgentUser>,
 }
 
 impl AcpHarness {
-    /// Builds a harness from its configuration and the MCP servers the
-    /// session may reach.
+    /// Builds a harness from an `[acp]` configuration (external subprocess or
+    /// in-process Codex) and the MCP servers the session may reach.
     #[must_use]
-    pub const fn new(config: AcpConfig, mount: Mount) -> Self {
+    pub fn new(config: AcpConfig, mount: Mount) -> Self {
         Self {
-            config,
+            backend: Backend::Acp {
+                config: Box::new(config),
+                codex_connector: None,
+            },
             mount,
             agent: None,
         }
     }
 
-    /// Configures the unprivileged agent user the ACP process runs as.
+    /// Builds an in-process Claude Code harness hosted via `claude-acp` and
+    /// synchronized against `transcript_sync`.
+    #[must_use]
+    pub fn claude<S: TranscriptSync>(
+        config: ClaudeConfig,
+        mount: Mount,
+        transcript_dir: PathBuf,
+        transcript_sync: S,
+    ) -> Self {
+        Self {
+            backend: Backend::Claude {
+                config: Box::new(config),
+                transcript_dir,
+                transcript_sync: AnyTranscriptSync::new(transcript_sync),
+                connector: None,
+            },
+            mount,
+            agent: None,
+        }
+    }
+
+    /// Configures the unprivileged agent user the harness spawns its native
+    /// CLI processes as.
     #[must_use]
     pub fn with_agent(mut self, agent: Option<AgentUser>) -> Self {
         self.agent = agent;
         self
     }
+
+    /// Overrides the `claude-acp` [`SessionConnector`] (used by tests to drive
+    /// an in-memory mock Claude CLI).
+    #[must_use]
+    pub fn with_claude_connector<C: SessionConnector + Clone>(mut self, connector: C) -> Self {
+        if let Backend::Claude {
+            connector: slot, ..
+        } = &mut self.backend
+        {
+            *slot = Some(Arc::new(move |cfg| cfg.connector(connector.clone())));
+        }
+        self
+    }
+
+    /// Overrides the `codex-acp` [`AppServerConnector`] (used by tests to drive
+    /// an in-memory mock `codex app-server`).
+    #[must_use]
+    pub fn with_codex_connector<C: AppServerConnector>(mut self, connector: C) -> Self {
+        if let Backend::Acp {
+            codex_connector: slot,
+            ..
+        } = &mut self.backend
+        {
+            *slot = Some(AnyAppServerConnector::new(connector));
+        }
+        self
+    }
+}
+
+/// Optional Claude-specific transcript sync context held by [`Driver`] so
+/// `DriverCommand::Flush` pushes pending JSONL bytes before spot/SIGTERM exit.
+struct ClaudeSyncContext {
+    sync: AnyTranscriptSync,
+    workdir: PathBuf,
+    transcript_home: PathBuf,
 }
 
 impl Harness for AcpHarness {
     type Session = AcpSession;
     type Error = AcpError;
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup orchestrates connect, session open, mode/model setup, mount proof, and driver spawn in one sequence"
+    )]
     async fn start(self, request: StartRequest) -> Result<Started<Self::Session>, AcpError> {
-        let config = self.config;
         let agent = self.agent;
-        materialize_files(&config, agent.as_ref()).await?;
+        let mount = self.mount;
         tokio::fs::create_dir_all(&request.workdir)
             .await
             .map_err(|source| AcpError::Workdir {
@@ -222,57 +322,100 @@ impl Harness for AcpHarness {
             })?;
 
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let connected = connect(
-            &config,
-            &request,
-            events_tx.clone(),
-            &self.mount,
-            agent.as_ref(),
-        )
-        .await?;
 
-        let replaying = connected.client.handler().replaying.clone();
-        let opened = match open_session(
-            &connected.client,
-            &config,
-            &self.mount,
-            &request,
-            &replaying,
-            &connected.initialized,
-        )
-        .await
-        {
-            Ok(opened) => opened,
-            Err(error) => {
-                connected.connection_task.abort();
-                return Err(error);
+        let (
+            config,
+            connected,
+            pass_mcp_to_session,
+            context_usage_method,
+            claude_compact,
+            claude_sync,
+        ) = match self.backend {
+            Backend::Acp {
+                config,
+                codex_connector,
+            } => {
+                let config = *config;
+                materialize_files(&config, agent.as_ref()).await?;
+                let connected = connect_acp(
+                    &config,
+                    &request,
+                    events_tx.clone(),
+                    &mount,
+                    agent.as_ref(),
+                    codex_connector,
+                )
+                .await?;
+                (config, connected, true, None, false, None)
+            }
+            Backend::Claude {
+                config: claude_cfg,
+                transcript_dir,
+                transcript_sync,
+                connector,
+            } => {
+                let (acp_cfg, connected, pass_mcp, transcript_home) = connect_claude(
+                    &claude_cfg,
+                    &transcript_dir,
+                    transcript_sync.clone(),
+                    connector,
+                    &request,
+                    events_tx.clone(),
+                    &mount,
+                    agent.as_ref(),
+                )
+                .await?;
+                let context_usage_method = Some(AcpMethodCall {
+                    call: claude_acp::EXT_CONTEXT_USAGE.to_owned(),
+                    params: json!({ "sessionId": "<session>" }),
+                });
+                let sync_ctx = ClaudeSyncContext {
+                    sync: transcript_sync,
+                    workdir: request.workdir.clone(),
+                    transcript_home,
+                };
+                (
+                    acp_cfg,
+                    connected,
+                    pass_mcp,
+                    context_usage_method,
+                    true,
+                    Some(sync_ctx),
+                )
             }
         };
+
+        let mcp_servers = if pass_mcp_to_session {
+            mount.acp_servers()
+        } else {
+            Vec::new()
+        };
+
+        let mut opened =
+            match open_session(&connected.client, &config, &mcp_servers, &request).await {
+                Ok(opened) => opened,
+                Err(error) => {
+                    connected.connection_task.abort();
+                    return Err(error);
+                }
+            };
+        let session = opened.session.clone();
         let session_id = opened.session_id.clone();
 
-        if let Err(error) = apply_permission_mode(
-            &connected.client,
-            &session_id,
-            config.permission_mode,
-            &config,
-        )
-        .await
-        {
+        if let Err(error) = apply_permission_mode(&session, config.permission_mode, &config).await {
             connected.connection_task.abort();
             return Err(error);
         }
-        if let Err(error) = apply_model(&connected.client, &session_id, &config).await {
+        if let Err(error) = apply_model(&session, &config).await {
             connected.connection_task.abort();
             return Err(error);
         }
 
         // Prove or observe the mount, exactly once, before the session can
-        // produce anything. The prelude keeps whatever arrived meanwhile —
-        // a replayed capability report, an early command palette — in order
-        // for the driver to process first.
+        // produce anything.
         let mut prelude = Vec::new();
         let mount_outcome = match &config.methods.mcp_status {
-            Some(method) => verify_mount(&connected.client, &session_id, method, &self.mount).await,
+            Some(method) => verify_mount(&connected.client, &session_id, method, &mount).await,
             None => observe_mount(&mut events_rx, &mut prelude).await,
         };
         if let Err(error) = mount_outcome {
@@ -280,14 +423,24 @@ impl Harness for AcpHarness {
             return Err(error);
         }
 
+        // Subscribe after startup setup and mount verification so the snapshot
+        // includes any early `available_commands_update` / `config_option_update`
+        // notifications without duplicating them in the live event stream.
+        let session_events = session.subscribe();
+        refresh_opened_from_state(&mut opened, &session_events.snapshot);
+
         let (commands, inbox) = mpsc::channel(CHANNEL_DEPTH);
         let (outputs, output_rx) = mpsc::channel(CHANNEL_DEPTH);
         tokio::spawn(
             Driver {
                 client: connected.client,
+                session,
                 connection_task: connected.connection_task,
                 session_id,
                 config,
+                context_usage_method,
+                claude_compact,
+                claude_sync,
                 normalizer: Normalizer::default(),
                 outputs,
                 events: events_tx,
@@ -302,7 +455,7 @@ impl Harness for AcpHarness {
                 mode: opened.mode.clone(),
                 model: opened.model.clone(),
             }
-            .run(inbox, events_rx, prelude, opened),
+            .run(inbox, events_rx, session_events, prelude, opened),
         );
 
         Ok(Started {
@@ -312,382 +465,555 @@ impl Harness for AcpHarness {
     }
 }
 
-/// A spawned, handshaken agent — the connect phase's yield.
+/// A connected, handshaken ACP client paired with its connection driver task.
 struct Connected {
-    /// The JSON-RPC client handle.
-    client: AcpClient<AgentHandler>,
-    /// The transport task; its end is the agent's end.
+    client: Client,
     connection_task: tokio::task::JoinHandle<()>,
-    /// The `initialize` answer.
-    initialized: aither_acp::InitializeResult,
 }
 
-/// Minimal newline-delimited JSON-RPC transport backed by a `tokio::process::Child`,
-/// used when dropping privileges to [`AgentUser`] before spawning an ACP agent.
-struct TokioChildTransport {
-    child: tokio::process::Child,
-    stdin: tokio::process::ChildStdin,
-    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
-    read_buf: Vec<u8>,
-}
-
-impl TokioChildTransport {
-    fn spawn(
-        program: &str,
-        args: &[&str],
-        env: &BTreeMap<String, String>,
-        cwd: &std::path::Path,
-        agent: &AgentUser,
-    ) -> std::io::Result<Self> {
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(args)
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true);
-        agent.apply_tokio_command(&mut cmd, env.clone());
-        let mut child = cmd.spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("ACP child stdin was not piped"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| std::io::Error::other("ACP child stdout was not piped"))?;
-        Ok(Self {
-            child,
-            stdin,
-            stdout: tokio::io::BufReader::new(stdout),
-            read_buf: Vec::new(),
-        })
-    }
-
-    async fn write_line(&mut self, value: &impl serde::Serialize) -> Result<(), McpError> {
-        let mut bytes = serde_json::to_vec(value)
-            .map_err(|error| McpError::Transport(format!("encode ACP message: {error}")))?;
-        bytes.push(b'\n');
-        self.stdin
-            .write_all(&bytes)
-            .await
-            .map_err(|error| McpError::Transport(format!("write ACP stdin: {error}")))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|error| McpError::Transport(format!("flush ACP stdin: {error}")))?;
-        Ok(())
-    }
-
-    async fn read_message(&mut self) -> Result<Option<JsonRpcMessage>, McpError> {
-        loop {
-            self.read_buf.clear();
-            let n = self
-                .stdout
-                .read_until(b'\n', &mut self.read_buf)
-                .await
-                .map_err(|error| McpError::Transport(format!("read ACP stdout: {error}")))?;
-            if n == 0 {
-                return Ok(None);
-            }
-            let line = std::str::from_utf8(&self.read_buf)
-                .map_err(|error| McpError::Transport(format!("ACP stdout is not UTF-8: {error}")))?
-                .trim();
-            if line.is_empty() {
-                continue;
-            }
-            let msg = serde_json::from_str::<JsonRpcMessage>(line)
-                .map_err(|error| McpError::Transport(format!("invalid ACP JSON-RPC: {error}")))?;
-            return Ok(Some(msg));
-        }
+/// Maps a flyco [`PermissionMode`] to `claude-acp`'s canonical mode identifier.
+const fn claude_mode_id(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Default => "agent",
+        PermissionMode::AcceptEdits => "workspace-write",
+        PermissionMode::Plan => "read-only",
+        PermissionMode::Auto => "auto",
+        PermissionMode::DontAsk => "dont-ask",
+        PermissionMode::BypassPermissions => "agent-full-access",
     }
 }
 
-impl Transport for TokioChildTransport {
-    async fn request(&mut self, req: JsonRpcRequest) -> Result<JsonRpcResponse, McpError> {
-        let wanted = req.id.clone();
-        self.write_line(&req).await?;
-        while let Some(msg) = self.read_message().await? {
-            if let JsonRpcMessage::Response(response) = msg
-                && response.id == wanted
-            {
-                return Ok(response);
-            }
-        }
-        Err(McpError::Transport(
-            "ACP child closed before answering".to_owned(),
-        ))
-    }
-
-    async fn notify(&mut self, notif: JsonRpcNotification) -> Result<(), McpError> {
-        self.write_line(&notif).await
-    }
-
-    async fn close(&mut self) -> Result<(), McpError> {
-        let _ = self.stdin.shutdown().await;
-        let _ = self.child.kill().await;
-        Ok(())
-    }
-
-    async fn exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        if let Ok(Some(status)) = self.child.try_wait() {
-            return Some(status);
-        }
-        let _ = self.child.kill().await;
-        self.child.wait().await.ok()
-    }
-}
-
-impl BidirectionalTransport for TokioChildTransport {
-    async fn recv(&mut self) -> Result<Option<JsonRpcMessage>, McpError> {
-        self.read_message().await
-    }
-
-    async fn respond(&mut self, response: JsonRpcResponse) -> Result<(), McpError> {
-        self.write_line(&response).await
-    }
-
-    async fn send_request(&mut self, req: JsonRpcRequest) -> Result<(), McpError> {
-        self.write_line(&req).await
-    }
-}
-
-/// Spawns the agent, runs the handshake, and refuses mounts the agent
-/// cannot speak.
-///
-/// The connection task owns the transport and dispatches to the handler.
-/// Its end is the agent's end: when it resolves, the driver is told rather
-/// than left to discover a dead channel per request.
-async fn connect(
-    config: &AcpConfig,
-    request: &StartRequest,
-    events: mpsc::UnboundedSender<AgentEvent>,
-    mount: &Mount,
-    agent: Option<&AgentUser>,
-) -> Result<Connected, AcpError> {
-    let handler = AgentHandler {
-        events,
-        replaying: Arc::new(AtomicBool::new(false)),
-    };
-    let program = config.program.to_string_lossy().into_owned();
-    let args: Vec<&str> = config.args.iter().map(String::as_str).collect();
-    let (client, connection_task) = if let Some(user) = agent {
-        let transport =
-            TokioChildTransport::spawn(&program, &args, &config.env, &request.workdir, user)
-                .map_err(|error| AcpError::Spawn {
-                    program: program.clone(),
-                    detail: error.to_string(),
-                })?;
-        let (client, connection) = AcpClient::connect(transport, handler.clone());
-        let closed = handler.events.clone();
-        let task = tokio::spawn(async move {
-            connection.await;
-            let _ = closed.send(AgentEvent::Closed);
-        });
-        (client, task)
-    } else {
-        let (client, connection) = AcpClient::spawn(
-            &program,
-            &args,
-            config.env.clone(),
-            request.workdir.clone(),
-            handler.clone(),
+/// Builds the `[acp]` view that drives an in-process Claude Code session.
+fn claude_acp_driver_config(claude: &ClaudeConfig) -> AcpConfig {
+    let modes = [
+        PermissionMode::Default,
+        PermissionMode::AcceptEdits,
+        PermissionMode::Plan,
+        PermissionMode::Auto,
+        PermissionMode::DontAsk,
+        PermissionMode::BypassPermissions,
+    ]
+    .into_iter()
+    .map(|mode| {
+        (
+            mode,
+            AcpMode {
+                set_mode: Some(claude_mode_id(mode).to_owned()),
+                options: Vec::new(),
+            },
         )
-        .map_err(|error| AcpError::Spawn {
-            program: program.clone(),
-            detail: error.to_string(),
+    })
+    .collect();
+
+    AcpConfig {
+        agent: "claude".to_owned(),
+        in_process: None,
+        program: claude
+            .claude_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(flyco_provider::flycod::CLAUDE_BIN)),
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        files: Vec::new(),
+        model: claude.model.clone(),
+        effort: claude.effort.clone(),
+        model_option: "model".to_owned(),
+        effort_option: Some("reasoning_effort".to_owned()),
+        fused_effort_tails: Vec::new(),
+        permission_mode: claude.permission_mode,
+        modes,
+        methods: AcpMethods {
+            compact: None,
+            usage: Some(AcpMethodCall {
+                call: claude_acp::EXT_RATE_LIMITS.to_owned(),
+                params: json!({ "sessionId": "<session>" }),
+            }),
+            mcp_status: Some(AcpMethodCall {
+                call: claude_acp::EXT_MCP_STATUS.to_owned(),
+                params: json!({ "sessionId": "<session>" }),
+            }),
+        },
+        tui: None,
+    }
+}
+
+/// Prepares a transcript home directory whose `.claude` entry points at
+/// `isolation_config_dir` so `claude-acp-sdk`'s [`TranscriptStore`] shares the
+/// exact directory tree `CLAUDE_CONFIG_DIR` writes into.
+async fn prepare_claude_transcript_home(
+    transcript_dir: &Path,
+    isolation_config_dir: &Path,
+    agent: Option<&AgentUser>,
+) -> Result<PathBuf, AcpError> {
+    let home = transcript_dir.join("claude-home");
+    tokio::fs::create_dir_all(&home)
+        .await
+        .map_err(|source| AcpError::File {
+            path: home.clone(),
+            source,
         })?;
-        let closed = handler.events.clone();
-        let task = tokio::spawn(async move {
-            connection.await;
-            let _ = closed.send(AgentEvent::Closed);
-        });
-        (client, task)
-    };
-    let client = client.with_client_info(Implementation {
-        name: "flycod".to_owned(),
-        title: None,
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-    });
-
-    let initialized = match client.initialize().await {
-        Ok(result) => result,
-        Err(error) => {
-            connection_task.abort();
-            return Err(AcpError::Agent {
-                context: "rejected `initialize`".to_owned(),
-                source: error,
-            });
+    tokio::fs::create_dir_all(isolation_config_dir)
+        .await
+        .map_err(|source| AcpError::File {
+            path: isolation_config_dir.to_path_buf(),
+            source,
+        })?;
+    if let Some(user) = agent
+        && user.needs_uid_switch()
+    {
+        chown_path(isolation_config_dir, Some(user.uid), Some(user.gid)).map_err(|error| {
+            AcpError::File {
+                path: isolation_config_dir.to_path_buf(),
+                source: std::io::Error::other(error),
+            }
+        })?;
+    }
+    let link = home.join(".claude");
+    match tokio::fs::symlink_metadata(&link).await {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                let _ = tokio::fs::remove_file(&link).await;
+            } else {
+                return Err(AcpError::File {
+                    path: link,
+                    source: std::io::Error::other(
+                        "expected `.claude` under transcript home to be a symlink",
+                    ),
+                });
+            }
         }
-    };
-    tracing::info!(
-        agent = %config.agent,
-        version = ?initialized.agent_info.as_ref().map(|info| &info.version),
-        "the ACP agent completed its handshake"
-    );
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(AcpError::File { path: link, source }),
+    }
+    tokio::fs::symlink(isolation_config_dir, &link)
+        .await
+        .map_err(|source| AcpError::File { path: link, source })?;
+    Ok(home)
+}
 
-    // A mounted server the agent cannot even speak to fails here rather
-    // than surfacing as a mysteriously absent tool mid-session.
-    for server in mount.acp_servers() {
-        if let aither_acp::McpServer::Http(http) = &server
-            && !initialized.agent_capabilities.mcp_capabilities.http
+/// Builds a [`aither_acp::ClientBuilder`] wired with flycod's identity,
+/// permission handler, and vendor notification forwarder.
+fn client_builder(events: mpsc::UnboundedSender<AgentEvent>) -> aither_acp::ClientBuilder {
+    let perm_tx = events.clone();
+    let notif_tx = events;
+    Client::builder(Implementation::new("flycod", env!("CARGO_PKG_VERSION")))
+        .permissions(move |request: PermissionRequest| {
+            let tx = perm_tx.clone();
+            async move {
+                let (respond, answer) = oneshot::channel();
+                if tx
+                    .send(AgentEvent::Permission {
+                        request: Box::new(request),
+                        respond,
+                    })
+                    .is_err()
+                {
+                    return PermissionOutcome::Cancelled(CancelledOutcome { meta: None });
+                }
+                answer
+                    .await
+                    .unwrap_or(PermissionOutcome::Cancelled(CancelledOutcome {
+                        meta: None,
+                    }))
+            }
+        })
+        .notification(move |notification: Notification| {
+            let tx = notif_tx.clone();
+            async move {
+                let _ = tx.send(AgentEvent::Vendor(notification));
+            }
+        })
+}
+
+/// Verifies that every HTTP MCP server in `servers` is supported by the
+/// negotiated agent capabilities.
+fn verify_mcp_transports(client: &Client, servers: &[McpServer]) -> Result<(), AcpError> {
+    let http_supported = client
+        .agent_capabilities()
+        .session
+        .as_ref()
+        .and_then(|s| s.mcp.as_ref())
+        .is_some_and(|m| m.http.is_some());
+    for server in servers {
+        if let McpServer::Http(http) = server
+            && !http_supported
         {
-            connection_task.abort();
             return Err(AcpError::UnsupportedTransport {
                 server: http.name.clone(),
             });
         }
     }
+    Ok(())
+}
+
+/// Connects an in-process `ClaudeAgent` hosted via `ClientBuilder::in_process_server`.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "assembles Claude managed policy, auth isolation, transcript home, and in-process ACP server"
+)]
+async fn connect_claude(
+    claude: &ClaudeConfig,
+    transcript_dir: &Path,
+    transcript_sync: AnyTranscriptSync,
+    connector_override: Option<ClaudeConnectorOverride>,
+    request: &StartRequest,
+    events: mpsc::UnboundedSender<AgentEvent>,
+    mount: &Mount,
+    agent: Option<&AgentUser>,
+) -> Result<(AcpConfig, Connected, bool, PathBuf), AcpError> {
+    let pass_mcp_to_session = if let Some(managed_dir) = &claude.managed_dir {
+        mount
+            .write_claude_managed(managed_dir)
+            .await
+            .map_err(|error| AcpError::File {
+                path: managed_dir.clone(),
+                source: std::io::Error::other(error),
+            })?;
+        false
+    } else {
+        true
+    };
+
+    let mut spawn_cfg = ClaudeSpawnConfig::new()
+        .cwd(request.workdir.clone())
+        .include_partial_messages(true);
+    if let Some(path) = &claude.claude_path {
+        spawn_cfg = spawn_cfg.claude_path(path.clone());
+    } else if Path::new(flyco_provider::flycod::CLAUDE_BIN).is_file() {
+        spawn_cfg = spawn_cfg.claude_path(flyco_provider::flycod::CLAUDE_BIN);
+    }
+    if let Some(model) = &claude.model {
+        spawn_cfg = spawn_cfg.model(model.clone());
+    }
+    if pass_mcp_to_session {
+        spawn_cfg.extra_args.push("--strict-mcp-config".to_owned());
+    }
+
+    let transcript_home = match &claude.auth {
+        ClaudeAuth::OauthToken { token, isolation } => {
+            let dir = isolation.config_dir.clone();
+            let token_owned = token.clone();
+            let agent_owned = agent.cloned();
+            tokio::task::spawn_blocking(move || {
+                crate::tui::provision_claude_oauth(&dir, &token_owned, agent_owned.as_ref())
+            })
+            .await
+            .map_err(|error| AcpError::File {
+                path: isolation.config_dir.clone(),
+                source: std::io::Error::other(error),
+            })?
+            .map_err(|source| AcpError::File {
+                path: isolation.config_dir.clone(),
+                source,
+            })?;
+            spawn_cfg.env.insert(
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                isolation.config_dir.to_string_lossy().into_owned(),
+            );
+            spawn_cfg.env.insert(
+                "CLAUDE_CODE_PROJECT_DIR_NAME".to_owned(),
+                isolation.project_dir_name.clone(),
+            );
+            prepare_claude_transcript_home(transcript_dir, &isolation.config_dir, agent).await?
+        }
+        ClaudeAuth::ApiKey { key, isolation } => {
+            spawn_cfg
+                .env
+                .insert("ANTHROPIC_API_KEY".to_owned(), key.clone());
+            spawn_cfg.env.insert(
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                isolation.config_dir.to_string_lossy().into_owned(),
+            );
+            spawn_cfg.env.insert(
+                "CLAUDE_CODE_PROJECT_DIR_NAME".to_owned(),
+                isolation.project_dir_name.clone(),
+            );
+            prepare_claude_transcript_home(transcript_dir, &isolation.config_dir, agent).await?
+        }
+        ClaudeAuth::Inherit => agent
+            .map(|u| u.home.clone())
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| transcript_dir.to_path_buf()),
+    };
+
+    let mut host_cfg = ClaudeAcpConfig::new()
+        .spawn(spawn_cfg)
+        .default_mode(claude_mode_id(claude.permission_mode))
+        .include_partial_messages(true)
+        .transcript_home(transcript_home.clone())
+        .connector(ClaudeProcessConnector::new(agent.cloned()));
+    host_cfg.transcript_sync = transcript_sync;
+    if let Some(apply) = connector_override {
+        host_cfg = apply(host_cfg);
+    }
+
+    let claude_agent = ClaudeAgent::new(host_cfg);
+    let shutdown_agent = claude_agent.clone();
+    let server = claude_agent.into_server();
+
+    let (client, connection) = client_builder(events.clone())
+        .in_process_server(server)
+        .await
+        .map_err(|source| AcpError::Agent {
+            context: "rejected `initialize`".to_owned(),
+            source,
+        })?;
+    let closed = events;
+    let connection_task = tokio::spawn(async move {
+        connection.await;
+        shutdown_agent.shutdown_all().await;
+        let _ = closed.send(AgentEvent::Closed);
+    });
+
+    tracing::info!(
+        agent = "claude",
+        version = ?client.agent_info().map(|info| &info.version),
+        "in-process Claude ACP host completed its handshake"
+    );
+
+    if pass_mcp_to_session && let Err(error) = verify_mcp_transports(&client, &mount.acp_servers())
+    {
+        connection_task.abort();
+        return Err(error);
+    }
+
+    Ok((
+        claude_acp_driver_config(claude),
+        Connected {
+            client,
+            connection_task,
+        },
+        pass_mcp_to_session,
+        transcript_home,
+    ))
+}
+
+/// Connects either an in-process `CodexAgent` or an external ACP subprocess.
+#[expect(
+    clippy::too_many_lines,
+    reason = "handles both in-process Codex and privilege-dropped subprocess ACP connection setup"
+)]
+async fn connect_acp(
+    config: &AcpConfig,
+    request: &StartRequest,
+    events: mpsc::UnboundedSender<AgentEvent>,
+    mount: &Mount,
+    agent: Option<&AgentUser>,
+    codex_connector: Option<AnyAppServerConnector>,
+) -> Result<Connected, AcpError> {
+    let builder = client_builder(events.clone());
+
+    let (client, connection_task) = match config.in_process {
+        Some(InProcessAgent::Codex) => {
+            let mut spawn_cfg = CodexSpawnConfig::new()
+                .codex_path(config.program.clone())
+                .cwd(request.workdir.clone())
+                .client_info("flycod", env!("CARGO_PKG_VERSION"))
+                .experimental_api(true);
+            spawn_cfg
+                .env
+                .extend(config.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+            let mut host_cfg = CodexAcpConfig::new().spawn(spawn_cfg);
+            if let Some(mode_id) = config
+                .modes
+                .get(&config.permission_mode)
+                .and_then(|m| m.set_mode.as_deref())
+            {
+                host_cfg = host_cfg.default_mode(mode_id);
+            }
+            host_cfg = match codex_connector {
+                Some(override_connector) => host_cfg.connector(override_connector),
+                None => host_cfg.connector(CodexProcessConnector::new(agent.cloned())),
+            };
+
+            let codex_agent = CodexAgent::new(host_cfg);
+            let bg_pump = codex_agent.drive_background();
+            let shutdown_agent = codex_agent.clone();
+            let server = codex_agent.into_server();
+
+            let (client, connection) =
+                builder
+                    .in_process_server(server)
+                    .await
+                    .map_err(|source| AcpError::Agent {
+                        context: "rejected `initialize`".to_owned(),
+                        source,
+                    })?;
+            let closed = events;
+            let task = tokio::spawn(async move {
+                futures_lite::future::or(connection, async move {
+                    bg_pump.await;
+                    std::future::pending::<()>().await;
+                })
+                .await;
+                shutdown_agent.shutdown_all().await;
+                let _ = closed.send(AgentEvent::Closed);
+            });
+            (client, task)
+        }
+        None => {
+            let program = config.program.to_string_lossy().into_owned();
+            let (client, connection) = if let Some(user) = agent {
+                let transport = TokioChildTransport::spawn(
+                    &program,
+                    &config.args,
+                    &config.env,
+                    &request.workdir,
+                    user,
+                )
+                .map_err(|error| AcpError::Spawn {
+                    program: program.clone(),
+                    detail: error.to_string(),
+                })?;
+                builder
+                    .connect(transport)
+                    .await
+                    .map_err(|source| AcpError::Agent {
+                        context: "rejected `initialize`".to_owned(),
+                        source,
+                    })?
+            } else {
+                let env: Vec<(String, String)> = config
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                builder
+                    .spawn(&program, &config.args, &env, &request.workdir)
+                    .await
+                    .map_err(|source| match source {
+                        ClientError::Transport(rpc) => AcpError::Spawn {
+                            program: program.clone(),
+                            detail: rpc.to_string(),
+                        },
+                        other => AcpError::Agent {
+                            context: "rejected `initialize`".to_owned(),
+                            source: other,
+                        },
+                    })?
+            };
+            let closed = events;
+            let task = tokio::spawn(async move {
+                connection.await;
+                let _ = closed.send(AgentEvent::Closed);
+            });
+            (client, task)
+        }
+    };
+
+    tracing::info!(
+        agent = %config.agent,
+        version = ?client.agent_info().map(|info| &info.version),
+        protocol = client.protocol_version(),
+        "the ACP agent completed its handshake"
+    );
+
+    if let Err(error) = verify_mcp_transports(&client, &mount.acp_servers()) {
+        connection_task.abort();
+        return Err(error);
+    }
     Ok(Connected {
         client,
         connection_task,
-        initialized,
     })
+}
+
+/// Checks a v1 session capability flag folded into
+/// `agent_capabilities().session.extra` by `aither-acp`'s v1 codec.
+fn v1_session_cap(client: &Client, key: &str) -> bool {
+    client
+        .agent_capabilities()
+        .session
+        .as_ref()
+        .and_then(|s| s.extra.get(key))
+        .is_some_and(|v| v.is_object() || v.as_bool().unwrap_or(false))
 }
 
 /// What a session-open call settled, before the driver task exists.
 struct Opened {
-    /// The ACP session id — what a later machine resumes by.
+    session: ClientSession,
     session_id: String,
-    /// Whether the agent advertised `session/close`.
     close_supported: bool,
-    /// The mode the agent reported itself in, when it said.
     mode: Option<String>,
-    /// The model the agent reported itself on, when it said.
     model: Option<String>,
-    /// The negotiated capability tokens, reported as `Capabilities`.
     capabilities: Vec<String>,
-    /// The models the agent's config options listed, if any.
     models: Vec<flyco_core::ModelOption>,
-    /// The commands the agent's session-open answer listed, if any.
     commands: Vec<flyco_core::HarnessCommand>,
-    /// Why a fresh session stands where a continued one was asked for —
-    /// said in the room, where the gap is visible.
     notice: Option<String>,
 }
 
 /// Opens the ACP session — new, resumed, or loaded.
-///
-/// Resume and load differ in what the agent replays: `session/resume`
-/// restores the context without re-sending history, while `session/load`
-/// streams the whole transcript back as updates. Replay is suppressed at
-/// the handler — a loaded history re-emitted as deltas would duplicate the
-/// conversation in flyco's transcript.
-///
-/// A continuation that cannot happen — the agent supports neither method,
-/// or rejects the one it advertised — is not a session failure. The
-/// workspace was already restored from the stored patch before the
-/// harness started, so the session opens fresh over it and says so in the
-/// room; the alternative is a dead session standing on live work.
 async fn open_session(
-    client: &AcpClient<AgentHandler>,
+    client: &Client,
     config: &AcpConfig,
-    mount: &Mount,
+    mcp_servers: &[McpServer],
     request: &StartRequest,
-    replaying: &AtomicBool,
-    initialized: &aither_acp::InitializeResult,
 ) -> Result<Opened, AcpError> {
-    let capabilities = &initialized.agent_capabilities;
+    let is_v2 = client.protocol_version() >= 2;
+    let can_resume = is_v2 || v1_session_cap(client, "resume");
+    let can_load = is_v2 || v1_session_cap(client, "loadSession");
 
-    let (session_id, modes, config_options, extra, notice) = match &request.resume_session_id {
-        Some(id) if capabilities.session_capabilities.resume.is_some() => {
-            match client
-                .resume_session(
-                    SessionResumeParams::new(id.clone(), request.workdir.clone())
-                        .mcp_servers(mount.acp_servers()),
-                )
-                .await
-            {
-                Ok(result) => (
-                    id.clone(),
-                    result.modes,
-                    result.config_options,
-                    result.extra,
-                    None,
-                ),
+    let (session, notice) = match &request.resume_session_id {
+        Some(id) if can_resume => {
+            let mut builder = client
+                .resume_session(SessionId::from(id.clone()), &request.workdir)
+                .no_replay();
+            for server in mcp_servers {
+                builder = builder.mcp_server(server.clone());
+            }
+            match builder.open().await {
+                Ok(session) => (session, None),
                 Err(source) => {
-                    let fresh = new_conversation(client, mount, request).await?;
+                    let fresh = new_conversation(client, mcp_servers, request).await?;
                     (
-                        fresh.session_id,
-                        fresh.modes,
-                        fresh.config_options,
-                        fresh.extra,
+                        fresh,
                         Some(restarted_fresh(config, "session/resume", &source)),
                     )
                 }
             }
         }
-        Some(id) if capabilities.load_session => {
-            replaying.store(true, Ordering::SeqCst);
-            let loaded = client
-                .load_session(
-                    aither_acp::SessionLoadParams::new(id.clone(), request.workdir.clone())
-                        .mcp_servers(mount.acp_servers()),
-                )
-                .await;
-            replaying.store(false, Ordering::SeqCst);
-            match loaded {
-                Ok(result) => (
-                    id.clone(),
-                    result.modes,
-                    result.config_options,
-                    result.extra,
-                    None,
-                ),
+        Some(id) if can_load => {
+            let mut builder = client
+                .resume_session(SessionId::from(id.clone()), &request.workdir)
+                .replay_from_start();
+            for server in mcp_servers {
+                builder = builder.mcp_server(server.clone());
+            }
+            match builder.open().await {
+                Ok(session) => (session, None),
                 Err(source) => {
-                    let fresh = new_conversation(client, mount, request).await?;
+                    let fresh = new_conversation(client, mcp_servers, request).await?;
                     (
-                        fresh.session_id,
-                        fresh.modes,
-                        fresh.config_options,
-                        fresh.extra,
+                        fresh,
                         Some(restarted_fresh(config, "session/load", &source)),
                     )
                 }
             }
         }
         Some(_) => {
-            let fresh = new_conversation(client, mount, request).await?;
-            (
-                fresh.session_id,
-                fresh.modes,
-                fresh.config_options,
-                fresh.extra,
-                Some(uncontinuable(config)),
-            )
+            let fresh = new_conversation(client, mcp_servers, request).await?;
+            (fresh, Some(uncontinuable(config)))
         }
         None => {
-            let fresh = new_conversation(client, mount, request).await?;
-            (
-                fresh.session_id,
-                fresh.modes,
-                fresh.config_options,
-                fresh.extra,
-                None,
-            )
+            let fresh = new_conversation(client, mcp_servers, request).await?;
+            (fresh, None)
         }
     };
-    Ok(describe_opened(
-        session_id,
-        capabilities,
-        modes,
-        config_options.as_deref(),
-        &extra,
-        notice,
-    ))
+
+    Ok(describe_opened(client, session, notice))
 }
 
-/// `session/new` — where a session whose conversation cannot be continued
-/// lands, and where one with nothing to continue starts.
+/// `session/new` — where a fresh conversation starts.
 async fn new_conversation(
-    client: &AcpClient<AgentHandler>,
-    mount: &Mount,
+    client: &Client,
+    mcp_servers: &[McpServer],
     request: &StartRequest,
-) -> Result<aither_acp::SessionNewResult, AcpError> {
+) -> Result<ClientSession, AcpError> {
     client
-        .new_session(
-            SessionNewParams::new(request.workdir.clone()).mcp_servers(mount.acp_servers()),
-        )
+        .new_session(&request.workdir)
+        .mcp_servers(mcp_servers.iter().cloned())
+        .open()
         .await
         .map_err(|source| AcpError::Agent {
             context: "rejected `session/new`".to_owned(),
@@ -695,8 +1021,6 @@ async fn new_conversation(
         })
 }
 
-/// The room line a fresh session carries when it stands where a continued
-/// conversation was asked for: the continuation was offered and refused.
 fn restarted_fresh(config: &AcpConfig, method: &str, source: &ClientError) -> String {
     tracing::warn!(agent = %config.agent, %source, "{method} was rejected; the session opens fresh");
     format!(
@@ -706,8 +1030,6 @@ fn restarted_fresh(config: &AcpConfig, method: &str, source: &ClientError) -> St
     )
 }
 
-/// The room line a fresh session carries on an agent that speaks no
-/// continuation method at all.
 fn uncontinuable(config: &AcpConfig) -> String {
     tracing::warn!(
         agent = %config.agent,
@@ -720,79 +1042,97 @@ fn uncontinuable(config: &AcpConfig) -> String {
     )
 }
 
-/// What the session-open answer settles, as an [`Opened`].
-fn describe_opened(
-    session_id: String,
-    capabilities: &aither_acp::AgentCapabilities,
-    modes: Option<aither_acp::SessionModeState>,
-    config_options: Option<&[aither_acp::ConfigOption]>,
-    extra: &BTreeMap<String, Value>,
-    notice: Option<String>,
-) -> Opened {
+/// Translates the opened [`ClientSession`] snapshot and negotiated capabilities
+/// into an [`Opened`] descriptor.
+fn describe_opened(client: &Client, session: ClientSession, notice: Option<String>) -> Opened {
+    let is_v2 = client.protocol_version() >= 2;
+    let caps = client.agent_capabilities();
+    let state = session.state();
+
+    let load_session = is_v2 || v1_session_cap(client, "loadSession");
+    let resume = is_v2 || v1_session_cap(client, "resume");
+    let close = is_v2 || v1_session_cap(client, "close");
+    let list = is_v2 || v1_session_cap(client, "list");
+    let mcp_http = caps
+        .session
+        .as_ref()
+        .and_then(|s| s.mcp.as_ref())
+        .is_some_and(|m| m.http.is_some());
+    let has_modes = state.current_mode.is_some()
+        || state
+            .config_options
+            .iter()
+            .any(aither_acp::domain::ConfigOption::is_mode);
+
     let mut tokens = vec!["acp".to_owned()];
-    if capabilities.load_session {
-        tokens.push("acp:load_session".to_owned());
-    }
     for (supported, token) in [
-        (
-            capabilities.session_capabilities.resume.is_some(),
-            "acp:resume",
-        ),
-        (
-            capabilities.session_capabilities.close.is_some(),
-            "acp:close",
-        ),
-        (capabilities.session_capabilities.list.is_some(), "acp:list"),
-        (modes.is_some(), "acp:modes"),
-        (
-            config_options.is_some_and(|list| !list.is_empty()),
-            "acp:config_options",
-        ),
-        (capabilities.mcp_capabilities.http, "acp:mcp_http"),
-        (capabilities.mcp_capabilities.sse, "acp:mcp_sse"),
+        (load_session, "acp:load_session"),
+        (resume, "acp:resume"),
+        (close, "acp:close"),
+        (list, "acp:list"),
+        (has_modes, "acp:modes"),
+        (!state.config_options.is_empty(), "acp:config_options"),
+        (mcp_http, "acp:mcp_http"),
     ] {
         if supported {
             tokens.push(token.to_owned());
         }
     }
 
-    let (model_list, current_model) =
-        normalize::read_model_option(config_options.unwrap_or_default());
+    let (model_list, current_model) = normalize::read_model_option(&state.config_options);
+    let current_mode = state
+        .current_mode
+        .map(|id| id.as_str().to_owned())
+        .or_else(|| {
+            state
+                .config_options
+                .iter()
+                .find(|o| o.is_mode())
+                .and_then(|o| match &o.kind {
+                    aither_acp::domain::ConfigKind::Select(select) => {
+                        Some(select.current_value.as_str().to_owned())
+                    }
+                    _ => None,
+                })
+        });
+
     Opened {
-        session_id,
-        close_supported: capabilities.session_capabilities.close.is_some(),
-        mode: modes.map(|state| state.current_mode_id),
+        session_id: session.id().as_str().to_owned(),
+        close_supported: close,
+        mode: current_mode,
         model: current_model,
         capabilities: tokens,
         models: model_list.unwrap_or_default(),
-        commands: extra
-            .get("availableCommands")
-            .and_then(|value| {
-                serde_json::from_value::<Vec<aither_acp::AvailableCommand>>(value.clone()).ok()
-            })
-            .map_or_default(|commands| {
-                commands
-                    .into_iter()
-                    .map(|command| flyco_core::HarnessCommand {
-                        name: command.name,
-                        description: command.description,
-                        argument_hint: command.input.map(|input| input.hint),
-                    })
-                    .collect()
-            }),
+        commands: normalize::convert_commands(&state.available_commands),
         notice,
+        session,
     }
 }
 
-/// Puts the session under the configured permission mode.
-///
-/// The `[acp.modes]` entry is applied as written: `set_mode` first, then
-/// the option writes in order. A mode with no entry fails rather than
-/// running under a neighbouring one, because "close enough" is not a
-/// permission mode.
+/// Refreshes [`Opened`] metadata from the folded [`aither_acp::SessionState`]
+/// snapshot captured right after startup setup and mount verification.
+fn refresh_opened_from_state(opened: &mut Opened, state: &aither_acp::SessionState) {
+    let (model_list, current_model) = normalize::read_model_option(&state.config_options);
+    if let Some(models) = model_list
+        && !models.is_empty()
+    {
+        opened.models = models;
+    }
+    if current_model.is_some() {
+        opened.model = current_model;
+    }
+    if let Some(mode) = state.current_mode.as_ref() {
+        opened.mode = Some(mode.as_str().to_owned());
+    }
+    let commands = normalize::convert_commands(&state.available_commands);
+    if !commands.is_empty() {
+        opened.commands = commands;
+    }
+}
+
+/// Applies the configured flyco [`PermissionMode`] to `session`.
 async fn apply_permission_mode(
-    client: &AcpClient<AgentHandler>,
-    session_id: &str,
+    session: &ClientSession,
     mode: PermissionMode,
     config: &AcpConfig,
 ) -> Result<(), AcpError> {
@@ -800,8 +1140,8 @@ async fn apply_permission_mode(
         return Err(AcpError::ModeUnsupported { mode });
     };
     if let Some(mode_id) = &mapping.set_mode {
-        client
-            .set_mode(SessionSetModeParams::new(session_id, mode_id.clone()))
+        session
+            .set_mode(mode_id.as_str())
             .await
             .map_err(|source| AcpError::Agent {
                 context: format!("rejected `session/set_mode {mode_id}`"),
@@ -809,12 +1149,13 @@ async fn apply_permission_mode(
             })?;
     }
     for write in &mapping.options {
-        client
-            .set_config_option(SessionSetConfigOptionParams::new(
-                session_id,
-                &write.option,
-                write.value.as_str(),
-            ))
+        session
+            .set_config(
+                write.option.as_str(),
+                ConfigValue::Id(ConfigValueById {
+                    value: write.value.as_str().into(),
+                }),
+            )
             .await
             .map_err(|source| AcpError::Agent {
                 context: format!("rejected `session/set_config_option {}`", write.option),
@@ -824,13 +1165,7 @@ async fn apply_permission_mode(
     Ok(())
 }
 
-/// The model id `set_config_option` is sent.
-///
-/// On an agent whose ids carry the effort — `fused_effort_tails` names
-/// the suffixes it hangs after the level — the chosen effort is folded
-/// back into the id: `gpt-5-6-sol-priority` at `high` sends
-/// `gpt-5-6-sol-high-priority`. A fused agent asked for no effort gets
-/// the id as written — bare ids like `adaptive` are valid on their own.
+/// Folds effort into a fused model id when `fused_effort_tails` is configured.
 fn model_id_to_send(config: &AcpConfig, model: &str, effort: Option<&str>) -> String {
     let Some(effort) = effort else {
         return model.to_owned();
@@ -846,21 +1181,17 @@ fn model_id_to_send(config: &AcpConfig, model: &str, effort: Option<&str>) -> St
     format!("{model}-{effort}")
 }
 
-/// Selects the configured model and effort through the session's config
-/// options.
-async fn apply_model(
-    client: &AcpClient<AgentHandler>,
-    session_id: &str,
-    config: &AcpConfig,
-) -> Result<(), AcpError> {
+/// Selects the configured model and effort through the session's config options.
+async fn apply_model(session: &ClientSession, config: &AcpConfig) -> Result<(), AcpError> {
     if let Some(model) = &config.model {
         let id = model_id_to_send(config, model, config.effort.as_deref());
-        client
-            .set_config_option(SessionSetConfigOptionParams::new(
-                session_id,
-                &config.model_option,
-                id.as_str(),
-            ))
+        session
+            .set_config(
+                config.model_option.as_str(),
+                ConfigValue::Id(ConfigValueById {
+                    value: id.as_str().into(),
+                }),
+            )
             .await
             .map_err(|source| AcpError::Agent {
                 context: format!(
@@ -871,19 +1202,19 @@ async fn apply_model(
             })?;
     }
     if !config.fused_effort_tails.is_empty() {
-        // The effort already rode inside the model id.
         return Ok(());
     }
     if let Some(effort) = &config.effort {
         let Some(option) = &config.effort_option else {
             return Err(AcpError::EffortUnsupported);
         };
-        client
-            .set_config_option(SessionSetConfigOptionParams::new(
-                session_id,
-                option,
-                effort.as_str(),
-            ))
+        session
+            .set_config(
+                option.as_str(),
+                ConfigValue::Id(ConfigValueById {
+                    value: effort.as_str().into(),
+                }),
+            )
             .await
             .map_err(|source| AcpError::Agent {
                 context: format!("rejected `session/set_config_option {option}`"),
@@ -895,25 +1226,15 @@ async fn apply_model(
 
 /// Whether an `[acp.files]` entry is a managed policy document (non-secret
 /// MCP registry) rather than a credential file.
-fn is_managed_policy_file(path: &std::path::Path) -> bool {
+fn is_managed_policy_file(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
         Some("config.toml" | "mcp_config.json")
     )
 }
 
-/// Writes every `[acp.files]` entry.
-///
-/// Under dual-UID isolation (`agent.is_some()`):
-/// - Managed policy files (`config.toml`, `mcp_config.json`) are written
-///   daemon-owned `0644` inside `0755` daemon-owned directories so the agent
-///   can read them but cannot modify or unlink them.
-/// - Credential files (`auth.json`, `credentials.toml`) are written
-///   daemon-owned `0640` with group `agent.gid` so the agent can read its
-///   own harness credential without being able to overwrite or leak it to
-///   other users.
-///
-/// Without a separate agent user (developer machine), every file is `0600`.
+/// Writes every `[acp.files]` entry with dual-UID permissions when `agent` is
+/// present.
 async fn materialize_files(config: &AcpConfig, agent: Option<&AgentUser>) -> Result<(), AcpError> {
     for file in &config.files {
         let managed_policy = is_managed_policy_file(&file.path);
@@ -974,11 +1295,7 @@ async fn materialize_files(config: &AcpConfig, agent: Option<&AgentUser>) -> Res
     Ok(())
 }
 
-/// A params template with its `<session>` placeholders filled.
-///
-/// Every extension method that takes the session id spells it differently —
-/// `sessionId`, `threadId` — so the config names the field and the marker
-/// is substituted wherever it appears as a whole string value.
+/// Fills `<session>` placeholders inside an [`AcpMethodCall`]'s params JSON.
 fn render_params(call: &AcpMethodCall, session_id: &str) -> Value {
     fn fill(value: &Value, session_id: &str) -> Value {
         match value {
@@ -997,50 +1314,88 @@ fn render_params(call: &AcpMethodCall, session_id: &str) -> Value {
     fill(&call.params, session_id)
 }
 
-/// Asks the agent what it mounted, until nothing is still dialling.
+/// Invokes a configured `_`-prefixed extension method on `client`.
+async fn call_ext(
+    client: &Client,
+    call: &AcpMethodCall,
+    session_id: &str,
+) -> Result<Value, AcpError> {
+    let method = ExtMethod::try_new(&call.call).map_err(|_| AcpError::InvalidMethod {
+        method: call.call.clone(),
+    })?;
+    let params = render_params(call, session_id);
+    client
+        .ext_request(&method, &params)
+        .await
+        .map_err(|source| AcpError::Agent {
+            context: format!("rejected `{}`", call.call),
+            source,
+        })
+}
+
+/// Asks the agent what it mounted, until nothing is still dialling or
+/// [`MOUNT_SETTLE`] expires.
 async fn verify_mount(
-    client: &AcpClient<AgentHandler>,
+    client: &Client,
     session_id: &str,
     method: &AcpMethodCall,
     mount: &Mount,
 ) -> Result<(), AcpError> {
     let deadline = tokio::time::Instant::now() + MOUNT_SETTLE;
     loop {
-        let servers = mounted_servers(client, session_id, method).await?;
+        let servers = mounted_servers(client, session_id, method, deadline).await?;
         if crate::mount::settled(&servers) || tokio::time::Instant::now() >= deadline {
             return crate::mount::verify(&servers, &mount.required_tools())
                 .map_err(AcpError::Mount);
         }
-        tokio::time::sleep(MOUNT_POLL).await;
+        let now = tokio::time::Instant::now();
+        let wait = MOUNT_POLL.min(deadline.saturating_duration_since(now));
+        if wait.is_zero() {
+            return crate::mount::verify(&servers, &mount.required_tools())
+                .map_err(AcpError::Mount);
+        }
+        tokio::time::sleep(wait).await;
     }
 }
 
-/// One complete answer to the configured mount-introspection method.
-///
-/// Parsed tolerantly rather than against one vendor's schema: the answer's
-/// server list is wherever a `data` array or a top-level array lives, a
-/// server is an object with a `name`, its state is whichever of
-/// `runtimeStatus`/`status`/`state` it carries, and its tools are the keys
-/// of a `tools` object or the names/strings of a `tools` array. Codex's
-/// `mcpServerStatus/list` answers exactly this; another agent's answer in
-/// the same shape works unchanged.
+/// Walks the agent's mount-introspection method with a strict page cap,
+/// non-advancing cursor guard, and overall deadline.
 async fn mounted_servers(
-    client: &AcpClient<AgentHandler>,
+    client: &Client,
     session_id: &str,
     method: &AcpMethodCall,
+    deadline: tokio::time::Instant,
 ) -> Result<Vec<MountedServer>, AcpError> {
+    let ext_method = ExtMethod::try_new(&method.call).map_err(|_| AcpError::InvalidMethod {
+        method: method.call.clone(),
+    })?;
     let mut mounted = Vec::new();
     let mut params = render_params(method, session_id);
+    let mut seen_cursors = BTreeSet::new();
+    let mut pages = 0usize;
+
     loop {
-        let result: Value = client
-            .request(&method.call, &params)
-            .await
-            .map_err(|source| AcpError::Agent {
-                context: format!("rejected `{}`", method.call),
-                source,
-            })?;
+        pages += 1;
+        let result: Value =
+            tokio::time::timeout_at(deadline, client.ext_request(&ext_method, &params))
+                .await
+                .map_err(|_| {
+                    AcpError::Mount(crate::mount::NotMounted::NotConnected {
+                        status: format!(
+                            "`{}` did not finish within {}s",
+                            method.call,
+                            MOUNT_SETTLE.as_secs()
+                        ),
+                    })
+                })?
+                .map_err(|source| AcpError::Agent {
+                    context: format!("rejected `{}`", method.call),
+                    source,
+                })?;
+
         let list = result
-            .get("data")
+            .get("mcpServers")
+            .or_else(|| result.get("data"))
             .or_else(|| result.get("servers"))
             .and_then(Value::as_array)
             .or_else(|| result.as_array())
@@ -1048,26 +1403,42 @@ async fn mounted_servers(
                 detail: format!("no server list in {}", truncate(&result)),
             })?;
         mounted.extend(list.iter().filter_map(mounted_server));
+
         let Some(cursor) = result
             .get("nextCursor")
             .or_else(|| result.get("next_cursor"))
             .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
         else {
             return Ok(mounted);
         };
+        if pages >= MAX_MOUNT_PAGES {
+            tracing::warn!(
+                method = %method.call,
+                pages,
+                "mount report pagination reached page cap; stopping walk"
+            );
+            return Ok(mounted);
+        }
+        if !seen_cursors.insert(cursor.to_owned()) {
+            tracing::warn!(
+                method = %method.call,
+                cursor,
+                "mount report pagination returned a repeating cursor; stopping walk"
+            );
+            return Ok(mounted);
+        }
         if let Value::Object(map) = &mut params {
             map.insert("cursor".to_owned(), Value::String(cursor.to_owned()));
         } else {
-            // A configured params shape that cannot carry a cursor ends
-            // the walk here — looping on the first page forever would
-            // be worse than reporting the page seen.
             tracing::warn!("the mount report paged but its params take no cursor");
             return Ok(mounted);
         }
     }
 }
 
-/// One entry of a mount report, read tolerantly.
+/// One entry of a mount report, read across Claude (`mcpServers`/`status`) and
+/// Codex (`data`/`runtimeStatus`) shapes.
 fn mounted_server(entry: &Value) -> Option<MountedServer> {
     let name = entry.get("name")?.as_str()?.to_owned();
     let status = entry
@@ -1101,18 +1472,7 @@ fn mounted_server(entry: &Value) -> Option<MountedServer> {
     })
 }
 
-/// The no-introspection mount check: watch what the agent itself reports.
-///
-/// An agent without a `mcp_status` method still tends to say when a server
-/// fails — Devin writes it to its `_cognition.ai/output` channel under
-/// `MCP: <name>` — so for a bounded window the session's early
-/// notifications are scanned for a failure naming flyco's server, which is
-/// fatal, or an explicit connect, which ends the watch early. Silence is
-/// not evidence either way and is logged as such.
-///
-/// Notifications that are not about MCP — the replayed capability report,
-/// an early palette — are not consumed but pushed onto `prelude`, which the
-/// driver processes before anything newer, so nothing is lost to the watch.
+/// Watches early agent notifications when no `mcp_status` method exists.
 async fn observe_mount(
     events: &mut mpsc::UnboundedReceiver<AgentEvent>,
     prelude: &mut Vec<AgentEvent>,
@@ -1131,8 +1491,6 @@ async fn observe_mount(
             event = events.recv() => {
                 let Some(event) = event else { return Ok(()) };
                 match event {
-                    // The agent died mid-watch: not a mount answer, a dead
-                    // session, and starting one is the wrong report.
                     AgentEvent::Closed => return Err(AcpError::Closed),
                     AgentEvent::Vendor(notification) => {
                         match mount_evidence(&notification) {
@@ -1145,7 +1503,7 @@ async fn observe_mount(
                                 tracing::info!("the agent confirmed flyco's MCP server connected");
                                 return Ok(());
                             }
-                            None => {}
+                            None => prelude.push(AgentEvent::Vendor(notification)),
                         }
                     }
                     other => prelude.push(other),
@@ -1155,30 +1513,56 @@ async fn observe_mount(
     }
 }
 
-/// What a notification says about flyco's MCP server, when it says
-/// anything.
+/// What a notification says about flyco's MCP server, when it says anything.
+#[derive(Debug, PartialEq, Eq)]
 enum Evidence {
-    /// The server connected.
     Connected,
-    /// The server failed; the detail is the agent's own words.
     Failed(String),
 }
 
-/// Reads an unmodeled agent notification for flyco-server news.
+/// Structurally parses an unmodeled agent notification for flyco MCP server
+/// status.
 ///
-/// Two generic shapes are recognized rather than one vendor's: a servers-
-/// changed notification whose payload names the server at all (it announces
-/// the live set), and a log-channel line of the `MCP: <name>` form, where
-/// the words after the name decide. Anything else is not evidence.
-fn mount_evidence(notification: &JsonRpcNotification) -> Option<Evidence> {
+/// Rejects false positives: failure/error payloads or in-progress (`starting`,
+/// `connecting`, `pending`) notifications never register as [`Evidence::Connected`].
+fn mount_evidence(notification: &Notification) -> Option<Evidence> {
     let method = notification.method.as_str();
     let params = notification.params.as_ref()?;
-    let text = params.to_string();
+
     if method.contains("serversChanged") || method.ends_with("/mcp") {
-        return text
-            .contains(&format!("\"{}\"", crate::mount::FLYCO))
-            .then_some(Evidence::Connected);
+        let list = params
+            .get("mcpServers")
+            .or_else(|| params.get("servers"))
+            .or_else(|| params.get("data"))
+            .and_then(Value::as_array)
+            .or_else(|| params.as_array())?;
+
+        for entry in list {
+            let Some(name) = entry.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if name != crate::mount::FLYCO {
+                continue;
+            }
+            if let Some(error) = entry.get("error").and_then(Value::as_str)
+                && !error.is_empty()
+            {
+                return Some(Evidence::Failed(error.to_owned()));
+            }
+            let status = entry
+                .get("runtimeStatus")
+                .or_else(|| entry.get("status"))
+                .or_else(|| entry.get("state"))
+                .and_then(Value::as_str);
+            return match status {
+                Some("connected" | "running" | "ready") => Some(Evidence::Connected),
+                Some("notStarted" | "starting" | "pending" | "connecting") | None => None,
+                Some(other) => Some(Evidence::Failed(other.to_owned())),
+            };
+        }
+        return None;
     }
+
     if let Some(message) = params.get("message").and_then(Value::as_str)
         && params
             .get("channel")
@@ -1186,15 +1570,38 @@ fn mount_evidence(notification: &JsonRpcNotification) -> Option<Evidence> {
             .is_some_and(|channel| channel.ends_with(crate::mount::FLYCO))
     {
         let lower = message.to_lowercase();
-        if ["fail", "error", "refus", "denied", "unable"]
-            .iter()
-            .any(|word| lower.contains(word))
+        if [
+            "fail",
+            "error",
+            "refus",
+            "denied",
+            "unable",
+            "disconnect",
+            "crash",
+            "timeout",
+            "exited",
+        ]
+        .iter()
+        .any(|word| lower.contains(word))
         {
             return Some(Evidence::Failed(message.to_owned()));
         }
-        if ["connect", "ready", "start", "listen"]
-            .iter()
-            .any(|word| lower.contains(word))
+        if [
+            "starting",
+            "connecting",
+            "pending",
+            "initializing",
+            "loading",
+        ]
+        .iter()
+        .any(|word| lower.contains(word))
+        {
+            return None;
+        }
+        if has_word(&lower, "connected")
+            || has_word(&lower, "ready")
+            || has_word(&lower, "listening")
+            || has_word(&lower, "started")
         {
             return Some(Evidence::Connected);
         }
@@ -1202,7 +1609,12 @@ fn mount_evidence(notification: &JsonRpcNotification) -> Option<Evidence> {
     None
 }
 
-/// The sentence a [`Value`] begins with, for error messages.
+/// Checks whether `word` appears as a whole ASCII-alphanumeric word in `text`.
+fn has_word(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| token == word)
+}
+
 fn truncate(value: &Value) -> String {
     let text = value.to_string();
     if text.len() > 200 {
@@ -1275,152 +1687,94 @@ impl HarnessSession for AcpSession {
     }
 }
 
-/// Everything the driver task can be asked to do.
 #[derive(Debug)]
 enum DriverCommand {
-    /// From the handle: push a user message and open a turn.
     UserMessage {
-        /// The message text.
         text: String,
-        /// Answered once the prompt is dispatched.
         ack: oneshot::Sender<Result<(), AcpError>>,
     },
-    /// From the handle: end the current turn.
     Interrupt {
-        /// Answered once the cancel notification is sent.
         ack: oneshot::Sender<Result<(), AcpError>>,
     },
-    /// From the handle: answer once every queued agent event is processed.
     Flush {
-        /// The acknowledgement.
         ack: oneshot::Sender<Result<(), AcpError>>,
     },
-    /// From the handle: compact the conversation context.
     Compact {
-        /// Answered with the method call's own result.
         ack: oneshot::Sender<Result<(), AcpError>>,
     },
-    /// From the handle: report what the context window is spent on.
     ContextUsage {
-        /// The acknowledgement.
         ack: oneshot::Sender<Result<(), AcpError>>,
     },
-    /// From the handle: put the session on another model.
     SetModel {
-        /// The choice.
         model: ModelChoice,
-        /// Answered with the config-option writes' result.
         ack: oneshot::Sender<Result<(), AcpError>>,
     },
-    /// From the handle: put the session under another permission mode.
     SetPermissionMode {
-        /// The mode.
         mode: PermissionMode,
-        /// Answered with the writes' result.
         ack: oneshot::Sender<Result<(), AcpError>>,
     },
-    /// From the handle: answer a pending approval.
     Approval {
-        /// The decision.
         approval: ToolApproval,
-        /// The acknowledgement.
         ack: oneshot::Sender<Result<(), AcpError>>,
     },
-    /// From the handle: stop the session.
     Shutdown {
-        /// The acknowledgement.
         ack: oneshot::Sender<Result<(), AcpError>>,
     },
 }
 
-/// Everything the agent reports, routed through the handler.
 #[derive(Debug)]
 enum AgentEvent {
-    /// A `session/update` notification.
-    Update(SessionNotification),
-    /// A `session/request_permission` request; the agent is blocked until
-    /// `respond` is answered.
     Permission {
-        /// What is being asked.
-        params: RequestPermissionParams,
-        /// Carries the answer back to the connection task.
-        respond: oneshot::Sender<RequestPermissionResult>,
+        request: Box<PermissionRequest>,
+        respond: oneshot::Sender<PermissionOutcome>,
     },
-    /// An agent-to-client notification ACP does not model — vendor
-    /// extensions and anything newer than this build.
-    Vendor(JsonRpcNotification),
-    /// A spawned `session/prompt` request resolved.
+    Vendor(Notification),
     PromptFinished {
-        /// Which minted turn it was.
         turn_id: String,
-        /// The prompt's own result.
-        result: Result<aither_acp::PromptResult, ClientError>,
+        outcome: TurnOutcome,
     },
-    /// A spawned extension-method call resolved.
+    CompactFinished {
+        outcome: TurnOutcome,
+        ack: oneshot::Sender<Result<(), AcpError>>,
+    },
     CallFinished {
-        /// Which spawned call it was.
         id: u64,
-        /// The call's raw result.
-        result: Result<Value, ClientError>,
+        result: Result<Value, AcpError>,
     },
-    /// The connection task ended — the agent exited or closed the pipe.
     Closed,
 }
 
-/// A permission request waiting on the user.
 struct PendingPermission {
-    /// Carries the outcome back to the blocked agent.
-    respond: oneshot::Sender<RequestPermissionResult>,
-    /// The options the agent offered, so an Allow can pick the right id.
+    respond: oneshot::Sender<PermissionOutcome>,
     options: Vec<PermissionOption>,
 }
 
-/// What a spawned extension call was for.
 enum PendingCall {
-    /// A compaction; its caller waits on the ack.
     Compact(oneshot::Sender<Result<(), AcpError>>),
-    /// A plan-usage read; nobody waits on it, and what it answers is only
-    /// read for the limit it may announce — the rings are the control
-    /// plane's, read from the vendor while a page is built.
     Usage,
 }
 
-/// The task that owns the client handle and everything mutable.
 struct Driver {
-    client: AcpClient<AgentHandler>,
-    /// The connection task, awaited on shutdown.
+    client: Client,
+    session: ClientSession,
     connection_task: tokio::task::JoinHandle<()>,
-    /// The ACP session every call is keyed by.
     session_id: String,
     config: AcpConfig,
+    context_usage_method: Option<AcpMethodCall>,
+    claude_compact: bool,
+    claude_sync: Option<ClaudeSyncContext>,
     normalizer: Normalizer,
     outputs: mpsc::Sender<SessionOutput>,
-    /// Cloned into every spawned request, so its answer lands back here.
     events: mpsc::UnboundedSender<AgentEvent>,
-    /// Minted turn counter — ACP carries no turn ids, so they are invented.
     turn_seq: u64,
-    /// The turn in flight, if any.
     active_turn: Option<String>,
-    /// User messages accepted while a turn runs.
-    ///
-    /// ACP refuses a second `session/prompt` mid-turn, so what arrives
-    /// during one — the user's own follow-up, an injected notice — waits
-    /// here rather than erroring. The next `PromptFinished` drains one,
-    /// and each message's ack answers at enqueue: "accepted" is what the
-    /// wire layer needs to know, and the room log still holds the text if
-    /// the daemon dies before it is sent.
     queued_messages: VecDeque<String>,
     pending_permissions: BTreeMap<ApprovalId, PendingPermission>,
     pending_calls: BTreeMap<u64, PendingCall>,
-    /// Spawned-call counter.
     call_seq: u64,
-    /// Whether the agent advertised `session/close`.
     close_supported: bool,
-    /// Whether shutdown has already run.
     stopped: bool,
-    /// The agent's current mode id, as last reported.
     mode: Option<String>,
-    /// The model the session reports running on, as last reported.
     model: Option<String>,
 }
 
@@ -1429,6 +1783,7 @@ impl Driver {
         mut self,
         mut inbox: mpsc::Receiver<DriverCommand>,
         mut events: mpsc::UnboundedReceiver<AgentEvent>,
+        mut session_events: SessionEvents,
         prelude: Vec<AgentEvent>,
         opened: Opened,
     ) {
@@ -1485,37 +1840,43 @@ impl Driver {
         {
             return;
         }
-        // Asked once at open, then again after every turn — a turn is the
-        // only thing that moves the number.
         self.request_usage();
 
-        // Drained before either channel: events buffered by the mount watch
-        // predate everything the channels hold.
         for event in prelude {
-            if !self.on_agent(event).await {
+            if !self.on_agent(event, &mut session_events).await {
                 let _ = self.stop().await;
                 return;
             }
         }
+
         loop {
             if inbox.is_closed() {
                 break;
             }
             let input = tokio::select! {
-                command = inbox.recv() => command.map(AgentOrCommand::Command),
-                agent = events.recv() => agent.map(|event| AgentOrCommand::Agent(Box::new(event))),
+                command = inbox.recv() => command.map(LoopInput::Command),
+                agent = events.recv() => agent.map(|ev| LoopInput::Agent(Box::new(ev))),
+                ev = session_events.next() => match ev {
+                    Some(session_event) => Some(LoopInput::SessionEvent(Box::new(session_event))),
+                    None => events
+                        .recv()
+                        .await
+                        .map(|agent| LoopInput::Agent(Box::new(agent))),
+                },
             };
             match input {
-                // `events` never ends: the driver holds a sender of its own
-                // for spawned calls, so the agent's end is the `Closed`
-                // event rather than the channel.
-                Some(AgentOrCommand::Command(command)) => {
-                    if !self.handle(command).await {
+                Some(LoopInput::Command(command)) => {
+                    if !self.handle(command, &mut session_events).await {
                         break;
                     }
                 }
-                Some(AgentOrCommand::Agent(event)) => {
-                    if !self.on_agent(*event).await {
+                Some(LoopInput::Agent(event)) => {
+                    if !self.on_agent(*event, &mut session_events).await {
+                        break;
+                    }
+                }
+                Some(LoopInput::SessionEvent(event)) => {
+                    if !self.on_session_event(&event).await {
                         break;
                     }
                 }
@@ -1526,10 +1887,23 @@ impl Driver {
         tracing::debug!(agent = %self.config.agent, "the ACP driver task finished");
     }
 
-    /// One handle command.
-    ///
-    /// Returns `false` when the loop should end.
-    async fn handle(&mut self, command: DriverCommand) -> bool {
+    /// Drains all immediately-ready [`SessionEvent`]s so deltas, tool
+    /// completions, and usage updates emitted by a turn always reach the
+    /// output stream before `TurnCompleted` / `Flush`.
+    async fn drain_session_events(&mut self, session_events: &mut SessionEvents) -> bool {
+        while let Some(Some(event)) = futures_lite::future::poll_once(session_events.next()).await {
+            if !self.on_session_event(&event).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "command dispatch handles every HarnessSession verb in one match"
+    )]
+    async fn handle(&mut self, command: DriverCommand, session_events: &mut SessionEvents) -> bool {
         match command {
             DriverCommand::UserMessage { text, ack } => {
                 if self.active_turn.is_some() {
@@ -1543,9 +1917,12 @@ impl Driver {
                 ok
             }
             DriverCommand::Interrupt { ack } => {
+                // Clear queued follow-ups immediately so cancelling the active
+                // turn does not unexpectedly kick off buffered user messages.
+                self.queued_messages.clear();
                 let result = self
-                    .client
-                    .cancel(self.session_id.clone())
+                    .session
+                    .cancel()
                     .await
                     .map_err(|source| AcpError::Agent {
                         context: "rejected `session/cancel`".to_owned(),
@@ -1555,19 +1932,52 @@ impl Driver {
                 true
             }
             DriverCommand::Flush { ack } => {
+                if !self.drain_session_events(session_events).await {
+                    let _ = ack.send(Err(AcpError::Stopped));
+                    return false;
+                }
+                if let Some(ctx) = &self.claude_sync
+                    && let Err(error) = ctx
+                        .sync
+                        .push(&self.session_id, &ctx.workdir, &ctx.transcript_home)
+                        .await
+                {
+                    tracing::warn!(%error, "transcript push during flush failed");
+                }
                 let _ = ack.send(Ok(()));
                 true
             }
             DriverCommand::Compact { ack } => {
-                let Some(call) = self.config.methods.compact.clone() else {
-                    let _ = ack.send(Err(AcpError::NoMethod {
-                        feature: "context compaction",
-                    }));
+                if let Some(call) = self.config.methods.compact.clone() {
+                    self.spawn_call(call, PendingCall::Compact(ack));
                     return true;
-                };
-                // The spawned call's `CallFinished` answers the ack — the
-                // loop must keep reading the agent while it runs.
-                self.spawn_call(call, PendingCall::Compact(ack));
+                }
+                if self.claude_compact {
+                    if self.active_turn.is_some() {
+                        let _ = ack.send(Err(AcpError::TurnInFlight));
+                        return true;
+                    }
+                    let session = self.session.clone();
+                    let events = self.events.clone();
+                    match session.prompt("/compact") {
+                        Ok(mut turn) => {
+                            tokio::spawn(async move {
+                                let outcome = turn.finish().await;
+                                let _ = events.send(AgentEvent::CompactFinished { outcome, ack });
+                            });
+                        }
+                        Err(source) => {
+                            let _ = ack.send(Err(AcpError::Agent {
+                                context: "rejected `/compact`".to_owned(),
+                                source,
+                            }));
+                        }
+                    }
+                    return true;
+                }
+                let _ = ack.send(Err(AcpError::NoMethod {
+                    feature: "context compaction",
+                }));
                 true
             }
             DriverCommand::ContextUsage { ack } => {
@@ -1580,8 +1990,7 @@ impl Driver {
                 true
             }
             DriverCommand::SetPermissionMode { mode, ack } => {
-                let result =
-                    apply_permission_mode(&self.client, &self.session_id, mode, &self.config).await;
+                let result = apply_permission_mode(&self.session, mode, &self.config).await;
                 let _ = ack.send(result);
                 true
             }
@@ -1598,66 +2007,150 @@ impl Driver {
         }
     }
 
-    /// One agent event.
-    async fn on_agent(&mut self, event: AgentEvent) -> bool {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "agent event dispatch handles permissions, vendor notifications, turn/compact outcomes, and close"
+    )]
+    async fn on_agent(&mut self, event: AgentEvent, session_events: &mut SessionEvents) -> bool {
         match event {
-            AgentEvent::Update(notification) => self.on_update(notification).await,
-            AgentEvent::Permission { params, respond } => self.on_permission(params, respond).await,
+            AgentEvent::Permission { request, respond } => {
+                if !self.drain_session_events(session_events).await {
+                    return false;
+                }
+                self.on_permission(*request, respond).await
+            }
             AgentEvent::Vendor(notification) => {
+                if notification.method == claude_acp::NOTIFY_RATE_LIMIT
+                    && let Some(params) = notification.params.as_ref()
+                {
+                    for event in self.normalizer.on_plan_usage(params) {
+                        if !emit(&self.outputs, SessionOutput::Event { event }).await {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
                 tracing::debug!(
                     method = %notification.method,
                     "an unmodeled agent notification arrived"
                 );
                 true
             }
-            AgentEvent::PromptFinished { turn_id, result } => {
+            AgentEvent::PromptFinished { turn_id, outcome } => {
+                if !self.drain_session_events(session_events).await {
+                    return false;
+                }
                 if self.active_turn.as_deref() == Some(turn_id.as_str()) {
                     self.active_turn = None;
                 }
-                let event = match result {
-                    Ok(prompt) => self
-                        .normalizer
-                        .on_prompt_result(prompt.stop_reason, &turn_id),
-                    Err(error) => HarnessEvent::TurnFailed {
-                        turn_id,
-                        error: super::describe(&error),
-                    },
-                };
+                let (event, cancelled) = self.normalizer.on_turn_outcome(outcome, &turn_id);
+                if cancelled {
+                    self.queued_messages.clear();
+                }
                 if !emit(&self.outputs, SessionOutput::Event { event }).await {
                     return false;
                 }
-                // A turn is the only thing that moves the plan's meters.
                 self.request_usage();
-                // And the only thing that moves the window. Reported
-                // unasked, so a session whose machine is suspended later
-                // still says where its context went rather than offering
-                // to wake a machine to find out.
                 if !self.report_context_usage().await {
                     return false;
                 }
-                // What arrived mid-turn now opens the next one.
-                if let Some(text) = self.queued_messages.pop_front()
+                if !cancelled
+                    && let Some(text) = self.queued_messages.pop_front()
                     && let Err(error) = self.start_turn(text).await
                 {
                     tracing::warn!(%error, "a queued message could not open its turn");
                 }
                 true
             }
+            AgentEvent::CompactFinished { outcome, ack } => {
+                if !self.drain_session_events(session_events).await {
+                    let _ = ack.send(Err(AcpError::Stopped));
+                    return false;
+                }
+                let (event, reply) = match outcome {
+                    TurnOutcome::Finished {
+                        stop_reason:
+                            None | Some(Open::Known(aither_acp::domain::StopReason::EndTurn)),
+                        ..
+                    } => (HarnessEvent::ContextCompacted, Ok(())),
+                    TurnOutcome::Cancelled
+                    | TurnOutcome::Finished {
+                        stop_reason: Some(Open::Known(aither_acp::domain::StopReason::Cancelled)),
+                        ..
+                    } => (
+                        HarnessEvent::ContextCompactionFailed {
+                            error: "context compaction was cancelled".to_owned(),
+                        },
+                        Ok(()),
+                    ),
+                    TurnOutcome::Finished {
+                        stop_reason, error, ..
+                    } => {
+                        let message = error.map_or_else(
+                            || format!("compaction stopped with `{stop_reason:?}`"),
+                            |rpc| rpc.to_string(),
+                        );
+                        (
+                            HarnessEvent::ContextCompactionFailed {
+                                error: message.clone(),
+                            },
+                            Err(AcpError::Agent {
+                                context: "rejected `/compact`".to_owned(),
+                                source: ClientError::Protocol(message),
+                            }),
+                        )
+                    }
+                    TurnOutcome::Rejected(rpc) => (
+                        HarnessEvent::ContextCompactionFailed {
+                            error: rpc.to_string(),
+                        },
+                        Err(AcpError::Agent {
+                            context: "rejected `/compact`".to_owned(),
+                            source: ClientError::Rejected(rpc),
+                        }),
+                    ),
+                };
+                let _ = ack.send(reply);
+                emit(&self.outputs, SessionOutput::Event { event }).await
+            }
             AgentEvent::CallFinished { id, result } => self.on_call_finished(id, result).await,
             AgentEvent::Closed => {
-                tracing::info!("the ACP agent's connection closed");
+                let _ = self.drain_session_events(session_events).await;
+                if self.stopped {
+                    tracing::info!("the ACP agent's connection closed");
+                } else {
+                    let message = format!(
+                        "the {} ACP agent connection closed unexpectedly",
+                        self.config.agent
+                    );
+                    tracing::error!("{message}");
+                    if let Some(turn_id) = self.active_turn.take() {
+                        let _ = emit(
+                            &self.outputs,
+                            SessionOutput::Event {
+                                event: HarnessEvent::TurnFailed {
+                                    turn_id,
+                                    error: message.clone(),
+                                },
+                            },
+                        )
+                        .await;
+                    }
+                    self.queued_messages.clear();
+                    let _ = emit(&self.outputs, SessionOutput::Fatal { error: message }).await;
+                }
                 false
             }
         }
     }
 
-    /// A `session/update` notification, normalized and emitted.
-    async fn on_update(&mut self, notification: SessionNotification) -> bool {
+    async fn on_session_event(&mut self, event: &SessionEvent) -> bool {
         let turn_id = self
             .active_turn
             .clone()
             .unwrap_or_else(|| "turn-0".to_owned());
-        let normalized = self.normalizer.on_update(&notification.update, &turn_id);
+        let state = self.session.state();
+        let normalized = self.normalizer.on_event(event, &state, &turn_id);
         if let Some(commands) = normalized.commands
             && !emit(&self.outputs, SessionOutput::Commands { commands }).await
         {
@@ -1683,24 +2176,18 @@ impl Driver {
         true
     }
 
-    /// A `session/request_permission` request, held until the user answers.
     async fn on_permission(
         &mut self,
-        params: RequestPermissionParams,
-        respond: oneshot::Sender<RequestPermissionResult>,
+        request: PermissionRequest,
+        respond: oneshot::Sender<PermissionOutcome>,
     ) -> bool {
         let id = ApprovalId::generate();
-        let input = params
-            .tool_call
-            .raw_input
-            .clone()
-            .unwrap_or_else(|| normalize::tool_call_input(&params.tool_call));
-        let tool = normalize::tool_name(&params.tool_call.title, params.tool_call.kind);
+        let (tool, input) = permission_tool_and_input(&request);
         self.pending_permissions.insert(
             id,
             PendingPermission {
                 respond,
-                options: params.options,
+                options: request.options,
             },
         );
         emit(
@@ -1715,8 +2202,7 @@ impl Driver {
         .await
     }
 
-    /// A spawned extension call's answer.
-    async fn on_call_finished(&mut self, id: u64, result: Result<Value, ClientError>) -> bool {
+    async fn on_call_finished(&mut self, id: u64, result: Result<Value, AcpError>) -> bool {
         let Some(call) = self.pending_calls.remove(&id) else {
             return true;
         };
@@ -1728,10 +2214,7 @@ impl Driver {
                         error: super::describe(error),
                     },
                 };
-                let _ = ack.send(result.map(|_| ()).map_err(|source| AcpError::Agent {
-                    context: "rejected the compaction call".to_owned(),
-                    source,
-                }));
+                let _ = ack.send(result.map(|_| ()));
                 emit(&self.outputs, SessionOutput::Event { event }).await
             }
             PendingCall::Usage => match result {
@@ -1744,9 +2227,6 @@ impl Driver {
                     true
                 }
                 Err(error) => {
-                    // An agent that cannot state the plan's meters
-                    // still holds a conversation; the rings stay
-                    // unread rather than the session ending.
                     tracing::warn!(%error, "the agent refused to state the plan's limits");
                     true
                 }
@@ -1754,12 +2234,6 @@ impl Driver {
         }
     }
 
-    /// Opens a turn: mint its id, announce it, spawn the prompt.
-    ///
-    /// The prompt is a long-running request — it resolves when the turn
-    /// ends — so it is spawned and its answer routed back through the
-    /// event channel rather than awaited, keeping the loop free to read
-    /// the turn's updates.
     async fn start_turn(&mut self, text: String) -> Result<(), AcpError> {
         if self.active_turn.is_some() {
             return Err(AcpError::TurnInFlight);
@@ -1779,62 +2253,68 @@ impl Driver {
         {
             return Err(AcpError::Stopped);
         }
-        let client = self.client.clone();
-        let session_id = self.session_id.clone();
+        let mut turn = self
+            .session
+            .prompt(text)
+            .map_err(|source| AcpError::Agent {
+                context: "rejected `session/prompt`".to_owned(),
+                source,
+            })?;
         let events = self.events.clone();
         let id = turn_id;
         tokio::spawn(async move {
-            let result = client
-                .prompt(aither_acp::PromptParams::new(
-                    session_id,
-                    vec![ContentBlock::Text(TextContent {
-                        text,
-                        annotations: None,
-                        meta: None,
-                    })],
-                ))
-                .await;
+            let outcome = turn.finish().await;
             let _ = events.send(AgentEvent::PromptFinished {
                 turn_id: id,
-                result,
+                outcome,
             });
         });
         Ok(())
     }
 
-    /// States what the context window holds, as this driver knows it.
-    ///
-    /// An ACP agent reports the window's fill and nothing about what is in
-    /// it, so this is the fill — the categories a Claude Code session
-    /// breaks its window into have no counterpart here, and an invented
-    /// one would be worse than none.
     async fn report_context_usage(&self) -> bool {
+        let usage = if let Some(call) = &self.context_usage_method {
+            match tokio::time::timeout(
+                CONTEXT_USAGE_TIMEOUT,
+                call_ext(&self.client, call, &self.session_id),
+            )
+            .await
+            {
+                Ok(Ok(value)) => {
+                    normalize::parse_claude_context_usage(&value, self.model.as_deref())
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "context usage extension call failed; using window");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!("context usage extension call timed out; using window");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+        .unwrap_or_else(|| ContextUsage {
+            model: self.model.clone(),
+            window: self.normalizer.window(),
+            auto_compact: None,
+            categories: Vec::new(),
+            mcp_tools: Vec::new(),
+            memory_files: Vec::new(),
+            agents: Vec::new(),
+            skills: Vec::new(),
+        });
+
         emit(
             &self.outputs,
             SessionOutput::Event {
-                event: HarnessEvent::ContextUsage {
-                    usage: ContextUsage {
-                        model: self.model.clone(),
-                        window: self.normalizer.window(),
-                        auto_compact: None,
-                        categories: Vec::new(),
-                        mcp_tools: Vec::new(),
-                        memory_files: Vec::new(),
-                        agents: Vec::new(),
-                        skills: Vec::new(),
-                    },
-                },
+                event: HarnessEvent::ContextUsage { usage },
             },
         )
         .await
     }
 
-    /// Asks the configured usage method for the plan's windows.
-    ///
-    /// Fire-and-forget on the same terms as the prompt: the answer lands
-    /// on the event channel and the loop keeps moving. With no method
-    /// configured there is nothing to ask — the rings stay empty, which is
-    /// the honest report for an agent that meters nothing flyco can read.
     fn request_usage(&mut self) {
         let Some(call) = self.config.methods.usage.clone() else {
             return;
@@ -1842,31 +2322,28 @@ impl Driver {
         self.spawn_call(call, PendingCall::Usage);
     }
 
-    /// Spawns an extension-method call whose answer comes back as
-    /// [`AgentEvent::CallFinished`].
     fn spawn_call(&mut self, call: AcpMethodCall, pending: PendingCall) {
         self.call_seq += 1;
         let id = self.call_seq;
         self.pending_calls.insert(id, pending);
         let client = self.client.clone();
         let events = self.events.clone();
-        let params = render_params(&call, &self.session_id);
-        let method = call.call;
+        let session_id = self.session_id.clone();
         tokio::spawn(async move {
-            let result = client.request::<Value, Value>(&method, &params).await;
+            let result = call_ext(&client, &call, &session_id).await;
             let _ = events.send(AgentEvent::CallFinished { id, result });
         });
     }
 
-    /// The model-choice writes a `set_model` command means.
     async fn apply_model_choice(&mut self, model: ModelChoice) -> Result<(), AcpError> {
         let id = model_id_to_send(&self.config, &model.model, model.effort.as_deref());
-        self.client
-            .set_config_option(SessionSetConfigOptionParams::new(
-                &self.session_id,
-                &self.config.model_option,
-                id.as_str(),
-            ))
+        self.session
+            .set_config(
+                self.config.model_option.as_str(),
+                ConfigValue::Id(ConfigValueById {
+                    value: id.as_str().into(),
+                }),
+            )
             .await
             .map_err(|source| AcpError::Agent {
                 context: format!(
@@ -1881,12 +2358,13 @@ impl Driver {
             let Some(option) = &self.config.effort_option else {
                 return Err(AcpError::EffortUnsupported);
             };
-            self.client
-                .set_config_option(SessionSetConfigOptionParams::new(
-                    &self.session_id,
-                    option,
-                    effort.as_str(),
-                ))
+            self.session
+                .set_config(
+                    option.as_str(),
+                    ConfigValue::Id(ConfigValueById {
+                        value: effort.as_str().into(),
+                    }),
+                )
                 .await
                 .map_err(|source| AcpError::Agent {
                     context: format!("rejected `session/set_config_option {option}`"),
@@ -1897,14 +2375,6 @@ impl Driver {
         Ok(())
     }
 
-    /// Answers a pending permission request with the user's decision.
-    ///
-    /// Flyco's Allow/Deny becomes the agent's own option ids: Allow picks
-    /// `allow_once` before `allow_always` — a user pressing Allow approved
-    /// this call — and Deny picks `reject_once` before `reject_always`.
-    /// The denial's reason text has no channel in ACP, so it is logged
-    /// rather than sent. An agent that offered no matching option gets
-    /// `cancelled`, the one outcome that needs no id.
     fn decide(&mut self, approval: &ToolApproval) -> Result<(), AcpError> {
         let id = approval.id();
         let Some(pending) = self.pending_permissions.remove(&id) else {
@@ -1917,32 +2387,25 @@ impl Driver {
                 pick(&pending.options, false)
             }
         };
-        let outcome = outcome.unwrap_or(RequestPermissionOutcome::Cancelled);
-        let _ = pending.respond.send(RequestPermissionResult {
-            outcome,
+        let outcome = outcome.unwrap_or(PermissionOutcome::Cancelled(CancelledOutcome {
             meta: None,
-        });
+        }));
+        let _ = pending.respond.send(outcome);
         Ok(())
     }
 
-    /// Closes the session and the connection, then waits the task out.
     async fn stop(&mut self) -> Result<(), AcpError> {
         if self.stopped {
             return Ok(());
         }
         self.stopped = true;
         self.queued_messages.clear();
-        // `session/close` where the agent advertised it — a courtesy, so a
-        // refusal is logged rather than fatal.
         if self.close_supported
-            && let Err(error) = self
-                .client
-                .close_session(aither_acp::SessionCloseParams::new(&self.session_id))
-                .await
+            && let Err(error) = self.session.close().await
         {
             tracing::debug!(%error, "the agent refused `session/close`");
         }
-        self.client.clone().close();
+        self.client.close().await;
         if tokio::time::timeout(SHUTDOWN_GRACE, &mut self.connection_task)
             .await
             .is_err()
@@ -1953,15 +2416,71 @@ impl Driver {
                     "did not stop within {}s and was killed",
                     SHUTDOWN_GRACE.as_secs()
                 ),
-                source: ClientError::Closed { status: None },
+                source: ClientError::PeerClosed { status: None },
             });
         }
         Ok(())
     }
 }
 
-/// Selects the option id an Allow or a Deny resolves to.
-fn pick(options: &[PermissionOption], allow: bool) -> Option<RequestPermissionOutcome> {
+/// Extracts a human-readable tool name and structured input payload from an
+/// ACP [`PermissionRequest`].
+fn permission_tool_and_input(request: &PermissionRequest) -> (String, Value) {
+    match &request.subject {
+        Some(Open::Known(PermissionSubject::ToolCall(subject))) => {
+            let call = &subject.tool_call;
+            let title = call
+                .title
+                .as_option()
+                .map(String::as_str)
+                .filter(|t| !t.is_empty())
+                .unwrap_or(request.title.as_str());
+            let name = call.name.as_option().map(String::as_str);
+            let tool = normalize::tool_name(name, title, call.kind.as_option());
+            let input = call.raw_input.as_option().cloned().unwrap_or_else(|| {
+                json!({
+                    "title": title,
+                    "description": request.description,
+                })
+            });
+            (tool, input)
+        }
+        Some(Open::Known(PermissionSubject::Command(cmd))) => {
+            let tool = if request.title.is_empty() {
+                "execute".to_owned()
+            } else {
+                request.title.clone()
+            };
+            let input = json!({
+                "command": cmd.command,
+                "cwd": cmd.cwd,
+            });
+            (tool, input)
+        }
+        Some(Open::Custom(_, raw) | Open::Unknown(_, raw)) => {
+            let tool = if request.title.is_empty() {
+                "tool".to_owned()
+            } else {
+                request.title.clone()
+            };
+            (tool, raw.clone())
+        }
+        None => {
+            let tool = if request.title.is_empty() {
+                "tool".to_owned()
+            } else {
+                request.title.clone()
+            };
+            let input = json!({
+                "title": request.title,
+                "description": request.description,
+            });
+            (tool, input)
+        }
+    }
+}
+
+fn pick(options: &[PermissionOption], allow: bool) -> Option<PermissionOutcome> {
     let preferred = if allow {
         [
             PermissionOptionKind::AllowOnce,
@@ -1978,93 +2497,21 @@ fn pick(options: &[PermissionOption], allow: bool) -> Option<RequestPermissionOu
         .find_map(|kind| {
             options
                 .iter()
-                .find(|option| option.kind == *kind)
+                .find(|option| option.kind.as_known() == Some(kind))
                 .map(|option| option.option_id.clone())
         })
-        .map(|option_id| RequestPermissionOutcome::Selected { option_id })
-}
-
-/// Either half of the driver loop's select.
-enum AgentOrCommand {
-    /// A handle command.
-    Command(DriverCommand),
-    /// An agent event — boxed: it dwarfs a command and is the rarer half.
-    Agent(Box<AgentEvent>),
-}
-
-/// The [`ClientHandler`] the agent's traffic is dispatched to.
-///
-/// Thin by construction: everything it receives is forwarded to the driver
-/// task as an [`AgentEvent`], because the session's state — pending
-/// approvals, the active turn, the replay flag's meaning — lives there and
-/// nowhere else. The one exception is `replaying`, an atomic the handler
-/// itself reads so a `session/load` replay is suppressed before it ever
-/// reaches the transcript.
-#[derive(Clone)]
-struct AgentHandler {
-    /// Where agent traffic is forwarded.
-    events: mpsc::UnboundedSender<AgentEvent>,
-    /// Set while `session/load` replays history: transcript-content updates
-    /// are the past re-sent, and forwarding them would duplicate it.
-    replaying: Arc<AtomicBool>,
-}
-
-impl ClientHandler for AgentHandler {
-    /// No file-system, terminal, or elicitation surface is advertised:
-    /// the agents flyco drives carry their own tools, and an advertised
-    /// capability would only reroute them through flycod.
-    fn capabilities(&self) -> ClientCapabilities {
-        ClientCapabilities::default()
-    }
-
-    async fn session_update(&self, notification: SessionNotification) {
-        use aither_acp::SessionUpdate as Update;
-        // Replay suppression: while `session/load` re-sends history, the
-        // updates that would duplicate the transcript are dropped here.
-        // Reports about the present — modes, options, commands, usage —
-        // still pass, because a load's answer about them is current.
-        if self.replaying.load(Ordering::SeqCst)
-            && matches!(
-                notification.update,
-                Update::AgentMessageChunk(_)
-                    | Update::AgentThoughtChunk(_)
-                    | Update::UserMessageChunk(_)
-                    | Update::Plan(_)
-                    | Update::ToolCall(_)
-                    | Update::ToolCallUpdate(_)
-            )
-        {
-            return;
-        }
-        let _ = self.events.send(AgentEvent::Update(notification));
-    }
-
-    async fn request_permission(
-        &self,
-        params: RequestPermissionParams,
-    ) -> Result<RequestPermissionResult, JsonRpcError> {
-        let (respond, answer) = oneshot::channel();
-        if self
-            .events
-            .send(AgentEvent::Permission { params, respond })
-            .is_err()
-        {
-            return Ok(RequestPermissionResult {
-                outcome: RequestPermissionOutcome::Cancelled,
+        .map(|option_id| {
+            PermissionOutcome::Selected(SelectedOutcome {
+                option_id,
                 meta: None,
-            });
-        }
-        // The agent is blocked until this resolves; a dropped sender is a
-        // session that ended, which the agent reads as a cancellation.
-        Ok(answer.await.unwrap_or(RequestPermissionResult {
-            outcome: RequestPermissionOutcome::Cancelled,
-            meta: None,
-        }))
-    }
+            })
+        })
+}
 
-    async fn notification(&self, notification: JsonRpcNotification) {
-        let _ = self.events.send(AgentEvent::Vendor(notification));
-    }
+enum LoopInput {
+    Command(DriverCommand),
+    Agent(Box<AgentEvent>),
+    SessionEvent(Box<SessionEvent>),
 }
 
 async fn emit(outputs: &mpsc::Sender<SessionOutput>, output: SessionOutput) -> bool {
@@ -2073,4 +2520,187 @@ async fn emit(outputs: &mpsc::Sender<SessionOutput>, output: SessionOutput) -> b
         return false;
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use aither_acp::Client;
+    use aither_acp::domain::{Implementation, SessionSetupParams};
+    use aither_acp::rpc::Notification;
+    use aither_acp::server::{
+        PendingPrompt, PromptError, Server, ServerError, Session, SessionContext, SessionHost,
+    };
+    use serde_json::json;
+
+    use super::{Evidence, MAX_MOUNT_PAGES, mount_evidence, mounted_servers};
+    use crate::config::AcpMethodCall;
+
+    #[test]
+    fn mount_evidence_rejects_failure_and_starting_notifications() {
+        let starting_server = Notification {
+            method: "_vendor/mcp".to_owned(),
+            params: Some(json!({
+                "servers": [{"name": "flyco", "status": "starting"}]
+            })),
+        };
+        assert_eq!(mount_evidence(&starting_server), None);
+
+        let failed_server = Notification {
+            method: "_vendor/serversChanged".to_owned(),
+            params: Some(json!({
+                "servers": [{"name": "flyco", "status": "failed", "error": "connection refused"}]
+            })),
+        };
+        assert_eq!(
+            mount_evidence(&failed_server),
+            Some(Evidence::Failed("connection refused".to_owned()))
+        );
+
+        let connected_server = Notification {
+            method: "_vendor/serversChanged".to_owned(),
+            params: Some(json!({
+                "mcpServers": [{"name": "flyco", "status": "connected"}]
+            })),
+        };
+        assert_eq!(mount_evidence(&connected_server), Some(Evidence::Connected));
+
+        let starting_log = Notification {
+            method: "_cognition.ai/output".to_owned(),
+            params: Some(json!({
+                "channel": "MCP: flyco",
+                "message": "starting flyco MCP server..."
+            })),
+        };
+        assert_eq!(mount_evidence(&starting_log), None);
+
+        let connecting_log = Notification {
+            method: "_cognition.ai/output".to_owned(),
+            params: Some(json!({
+                "channel": "MCP: flyco",
+                "message": "connecting to flyco"
+            })),
+        };
+        assert_eq!(mount_evidence(&connecting_log), None);
+
+        let disconnected_log = Notification {
+            method: "_cognition.ai/output".to_owned(),
+            params: Some(json!({
+                "channel": "MCP: flyco",
+                "message": "server disconnected unexpectedly"
+            })),
+        };
+        assert!(matches!(
+            mount_evidence(&disconnected_log),
+            Some(Evidence::Failed(_))
+        ));
+
+        let ready_log = Notification {
+            method: "_cognition.ai/output".to_owned(),
+            params: Some(json!({
+                "channel": "MCP: flyco",
+                "message": "MCP server connected and ready"
+            })),
+        };
+        assert_eq!(mount_evidence(&ready_log), Some(Evidence::Connected));
+    }
+
+    struct DummySession;
+    impl Session for DummySession {
+        fn prompt(
+            &self,
+            _pending: PendingPrompt,
+            _cx: &SessionContext,
+        ) -> impl std::future::Future<Output = Result<aither_acp::domain::StopReason, PromptError>>
+        {
+            std::future::ready(Ok(aither_acp::domain::StopReason::EndTurn))
+        }
+    }
+
+    struct DummyHost;
+    impl SessionHost for DummyHost {
+        type Session = DummySession;
+        fn new_session(
+            &self,
+            _params: SessionSetupParams,
+            _cx: &SessionContext,
+        ) -> impl std::future::Future<Output = Result<DummySession, ServerError>> {
+            std::future::ready(Ok(DummySession))
+        }
+    }
+
+    #[tokio::test]
+    async fn mounted_servers_stops_on_repeating_cursor() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = calls.clone();
+        let server = Server::builder(DummyHost, Implementation::new("dummy", "0.1.0"))
+            .ext(move |_method, _params| {
+                let calls = calls_ref.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({
+                        "data": [{"name": "flyco", "runtimeStatus": "connected", "tools": ["machine_status"]}],
+                        "nextCursor": "stuck-cursor"
+                    }))
+                }
+            })
+            .build();
+        let (client, conn) = Client::builder(Implementation::new("test", "0.1.0"))
+            .in_process_server(server)
+            .await
+            .expect("connect");
+        let task = tokio::spawn(conn);
+
+        let method = AcpMethodCall {
+            call: "_test/mcp_status".to_owned(),
+            params: json!({}),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let servers = mounted_servers(&client, "s1", &method, deadline)
+            .await
+            .expect("bounded walk succeeds");
+        assert_eq!(servers.len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        client.close().await;
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn mounted_servers_enforces_page_cap() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = calls.clone();
+        let server = Server::builder(DummyHost, Implementation::new("dummy", "0.1.0"))
+            .ext(move |_method, _params| {
+                let calls = calls_ref.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    Ok(json!({
+                        "data": [{"name": format!("srv-{n}"), "runtimeStatus": "connected", "tools": []}],
+                        "nextCursor": format!("cursor-{n}")
+                    }))
+                }
+            })
+            .build();
+        let (client, conn) = Client::builder(Implementation::new("test", "0.1.0"))
+            .in_process_server(server)
+            .await
+            .expect("connect");
+        let task = tokio::spawn(conn);
+
+        let method = AcpMethodCall {
+            call: "_test/mcp_status".to_owned(),
+            params: json!({}),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let servers = mounted_servers(&client, "s1", &method, deadline)
+            .await
+            .expect("capped walk succeeds");
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_MOUNT_PAGES);
+        assert_eq!(servers.len(), MAX_MOUNT_PAGES);
+        client.close().await;
+        let _ = task.await;
+    }
 }

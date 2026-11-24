@@ -1936,9 +1936,8 @@ impl<
 
     /// Puts the harness's own TUI on the terminal.
     ///
-    /// A launch that cannot be built — the claude binary missing from the
-    /// sidecar tree — is a line in the terminal, where a failed `claude`
-    /// would have printed.
+    /// A launch that cannot be built — a missing `claude` binary — is a
+    /// line in the terminal, where a failed `claude` would have printed.
     async fn launch_harness_tui(&mut self, resume: bool) -> Result<(), WireError> {
         match self.tui.command(resume).await {
             Ok(command) => self.terminal.launch_harness(command)?,

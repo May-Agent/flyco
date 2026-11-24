@@ -10,7 +10,7 @@
 //!   approval, a transcript batch, the transcript a resuming session
 //!   reads back.
 //!
-//! [`store::RemoteTranscriptStore`] sits on top of [`rest`] and is what
+//! [`store::R2TranscriptSync`] sits on top of [`rest`] and is what
 //! makes History work: the transcript is in the control plane rather than on
 //! a disk a spot eviction can take away.
 
@@ -25,5 +25,5 @@ pub use rest::{
     AgentApi, ApprovalRaiser, CommandStream, ControlApi, ControlApiError, HttpControlApi,
     RelayTransport, TranscriptRead,
 };
-pub use store::RemoteTranscriptStore;
+pub use store::R2TranscriptSync;
 pub use wire::{SessionRelay, WireError};

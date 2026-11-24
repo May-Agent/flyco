@@ -9,9 +9,9 @@
 # The flyco session this daemon serves.
 session = "9d0f4b1a-3b7e-4a3e-9e1a-4c2f8b6d7a10"
 
-# Which driver supervises the agent: "claude_code" for the Agent SDK
-# sidecar, "acp" for the generic driver every other harness — Codex,
-# Devin, anything that speaks the Agent Client Protocol — takes.
+# Which driver supervises the agent: "claude_code" for in-process `claude-acp`
+# driving the native `claude` CLI, or "acp" for the generic ACP driver (Codex
+# in-process via `codex-acp`, Devin, or any external ACP agent).
 harness = "claude_code"
 
 # Where the agent works.
@@ -132,13 +132,17 @@ memory_mib = 16384
 # reaches flyco's approval UI, because auto-approved tools never call back.
 permission_mode = "default"
 
+# Path to the native `claude` CLI binary. Omitted resolves `claude` on PATH.
+# claude_path = "/usr/local/bin/claude"
+
 # Claude Code's managed-policy directory, "/etc/claude-code" on a
 # provisioned machine. flycod writes managed-settings.json and
 # managed-mcp.json there: root-owned files that outrank every other settings
 # source and hold the MCP allowlist, so the agent cannot add a server or
 # remove flyco's. Omitted here because a developer's flycod is not root and
 # the host's own managed policy is not flyco's to overwrite — the session's
-# servers are still mounted through the Agent SDK, but nothing is enforced.
+# servers are still mounted through `--mcp-config` and `--strict-mcp-config`,
+# without replacing host managed policy.
 # managed_dir = "/etc/claude-code"
 
 [claude.auth]
@@ -148,54 +152,49 @@ permission_mode = "default"
 # "api_key"      — key   = "…", isolation = { config_dir, project_dir_name }
 mode = "inherit"
 
-[sidecar]
-# Where the embedded Bun sidecar is written and `bun install` is run.
-dir = "/tmp/flycod-dev/sidecar"
-
-# The bun executable; a bare name is resolved through PATH.
-bun = "bun"
-
-# An ACP session spells its agent out here instead of [claude]/[sidecar].
+# An ACP session spells its agent out here instead of [claude].
 # `harness = "acp"` plus this table drives any ACP-compatible agent — the
-# provisioner renders Codex and Devin into this same shape, so nothing in
-# the driver knows a vendor name. `modes` says how each flyco permission
-# mode reaches the agent: a `set_mode` id and/or ordered config-option
-# writes, and a mode with no entry is refused rather than approximated.
+# provisioner renders Codex (with `in_process = "codex"`) and Devin into this
+# same shape. `modes` says how each flyco permission mode reaches the agent:
+# a `set_mode` id and/or ordered config-option writes, and a mode with no entry
+# is refused rather than approximated.
 #
 # [acp]
-# agent = "devin"
-# program = "devin"
-# args = ["acp"]
-# env = { XDG_DATA_HOME = "/var/lib/flyco/devin/data" }
-# model = "swe-2"
-# effort = "max"
-# fused_effort_tails = ["-1m", "-fast", "-priority"]
+# agent = "codex"
+# in_process = "codex"
+# program = "/usr/local/bin/codex"
+# env = { CODEX_HOME = "/var/lib/flyco/codex" }
+# model = "gpt-5.4"
+# effort = "high"
 # permission_mode = "default"
 #
 # [acp.methods.compact]
-# call = "thread/compact/start"
-# params = { threadId = "<session>" }
+# call = "_codex/compact"
+# params = { sessionId = "<session>" }
 #
 # [acp.methods.usage]
-# call = "account/rateLimits/read"
+# call = "_codex/rate_limits"
+# params = {}
 #
 # [acp.methods.mcp_status]
-# call = "mcpServerStatus/list"
-# params = { threadId = "<session>", detail = "toolsAndAuthOnly" }
+# call = "_codex/mcp_status"
+# params = { sessionId = "<session>" }
 #
 # [[acp.files]]
-# path = "/var/lib/flyco/devin/data/devin/credentials.toml"
+# path = "/var/lib/flyco/codex/auth.json"
 # contents = "…"
 #
 # [acp.modes.default]
-# set_mode = "smart"
+# set_mode = "read-only"
+# options = [{ option = "collaboration_mode", value = "default" }]
 #
 # [acp.modes.plan]
+# set_mode = "read-only"
 # options = [{ option = "collaboration_mode", value = "plan" }]
 #
 # [acp.tui]
-# program = "devin"
-# resume_args = ["--resume"]
+# program = "codex"
+# resume_args = ["resume", "{session}"]
 
 # The user's registered MCP servers, written by the provisioner from
 # `GET /v1/mcp-servers`. This is the whole set the session gets beside

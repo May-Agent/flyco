@@ -8,14 +8,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use flyco_core::{
-    BranchName, DAEMON_TOKEN_PREFIX, DriverKind, MachineOrigin, McpServerMount, RepoSlug,
-    SessionId, SessionMachine,
+    BranchName, DAEMON_TOKEN_PREFIX, DriverKind, MachineOrigin, McpServerMount, PermissionMode,
+    RepoSlug, SessionId, SessionMachine,
 };
 use serde::Deserialize;
 use url::Url;
-
-use crate::harness::claude::protocol::{PermissionMode, SidecarAuth};
-use crate::harness::claude::sidecar::SidecarConfig;
 
 /// The configuration file could not be used.
 #[derive(Debug, thiserror::Error)]
@@ -85,7 +82,7 @@ pub enum ClaudeAuth {
     Inherit,
     /// A Claude subscription OAuth token in an isolated config tree.
     OauthToken {
-        /// The access token the sidecar writes as `.credentials.json` —
+        /// The access token `flycod` writes as `.credentials.json` —
         /// a credentials-store entry, not `CLAUDE_CODE_OAUTH_TOKEN`,
         /// because env injection resolves as env-quad auth and is
         /// ineligible for plan rate limits.
@@ -103,18 +100,6 @@ pub enum ClaudeAuth {
 }
 
 impl ClaudeAuth {
-    /// The credentials half, as the sidecar protocol carries it.
-    #[must_use]
-    pub fn sidecar_auth(&self) -> SidecarAuth {
-        match self {
-            Self::Inherit => SidecarAuth::Inherit,
-            Self::OauthToken { token, .. } => SidecarAuth::OauthToken {
-                token: token.clone(),
-            },
-            Self::ApiKey { key, .. } => SidecarAuth::ApiKey { key: key.clone() },
-        }
-    }
-
     /// The isolated config tree, when this mode has one.
     #[must_use]
     pub const fn isolation(&self) -> Option<&Isolation> {
@@ -132,8 +117,7 @@ pub struct ClaudeConfig {
     /// Model override; omitted leaves the CLI's own default in place.
     #[serde(default)]
     pub model: Option<String>,
-    /// Reasoning effort for that model, as the SDK's `EffortLevel` spells
-    /// it (`low`, `medium`, `high`, `xhigh`, `max`).
+    /// Reasoning effort for that model (`low`, `medium`, `high`, `xhigh`, `max`).
     ///
     /// Separate from [`Self::model`] because the harness takes them
     /// separately, and omitted where the session chose none so the CLI's
@@ -141,9 +125,13 @@ pub struct ClaudeConfig {
     /// names the model, and most name no effort.
     #[serde(default)]
     pub effort: Option<String>,
-    /// Permission mode, spelled the way the Agent SDK spells it
-    /// (`default`, `acceptEdits`, `bypassPermissions`, `plan`).
+    /// Permission mode (`default`, `acceptEdits`, `bypassPermissions`, `plan`,
+    /// `auto`, `dontAsk`).
     pub permission_mode: PermissionMode,
+    /// Explicit path to the native `claude` binary; omitted resolves `claude`
+    /// through `PATH`.
+    #[serde(default)]
+    pub claude_path: Option<PathBuf>,
     /// Claude Code's managed-policy directory — `/etc/claude-code` on a
     /// provisioned machine.
     ///
@@ -152,12 +140,21 @@ pub struct ClaudeConfig {
     /// allowlist a fact about the filesystem. Absent on a developer
     /// machine, where flycod is not root and the host's own managed policy
     /// is not flyco's to overwrite; the session's servers are still mounted
-    /// there, through the Agent SDK, but nothing stops the agent adding
-    /// more.
+    /// there, through `--mcp-config` and `--strict-mcp-config`, without
+    /// touching host managed policy.
     #[serde(default)]
     pub managed_dir: Option<PathBuf>,
     /// Credentials and config isolation.
     pub auth: ClaudeAuth,
+}
+
+/// An in-process ACP host embedded inside `flycod` rather than spawned as an
+/// external ACP subprocess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InProcessAgent {
+    /// Host `codex-acp::CodexAgent` in-process, spawning `codex app-server`.
+    Codex,
 }
 
 /// A file the daemon writes before spawning an ACP agent.
@@ -248,7 +245,13 @@ pub struct AcpConfig {
     /// What to call the agent in logs and diagnostics (`"codex"`,
     /// `"devin"`, or whatever a hand-written config is driving).
     pub agent: String,
-    /// The ACP server executable. A bare name is resolved through `PATH`.
+    /// Optional in-process ACP server embedded in `flycod` instead of
+    /// spawning `program` directly as an ACP subprocess. When set to
+    /// [`InProcessAgent::Codex`], `program` names the native `codex` binary.
+    #[serde(default)]
+    pub in_process: Option<InProcessAgent>,
+    /// The ACP server executable (or the native `codex` binary when
+    /// `in_process = "codex"`). A bare name is resolved through `PATH`.
     pub program: PathBuf,
     /// Arguments the program is spawned with (`["acp"]` for `devin acp`).
     #[serde(default)]
@@ -674,8 +677,8 @@ impl Default for ComputerConfig {
 pub struct DaemonConfig {
     /// The flyco session this daemon serves.
     pub session: SessionId,
-    /// Which driver supervises the agent: `claude_code` for the Agent SDK
-    /// sidecar, `acp` for the generic driver every other harness takes.
+    /// Which driver supervises the agent: `claude_code` for in-process
+    /// `claude-acp`, `acp` for in-process `codex-acp` or an external ACP agent.
     pub harness: DriverKind,
     /// Directory the agent works in.
     pub workdir: PathBuf,
@@ -757,10 +760,6 @@ pub struct DaemonConfig {
     /// [`DriverKind::ClaudeCode`].
     #[serde(default)]
     pub claude: Option<ClaudeConfig>,
-    /// Where the Bun sidecar is materialized and how Bun is run. Required
-    /// when [`harness`](Self::harness) is [`DriverKind::ClaudeCode`].
-    #[serde(default)]
-    pub sidecar: Option<SidecarConfig>,
     /// ACP settings. Required when [`harness`](Self::harness) is
     /// [`DriverKind::Acp`].
     #[serde(default)]
@@ -825,19 +824,6 @@ impl DaemonConfig {
             .expect("a loaded Claude Code config has a [claude] table")
     }
 
-    /// Returns the sidecar settings, which a Claude session always has.
-    ///
-    /// # Panics
-    ///
-    /// Panics if [`load`](Self::load) admitted a Claude session without a
-    /// `[sidecar]` table — that combination is unrepresentable after load.
-    #[must_use]
-    pub const fn sidecar(&self) -> &SidecarConfig {
-        self.sidecar
-            .as_ref()
-            .expect("a loaded Claude Code config has a [sidecar] table")
-    }
-
     /// Returns the ACP settings, which an `acp` session always has.
     ///
     /// # Panics
@@ -895,11 +881,6 @@ impl DaemonConfig {
                         "a claude_code session requires a [claude] table",
                     ));
                 }
-                if self.sidecar.is_none() {
-                    return Err(ConfigError::WrongHarness(
-                        "a claude_code session requires a [sidecar] table",
-                    ));
-                }
             }
             DriverKind::Acp => {
                 if self.acp.is_none() {
@@ -919,8 +900,7 @@ pub const EXAMPLE: &str = include_str!("../config.example.toml");
 #[cfg(test)]
 mod tests {
     use super::{ClaudeAuth, DaemonConfig, EXAMPLE};
-    use crate::harness::claude::protocol::{PermissionMode, SidecarAuth};
-    use flyco_core::DriverKind;
+    use flyco_core::{DriverKind, PermissionMode};
 
     fn parse(text: &str) -> Result<DaemonConfig, toml::de::Error> {
         toml::from_str(text)
@@ -936,10 +916,6 @@ mod tests {
             .expect("the example drives Claude Code");
         assert!(matches!(claude.auth, ClaudeAuth::Inherit));
         assert_eq!(claude.permission_mode, PermissionMode::Default);
-        assert_eq!(
-            config.sidecar.as_ref().expect("example sidecar").bun,
-            std::path::PathBuf::from("bun")
-        );
     }
 
     #[test]
@@ -947,7 +923,7 @@ mod tests {
         let config = parse(EXAMPLE).expect("parse");
         let claude = config.claude.as_ref().expect("example");
         assert!(claude.auth.isolation().is_none());
-        assert!(matches!(claude.auth.sidecar_auth(), SidecarAuth::Inherit));
+        assert!(matches!(claude.auth, ClaudeAuth::Inherit));
     }
 
     #[test]
@@ -967,8 +943,8 @@ mod tests {
             .expect("credential modes are isolated");
         assert_eq!(isolation.project_dir_name, "flyco-session");
         assert!(matches!(
-            config.claude.as_ref().expect("example").auth.sidecar_auth(),
-            SidecarAuth::OauthToken { .. }
+            config.claude.as_ref().expect("example").auth,
+            ClaudeAuth::OauthToken { .. }
         ));
     }
 
@@ -983,7 +959,7 @@ mod tests {
 
     #[test]
     fn an_unknown_key_is_rejected_rather_than_ignored() {
-        let text = format!("{EXAMPLE}\nreconnect_delay_ms = 500\n");
+        let text = format!("reconnect_delay_ms = 500\n{EXAMPLE}");
         let error = parse(&text).expect_err("unknown keys must fail the daemon at startup");
         assert!(
             error.to_string().contains("reconnect_delay_ms"),

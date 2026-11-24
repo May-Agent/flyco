@@ -13,8 +13,8 @@
 //! # What is here
 //!
 //! - [`config`] — the daemon's TOML configuration.
-//! - [`harness`] — the harness abstraction, the Claude Code driver
-//!   (Bun sidecar / Agent SDK), and the Codex driver (`codex app-server`).
+//! - [`harness`] — the harness abstraction and unified ACP driver
+//!   (in-process `claude-acp`, in-process `codex-acp`, and subprocess ACP).
 //! - [`control`] — the control-plane connection: the relay's command
 //!   stream and frame posts, the REST client beside them, and the
 //!   transcript store that makes a session resumable onto any machine.

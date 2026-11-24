@@ -37,8 +37,11 @@ pub const WORKDIR: &str = "/srv/flyco/work";
 /// always has a control plane and keeps its transcript in R2.
 pub const TRANSCRIPT_DIR: &str = "/var/lib/flyco/transcripts";
 
-/// Where the Bun sidecar is materialized.
-pub const SIDECAR_DIR: &str = "/var/lib/flyco/sidecar";
+/// Where the session image and installer put the native `claude` CLI binary.
+pub const CLAUDE_BIN: &str = "/usr/local/bin/claude";
+
+/// Where the session image and installer put the native `codex` CLI binary.
+pub const CODEX_BIN: &str = "/usr/local/bin/codex";
 
 /// The isolated `CLAUDE_CONFIG_DIR` an injected credential runs under.
 pub const CLAUDE_CONFIG_DIR: &str = "/var/lib/flyco/claude";
@@ -280,6 +283,10 @@ enum Auth<'a> {
 
 /// The `[claude]` table.
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "matches the `[claude].claude_path` configuration key"
+)]
 struct Claude<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<&'a str>,
@@ -288,6 +295,7 @@ struct Claude<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<&'a str>,
     permission_mode: PermissionMode,
+    claude_path: &'static str,
     managed_dir: &'static str,
     auth: Auth<'a>,
 }
@@ -319,13 +327,6 @@ struct Repo<'a> {
     branch: &'a BranchName,
     /// The directory under the workdir it is cloned into.
     dir: &'a str,
-}
-
-/// The `[sidecar]` table.
-#[derive(Debug, Clone, Copy, Serialize)]
-struct Sidecar {
-    dir: &'static str,
-    bun: &'static str,
 }
 
 /// One file of `[acp.files]`: credentials and managed configuration the
@@ -401,6 +402,8 @@ struct AcpTui {
 #[derive(Debug, Clone, Serialize)]
 struct Acp<'a> {
     agent: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    in_process: Option<&'static str>,
     program: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     args: Vec<&'static str>,
@@ -469,8 +472,6 @@ struct Document<'a> {
     computer: Computer,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude: Option<Claude<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    sidecar: Option<Sidecar>,
     #[serde(skip_serializing_if = "Option::is_none")]
     acp: Option<Acp<'a>>,
     /// `[[repos]]`, at the tail with `mcp_servers` because an array of
@@ -774,50 +775,56 @@ fn devin_mcp_config_json(mounts: &[McpServerMount]) -> String {
     serde_json::to_string_pretty(&file).expect("DevinMcpFile serializes")
 }
 
-/// How flyco's permission modes reach Codex through the `codex-acp`
-/// adapter.
+/// How flyco's permission modes reach Codex through the in-process
+/// `codex-acp` host.
 ///
 /// Codex's ACP surface has two dials: the session mode — `read-only`,
-/// `agent`, `agent-full-access` — and a `collaboration_mode` config option
-/// whose `plan` value is what planning actually is on this agent. The
-/// pairings follow the ones the retired app-server driver encoded: every
-/// mutation asking reads as the read-only mode, workspace-write reads as
-/// `agent`, and full access is reserved for `bypassPermissions`.
+/// `workspace-write`, `agent`, `agent-full-access` — and a
+/// `collaboration_mode` config option (`default` or `plan`). Non-plan modes
+/// explicitly reset `collaboration_mode` to `default` so switching out of
+/// plan mode never leaves planning active.
 fn codex_modes() -> BTreeMap<PermissionMode, AcpMode> {
+    let mode_with_collab = |mode: &'static str, collab: &'static str| AcpMode {
+        set_mode: Some(mode),
+        options: vec![AcpOptionWrite {
+            option: "collaboration_mode",
+            value: collab,
+        }],
+    };
     BTreeMap::from([
-        (PermissionMode::Default, AcpMode::mode("read-only")),
-        (PermissionMode::AcceptEdits, AcpMode::mode("agent")),
         (
-            PermissionMode::Plan,
-            AcpMode {
-                set_mode: Some("read-only"),
-                options: vec![AcpOptionWrite {
-                    option: "collaboration_mode",
-                    value: "plan",
-                }],
-            },
+            PermissionMode::Default,
+            mode_with_collab("read-only", "default"),
         ),
-        (PermissionMode::Auto, AcpMode::mode("agent")),
+        (
+            PermissionMode::AcceptEdits,
+            mode_with_collab("workspace-write", "default"),
+        ),
+        (PermissionMode::Plan, mode_with_collab("read-only", "plan")),
+        (PermissionMode::Auto, mode_with_collab("agent", "default")),
         (
             PermissionMode::BypassPermissions,
-            AcpMode::mode("agent-full-access"),
+            mode_with_collab("agent-full-access", "default"),
         ),
-        (PermissionMode::DontAsk, AcpMode::mode("read-only")),
+        (
+            PermissionMode::DontAsk,
+            mode_with_collab("read-only", "default"),
+        ),
     ])
 }
 
-/// The app-server extension methods the `codex-acp` adapter forwards.
+/// The `_`-prefixed extension methods exposed by the in-process `codex-acp` host.
 fn codex_methods() -> AcpMethods {
     let call = |call: &'static str, params: serde_json::Value| Some(AcpMethodCall { call, params });
     AcpMethods {
         compact: call(
-            "thread/compact/start",
-            serde_json::json!({ "threadId": "<session>" }),
+            "_codex/compact",
+            serde_json::json!({ "sessionId": "<session>" }),
         ),
-        usage: call("account/rateLimits/read", serde_json::json!({})),
+        usage: call("_codex/rate_limits", serde_json::json!({})),
         mcp_status: call(
-            "mcpServerStatus/list",
-            serde_json::json!({ "threadId": "<session>" }),
+            "_codex/mcp_status",
+            serde_json::json!({ "sessionId": "<session>" }),
         ),
     }
 }
@@ -856,14 +863,10 @@ fn codex_acp<'a>(
     }));
     Acp {
         agent: "codex",
-        // The `@agentclientprotocol/codex-acp` adapter, which owns the
-        // `codex app-server` subprocess it spawns through `CODEX_PATH`.
-        program: "codex-acp",
+        in_process: Some("codex"),
+        program: CODEX_BIN,
         args: Vec::new(),
-        env: BTreeMap::from([
-            ("CODEX_PATH", "/usr/local/bin/codex"),
-            ("CODEX_HOME", CODEX_HOME),
-        ]),
+        env: BTreeMap::from([("CODEX_HOME", CODEX_HOME)]),
         files,
         model: Some(model),
         effort,
@@ -909,6 +912,7 @@ fn devin_acp<'a>(
     }));
     Acp {
         agent: "devin",
+        in_process: None,
         program: "devin",
         args: vec!["acp"],
         env,
@@ -976,23 +980,19 @@ pub fn render(bootstrap: &DaemonBootstrap) -> Result<String, RenderError> {
     // credential names, so a Codex model can never land in `[claude]`.
     let model = bootstrap.model.model.as_str();
     let effort = bootstrap.model.effort.as_deref();
-    let (claude, sidecar, acp) = match &bootstrap.auth {
+    let (claude, acp) = match &bootstrap.auth {
         HarnessCredential::ClaudeCode(credential) => (
             Some(Claude {
                 model: Some(model),
                 effort,
                 permission_mode: bootstrap.permission_mode,
+                claude_path: CLAUDE_BIN,
                 managed_dir: CLAUDE_MANAGED_DIR,
                 auth: claude_auth(credential),
-            }),
-            Some(Sidecar {
-                dir: SIDECAR_DIR,
-                bun: "bun",
             }),
             None,
         ),
         HarnessCredential::Codex(credential) => (
-            None,
             None,
             Some(codex_acp(
                 credential,
@@ -1003,7 +1003,6 @@ pub fn render(bootstrap: &DaemonBootstrap) -> Result<String, RenderError> {
             )),
         ),
         HarnessCredential::Devin(credential) => (
-            None,
             None,
             Some(devin_acp(
                 credential,
@@ -1041,7 +1040,6 @@ pub fn render(bootstrap: &DaemonBootstrap) -> Result<String, RenderError> {
             enabled: bootstrap.computer_use,
         },
         claude,
-        sidecar,
         acp,
         repos: bootstrap
             .repos
@@ -1190,7 +1188,11 @@ mod tests {
         assert!(rendered.contains("[acp]"));
         assert!(rendered.contains("harness = \"acp\""));
         assert!(rendered.contains(r#"agent = "codex""#));
-        assert!(rendered.contains(r#"program = "codex-acp""#));
+        assert!(rendered.contains(r#"in_process = "codex""#));
+        assert!(rendered.contains(r#"program = "/usr/local/bin/codex""#));
+        assert!(rendered.contains(r#"call = "_codex/compact""#));
+        assert!(rendered.contains(r#"call = "_codex/rate_limits""#));
+        assert!(rendered.contains(r#"call = "_codex/mcp_status""#));
         assert!(rendered.contains("permission_mode = \"default\""));
         assert!(rendered.contains(CODEX_HOME));
         assert!(!rendered.contains("[claude]"));

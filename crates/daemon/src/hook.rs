@@ -23,7 +23,6 @@ const READ_ONLY_PREFIXES: &[&str] = &[
     "/etc/claude-code",
     "/var/lib/flyco/codex",
     "/var/lib/flyco/devin-config",
-    "/var/lib/flyco/sidecar",
 ];
 
 /// Partial Claude Code `PreToolUse` hook stdin payload.
