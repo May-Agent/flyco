@@ -22,7 +22,10 @@ tracing.workspace = true
 zenwave = { workspace = true, features = ["hyper-rustls"] }
 clap.workspace = true
 dialoguer.workspace = true
+eventsource-stream.workspace = true
+futures-core.workspace = true
 open.workspace = true
+rand.workspace = true
 rustix.workspace = true
 tokio.workspace = true
 futures-util.workspace = true

@@ -102,6 +102,12 @@ pub struct Failure {
     /// carrying `Retry-After` — how long a caller may choose to sleep
     /// before asking again.
     pub retry_after: Option<core::time::Duration>,
+    /// Whether retrying the request or stream connect may succeed (`5xx`,
+    /// transport, I/O, or timeout).
+    transient: bool,
+    /// Whether the control plane refused with `request-budget-exhausted` or
+    /// `row-budget-exhausted`, which must stop immediately without retrying.
+    budget_exhausted: bool,
 }
 
 impl Failure {
@@ -111,6 +117,8 @@ impl Failure {
             code: Exit::Usage,
             text: text.into(),
             retry_after: None,
+            transient: false,
+            budget_exhausted: false,
         }
     }
 
@@ -130,6 +138,8 @@ impl Failure {
             code,
             text: text.into(),
             retry_after,
+            transient: false,
+            budget_exhausted: false,
         }
     }
 
@@ -139,7 +149,31 @@ impl Failure {
             code: Exit::Transport,
             text: text.into(),
             retry_after: None,
+            transient: true,
+            budget_exhausted: false,
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn with_transient(mut self, transient: bool) -> Self {
+        self.transient = transient;
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn with_budget_exhausted(mut self, budget_exhausted: bool) -> Self {
+        self.budget_exhausted = budget_exhausted;
+        self
+    }
+
+    #[must_use]
+    pub(crate) const fn is_transient(&self) -> bool {
+        self.transient
+    }
+
+    #[must_use]
+    pub(crate) const fn is_budget_exhausted(&self) -> bool {
+        self.budget_exhausted
     }
 }
 

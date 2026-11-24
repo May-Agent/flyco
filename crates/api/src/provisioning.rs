@@ -1081,6 +1081,16 @@ impl Operation<'_> {
 /// Returns [`ProviderError::Malformed`] for an Azure account with no
 /// resource group recorded — see [`LinkedAccount::azure_workspace`].
 fn azure_driver_for(account: &LinkedAccount) -> Result<Option<AzureProvider>, ProviderError> {
+    azure_driver_with_installer(
+        account,
+        flyco_provider::cloud_init::DEFAULT_FLYCOD_INSTALLER_URL,
+    )
+}
+
+fn azure_driver_with_installer(
+    account: &LinkedAccount,
+    installer_url: &str,
+) -> Result<Option<AzureProvider>, ProviderError> {
     let ProviderCredentials::Azure {
         tenant_id,
         client_id,
@@ -1091,13 +1101,18 @@ fn azure_driver_for(account: &LinkedAccount) -> Result<Option<AzureProvider>, Pr
         return Ok(None);
     };
 
-    Ok(Some(azure_driver(
-        tenant_id,
-        client_id,
-        client_secret,
-        subscription_id,
-        account.azure_workspace()?,
-        &account.machine_login_key,
+    Ok(Some(AzureProvider::new(
+        ServicePrincipal {
+            tenant_id: tenant_id.to_owned(),
+            client_id: client_id.to_owned(),
+            client_secret: client_secret.to_owned(),
+            subscription_id: subscription_id.to_owned(),
+        },
+        Workspace::new(
+            account.azure_workspace()?,
+            account.machine_login_key.clone(),
+        )
+        .with_installer(installer_url),
     )))
 }
 
@@ -1215,13 +1230,35 @@ pub trait Provisioner {
 #[derive(Debug, Clone)]
 pub struct CloudProvisioner {
     hosts: HostRooms,
+    flycod_installer_url: String,
 }
 
 impl CloudProvisioner {
     /// Builds the provisioner around the host rooms this Worker can reach.
     #[must_use]
-    pub const fn new(hosts: HostRooms) -> Self {
-        Self { hosts }
+    pub fn new(hosts: HostRooms) -> Self {
+        Self {
+            hosts,
+            flycod_installer_url: flyco_provider::cloud_init::DEFAULT_FLYCOD_INSTALLER_URL
+                .to_owned(),
+        }
+    }
+
+    /// Configures the `flycod.sh` installer URL from the active control-plane origin.
+    #[must_use]
+    pub fn with_flycod_installer_url(mut self, control_plane_url: &str) -> Self {
+        self.flycod_installer_url = format!(
+            "{}/install/{}",
+            control_plane_url.trim_end_matches('/'),
+            flyco_core::release::INSTALLER.name
+        );
+        self
+    }
+
+    /// Installer URL this provisioner passes into cloud-init drivers.
+    #[must_use]
+    pub fn flycod_installer_url(&self) -> &str {
+        &self.flycod_installer_url
     }
 }
 
@@ -1231,7 +1268,7 @@ impl Provisioner for CloudProvisioner {
         account: &LinkedAccount,
         request: &ProvisionRequest,
     ) -> Result<Provisioning, ProviderError> {
-        if let Some(mut azure) = azure_driver_for(account)? {
+        if let Some(mut azure) = azure_driver_with_installer(account, &self.flycod_installer_url)? {
             return azure.provision(request).await;
         }
         if let Some(mut codespaces) = codespaces_driver_for(account) {
@@ -1265,7 +1302,7 @@ impl Provisioner for CloudProvisioner {
         machine: &Machine,
         continuation: &Continuation,
     ) -> Result<Provisioning, ProviderError> {
-        if let Some(mut azure) = azure_driver_for(account)? {
+        if let Some(mut azure) = azure_driver_with_installer(account, &self.flycod_installer_url)? {
             return azure.resume(machine, continuation).await;
         }
         if let Some(mut codespaces) = codespaces_driver_for(account) {

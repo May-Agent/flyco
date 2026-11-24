@@ -126,15 +126,14 @@ pub async fn run(api: &Api, session: SessionId, follow: &mut Follow<'_>) -> Outc
 pub(crate) async fn send_resize(api: &Api, session: SessionId) -> Outcome<()> {
     let winsize = tcgetwinsize(std::io::stdout())
         .map_err(|error| Failure::transport(format!("cannot read the terminal size: {error}")))?;
-    api.post::<flyco_core::TerminalSize, serde_json::Value>(
+    api.post_json_empty(
         &format!("/v1/sessions/{session}/terminal/resize"),
         &flyco_core::TerminalSize {
             cols: winsize.ws_col,
             rows: winsize.ws_row,
         },
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// Forwards one stdin chunk to the remote PTY.
@@ -142,12 +141,11 @@ async fn send_input(api: &Api, session: SessionId, bytes: &[u8]) -> Outcome<()> 
     let text = core::str::from_utf8(bytes)
         .expect("split_utf8 holds back only the incomplete tail")
         .to_owned();
-    api.post::<flyco_core::TerminalInput, serde_json::Value>(
+    api.post_json_empty(
         &format!("/v1/sessions/{session}/terminal/input"),
         &flyco_core::TerminalInput { data: text },
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// Splits a byte chunk into (the longest valid-UTF-8 prefix, the

@@ -7,5 +7,5 @@ write_files:
     content: {{ config_base64 }}
 runcmd:
   - ['curl', '--fail', '--silent', '--show-error', '--location', '--output', '/run/flycod-install.sh', {{ installer_url }}]
-  - ['sh', '/run/flycod-install.sh']
+  - ['sh', '/run/flycod-install.sh', '--asset-base', {{ asset_base }}]
   - ['systemctl', 'enable', '--now', 'flycod']

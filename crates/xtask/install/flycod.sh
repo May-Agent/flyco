@@ -17,12 +17,62 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 1
 fi
 
-asset_base=${FLYCO_ASSET_BASE:-https://dev.flyco.dev/install}
+usage() {
+  echo "usage: flycod.sh [--asset-base URL] [--control-plane URL]                     set this machine up as a flyco session VM" >&2
+  echo "       flycod.sh [--asset-base URL] [--control-plane URL] image <flycod>      set up a session container image, flycod from a file" >&2
+  echo "       flycod.sh [--asset-base URL] [--control-plane URL] host enroll <token> enrol this machine as a flyco host" >&2
+  exit 64
+}
+
+asset_base_arg=
+control_plane_arg=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --asset-base)
+      [ "$#" -ge 2 ] || usage
+      asset_base_arg=${2%/}
+      shift 2
+      ;;
+    --asset-base=*)
+      asset_base_arg=${1#--asset-base=}
+      asset_base_arg=${asset_base_arg%/}
+      shift
+      ;;
+    --control-plane)
+      [ "$#" -ge 2 ] || usage
+      control_plane_arg=${2%/}
+      shift 2
+      ;;
+    --control-plane=*)
+      control_plane_arg=${1#--control-plane=}
+      control_plane_arg=${control_plane_arg%/}
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [ -n "$asset_base_arg" ]; then
+  asset_base=$asset_base_arg
+elif [ -n "$control_plane_arg" ] && [ -z "${FLYCO_ASSET_BASE:-}" ]; then
+  asset_base="$control_plane_arg/install"
+else
+  asset_base=${FLYCO_ASSET_BASE:-https://dev.flyco.dev/install}
+fi
+asset_base=${asset_base%/}
 binary_base=${FLYCO_BINARY_BASE:-$asset_base}
+binary_base=${binary_base%/}
 # The control plane a host enrols with is the origin serving this installer:
 # a machine is enrolled into the deployment whose wizard printed the command,
 # and there is nothing else on the machine that could know which that is.
-control_plane=${FLYCO_CONTROL_PLANE:-${asset_base%/install}}
+control_plane=${control_plane_arg:-${FLYCO_CONTROL_PLANE:-${asset_base%/install}}}
+control_plane=${control_plane%/}
 install_root=/usr/local/bin
 service_root=/etc/systemd/system
 runtime_user=flyco
@@ -51,13 +101,6 @@ download() {
   curl --fail --silent --show-error --location --retry 3 --output "$2" "$1"
 }
 
-usage() {
-  echo "usage: flycod.sh                     set this machine up as a flyco session VM" >&2
-  echo "       flycod.sh image <flycod>      set up a session container image, flycod from a file" >&2
-  echo "       flycod.sh host enroll <token> enrol this machine as a flyco host" >&2
-  exit 64
-}
-
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT HUP INT TERM
 chmod 0755 "$scratch"
@@ -80,8 +123,13 @@ create_runtime_user() {
 # refuses at attach — and a protocol nothing was ever published for answers
 # 404, which fails this script the same way a missing release always did.
 install_flycod() {
-  download "$binary_base/$artifact" "$scratch/$artifact"
   download "$binary_base/$artifact.sha256" "$scratch/$artifact.sha256"
+  expected_sha256=$(awk '{ print $1; exit }' "$scratch/$artifact.sha256")
+  if [ -z "$expected_sha256" ]; then
+    echo "checksum file $artifact.sha256 is empty" >&2
+    exit 1
+  fi
+  download "$binary_base/$artifact?sha256=$expected_sha256" "$scratch/$artifact"
   (cd "$scratch" && sha256sum --check "$artifact.sha256")
   install -m 0755 "$scratch/$artifact" "$install_root/flycod"
 }
