@@ -32,6 +32,11 @@ export type UsageWindow = components["schemas"]["UsageWindow"];
 export type DesktopStatus = components["schemas"]["DesktopStatus"];
 export type DesktopButton = components["schemas"]["DesktopButton"];
 export type DesktopInputEvent = components["schemas"]["DesktopInputEvent"];
+export type SwarmGoal = components["schemas"]["SwarmGoal"];
+export type SwarmThread = components["schemas"]["SwarmThread"];
+export type SwarmMember = components["schemas"]["SwarmMember"];
+export type SwarmSnapshot = components["schemas"]["SwarmSnapshot"];
+export type SwarmBoardMessage = components["schemas"]["SwarmBoardMessage"];
 
 /**
  * Who wrote a message that appears in the conversation as the user's.
@@ -235,7 +240,13 @@ export type ClientEvent =
    */
   | { type: "desktop_takeover"; active: boolean }
   /** The session's `computer_use` capability was toggled. */
-  | { type: "computer_use_changed"; enabled: boolean };
+  | { type: "computer_use_changed"; enabled: boolean }
+  /** Read-only Antigravity swarm snapshot and/or incremental board batch. */
+  | {
+      type: "swarm_updated";
+      snapshot?: SwarmSnapshot | null;
+      board_messages?: SwarmBoardMessage[];
+    };
 
 /**
  * The `ControlToDaemon` variants a browser may send through `send()`,
@@ -355,4 +366,5 @@ const CLIENT_EVENT_TYPES: ReadonlySet<string> = new Set([
   "desktop_active",
   "desktop_takeover",
   "computer_use_changed",
+  "swarm_updated",
 ]);

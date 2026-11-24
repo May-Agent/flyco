@@ -431,6 +431,16 @@ async fn collect<A: ControlApi>(
                 // against the account.
                 (DaemonToControl::Commands { commands }, None)
             }
+            SessionOutput::SwarmUpdated {
+                snapshot,
+                board_messages,
+            } => (
+                DaemonToControl::SwarmUpdated {
+                    snapshot,
+                    board_messages,
+                },
+                None,
+            ),
             SessionOutput::Models { models } => {
                 // Filed over REST and never queued as a relay frame: the
                 // list is recorded against the account, which is D1, and a

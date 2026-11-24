@@ -11320,6 +11320,39 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "Read-only Antigravity swarm state and message-board batch.\n\nCoalesced in `flycod` so rapid file updates and board bursts ride a\nsingle bounded frame rather than one frame per file write or message.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "board_messages": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/SwarmBoardMessage"
+                },
+                "description": "Newly observed `board.jsonl` lines in ascending `seq` order, capped\nat [`crate::swarm::SWARM_BOARD_BATCH_MAX`] per frame."
+              },
+              "snapshot": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/SwarmSnapshot",
+                    "description": "Latest snapshot of swarm metadata, goal, threads, tasks, and roster.\nOmitted when only new board lines arrived since the previous frame."
+                  }
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "swarm_updated"
+                ]
+              }
+            }
           }
         ],
         "description": "Messages from the daemon to the control plane."
@@ -15652,6 +15685,217 @@
             "format": "int64",
             "description": "Monotonic position in the room's stream. Pass the last one back as\n`after` to continue.",
             "minimum": 0
+          }
+        }
+      },
+      "SwarmBoardMessage": {
+        "type": "object",
+        "description": "One message appended to the swarm's shared `board.jsonl`.",
+        "required": [
+          "seq",
+          "agent",
+          "text"
+        ],
+        "properties": {
+          "agent": {
+            "type": "string",
+            "description": "Roster name of the agent that posted the message."
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional message kind tag recorded by Antigravity."
+          },
+          "seq": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonic sequence number on the swarm message board.",
+            "minimum": 0
+          },
+          "text": {
+            "type": "string",
+            "description": "Message text, truncated at [`SWARM_MESSAGE_TEXT_BYTES_MAX`] bytes when oversized."
+          },
+          "time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Timestamp string as recorded on the board (typically RFC 3339)."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether `text` was truncated to fit [`SWARM_MESSAGE_TEXT_BYTES_MAX`]."
+          }
+        }
+      },
+      "SwarmGoal": {
+        "type": "object",
+        "description": "High-level swarm goal read from `plan.json`.",
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "line": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional one-line detail beneath the title."
+          },
+          "title": {
+            "type": "string",
+            "description": "Short heading describing the swarm's objective."
+          }
+        }
+      },
+      "SwarmMember": {
+        "type": "object",
+        "description": "One member in the swarm roster, read from `members.json`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "killed": {
+            "type": "boolean",
+            "description": "Whether this member has been permanently ended."
+          },
+          "last_read_seq": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Highest message board sequence number this member has read.",
+            "minimum": 0
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Active or configured model display name."
+          },
+          "name": {
+            "type": "string",
+            "description": "Roster name (e.g. `coordinator`, `parser`, `verifier`)."
+          },
+          "phase": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Current runtime phase (e.g. `working`, `waiting`, `idle`)."
+          },
+          "role": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Role label reported by Antigravity (e.g. `coordinator`, `worker`)."
+          },
+          "state": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Desired lifecycle state (e.g. `running`, `waiting`, `stopped`)."
+          },
+          "workspace_mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Workspace isolation mode (`inherit`, `share`, `branch`)."
+          }
+        }
+      },
+      "SwarmSnapshot": {
+        "type": "object",
+        "description": "Point-in-time snapshot of a session's swarm state.\n\nCombines `swarm.json`, `members.json`, and `plan.json` into one compact\ndocument. Emitted only when the snapshot changes; board-only updates omit it\nso unchanged roster state is never repeated on every message.",
+        "properties": {
+          "goal": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SwarmGoal",
+                "description": "Top-level goal from `plan.json`."
+              }
+            ]
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SwarmMember"
+            },
+            "description": "Roster entries from `members.json`, ordered deterministically."
+          },
+          "swarm_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Swarm identifier from `swarm.json`."
+          },
+          "tasks": {
+            "type": "object",
+            "description": "Per-member task summaries keyed by roster name from `plan.json`.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "threads": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SwarmThread"
+            },
+            "description": "Thread groupings from `plan.json`."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable swarm title from `members.json`."
+          }
+        }
+      },
+      "SwarmThread": {
+        "type": "object",
+        "description": "One logical work thread grouping tasks/members in `plan.json`.",
+        "required": [
+          "id",
+          "title"
+        ],
+        "properties": {
+          "goal": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional objective sentence for the thread."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable thread identifier as recorded in `plan.json`."
+          },
+          "tasks": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Member or task names grouped under this thread."
+          },
+          "title": {
+            "type": "string",
+            "description": "Display heading for the thread."
           }
         }
       },

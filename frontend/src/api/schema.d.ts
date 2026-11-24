@@ -4173,6 +4173,15 @@ export interface components {
             stage: components["schemas"]["ProvisioningStage"];
             /** @enum {string} */
             type: "provisioning_stage";
+        } | {
+            /**
+             * @description Newly observed `board.jsonl` lines in ascending `seq` order, capped
+             *     at [`crate::swarm::SWARM_BOARD_BATCH_MAX`] per frame.
+             */
+            board_messages?: components["schemas"]["SwarmBoardMessage"][];
+            snapshot?: null | components["schemas"]["SwarmSnapshot"];
+            /** @enum {string} */
+            type: "swarm_updated";
         };
         /**
          * @description A freshly minted daemon token.
@@ -6844,6 +6853,86 @@ export interface components {
              *     `after` to continue.
              */
             seq: number;
+        };
+        /** @description One message appended to the swarm's shared `board.jsonl`. */
+        SwarmBoardMessage: {
+            /** @description Roster name of the agent that posted the message. */
+            agent: string;
+            /** @description Optional message kind tag recorded by Antigravity. */
+            kind?: string | null;
+            /**
+             * Format: int64
+             * @description Monotonic sequence number on the swarm message board.
+             */
+            seq: number;
+            /** @description Message text, truncated at [`SWARM_MESSAGE_TEXT_BYTES_MAX`] bytes when oversized. */
+            text: string;
+            /** @description Timestamp string as recorded on the board (typically RFC 3339). */
+            time?: string | null;
+            /** @description Whether `text` was truncated to fit [`SWARM_MESSAGE_TEXT_BYTES_MAX`]. */
+            truncated?: boolean;
+        };
+        /** @description High-level swarm goal read from `plan.json`. */
+        SwarmGoal: {
+            /** @description Optional one-line detail beneath the title. */
+            line?: string | null;
+            /** @description Short heading describing the swarm's objective. */
+            title: string;
+        };
+        /** @description One member in the swarm roster, read from `members.json`. */
+        SwarmMember: {
+            /** @description Whether this member has been permanently ended. */
+            killed?: boolean;
+            /**
+             * Format: int64
+             * @description Highest message board sequence number this member has read.
+             */
+            last_read_seq?: number | null;
+            /** @description Active or configured model display name. */
+            model?: string | null;
+            /** @description Roster name (e.g. `coordinator`, `parser`, `verifier`). */
+            name: string;
+            /** @description Current runtime phase (e.g. `working`, `waiting`, `idle`). */
+            phase?: string | null;
+            /** @description Role label reported by Antigravity (e.g. `coordinator`, `worker`). */
+            role?: string | null;
+            /** @description Desired lifecycle state (e.g. `running`, `waiting`, `stopped`). */
+            state?: string | null;
+            /** @description Workspace isolation mode (`inherit`, `share`, `branch`). */
+            workspace_mode?: string | null;
+        };
+        /**
+         * @description Point-in-time snapshot of a session's swarm state.
+         *
+         *     Combines `swarm.json`, `members.json`, and `plan.json` into one compact
+         *     document. Emitted only when the snapshot changes; board-only updates omit it
+         *     so unchanged roster state is never repeated on every message.
+         */
+        SwarmSnapshot: {
+            goal?: null | components["schemas"]["SwarmGoal"];
+            /** @description Roster entries from `members.json`, ordered deterministically. */
+            members?: components["schemas"]["SwarmMember"][];
+            /** @description Swarm identifier from `swarm.json`. */
+            swarm_id?: string | null;
+            /** @description Per-member task summaries keyed by roster name from `plan.json`. */
+            tasks?: {
+                [key: string]: string;
+            };
+            /** @description Thread groupings from `plan.json`. */
+            threads?: components["schemas"]["SwarmThread"][];
+            /** @description Human-readable swarm title from `members.json`. */
+            title?: string | null;
+        };
+        /** @description One logical work thread grouping tasks/members in `plan.json`. */
+        SwarmThread: {
+            /** @description Optional objective sentence for the thread. */
+            goal?: string | null;
+            /** @description Stable thread identifier as recorded in `plan.json`. */
+            id: string;
+            /** @description Member or task names grouped under this thread. */
+            tasks?: string[];
+            /** @description Display heading for the thread. */
+            title: string;
         };
         /** @description Request body of `POST /v1/sessions/{id}/terminal/input`. */
         TerminalInput: {

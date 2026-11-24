@@ -221,6 +221,8 @@ pub struct AcpHarness {
     backend: Backend,
     mount: Mount,
     agent: Option<AgentUser>,
+    swarm_root: Option<PathBuf>,
+    swarm_timings: crate::swarm::WatchTimings,
 }
 
 impl AcpHarness {
@@ -235,6 +237,8 @@ impl AcpHarness {
             },
             mount,
             agent: None,
+            swarm_root: None,
+            swarm_timings: crate::swarm::WatchTimings::default(),
         }
     }
 
@@ -256,6 +260,8 @@ impl AcpHarness {
             },
             mount,
             agent: None,
+            swarm_root: None,
+            swarm_timings: crate::swarm::WatchTimings::default(),
         }
     }
 
@@ -264,6 +270,21 @@ impl AcpHarness {
     #[must_use]
     pub fn with_agent(mut self, agent: Option<AgentUser>) -> Self {
         self.agent = agent;
+        self
+    }
+
+    /// Overrides the Antigravity app-data root watched read-only for swarm
+    /// files (`<root>/brain/<session_id>/.system_generated/swarm`).
+    #[must_use]
+    pub fn with_swarm_root(mut self, root: PathBuf) -> Self {
+        self.swarm_root = Some(root);
+        self
+    }
+
+    /// Overrides poll and coalescing timings for the read-only swarm watcher.
+    #[must_use]
+    pub const fn with_swarm_timings(mut self, timings: crate::swarm::WatchTimings) -> Self {
+        self.swarm_timings = timings;
         self
     }
 
@@ -430,6 +451,16 @@ impl Harness for AcpHarness {
         let session_events = session.subscribe();
         refresh_opened_from_state(&mut opened, &session_events.snapshot);
 
+        let swarm_dir = match self.swarm_root {
+            Some(root) => crate::swarm::swarm_dir_for_session(&root, &session_id),
+            None if config.agent == "antigravity" => crate::swarm::resolve_antigravity_swarm_dir(
+                &config.args,
+                agent.as_ref().map(|u| u.home.as_path()),
+                &session_id,
+            ),
+            None => None,
+        };
+
         let (commands, inbox) = mpsc::channel(CHANNEL_DEPTH);
         let (outputs, output_rx) = mpsc::channel(CHANNEL_DEPTH);
         tokio::spawn(
@@ -442,6 +473,9 @@ impl Harness for AcpHarness {
                 context_usage_method,
                 claude_compact,
                 claude_sync,
+                swarm_dir,
+                swarm_timings: self.swarm_timings,
+                swarm_task: None,
                 normalizer: Normalizer::default(),
                 outputs,
                 events: events_tx,
@@ -1805,6 +1839,9 @@ struct Driver {
     context_usage_method: Option<AcpMethodCall>,
     claude_compact: bool,
     claude_sync: Option<ClaudeSyncContext>,
+    swarm_dir: Option<PathBuf>,
+    swarm_timings: crate::swarm::WatchTimings,
+    swarm_task: Option<tokio::task::JoinHandle<()>>,
     normalizer: Normalizer,
     outputs: mpsc::Sender<SessionOutput>,
     events: mpsc::UnboundedSender<AgentEvent>,
@@ -1883,6 +1920,7 @@ impl Driver {
             return;
         }
         self.request_usage();
+        self.start_swarm_watcher();
 
         for event in prelude {
             if !self.on_agent(event, &mut session_events).await {
@@ -2364,6 +2402,17 @@ impl Driver {
         self.spawn_call(call, PendingCall::Usage);
     }
 
+    fn start_swarm_watcher(&mut self) {
+        if let Some(swarm_dir) = self.swarm_dir.take() {
+            tracing::debug!(path = %swarm_dir.display(), "starting read-only swarm watcher");
+            self.swarm_task = Some(crate::swarm::spawn(
+                swarm_dir,
+                self.outputs.clone(),
+                self.swarm_timings,
+            ));
+        }
+    }
+
     fn spawn_call(&mut self, call: AcpMethodCall, pending: PendingCall) {
         self.call_seq += 1;
         let id = self.call_seq;
@@ -2441,6 +2490,9 @@ impl Driver {
             return Ok(());
         }
         self.stopped = true;
+        if let Some(task) = self.swarm_task.take() {
+            task.abort();
+        }
         self.queued_messages.clear();
         if self.close_supported
             && let Err(error) = self.session.close().await

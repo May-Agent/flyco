@@ -35,6 +35,7 @@ pub mod skill_catalog;
 pub mod skills;
 #[cfg(feature = "sql")]
 pub mod sql;
+pub mod swarm;
 pub mod usage;
 pub mod wire;
 pub mod workdir;
@@ -118,6 +119,11 @@ pub use skill_catalog::{
     MarketplaceView, SkillCatalog,
 };
 pub use skills::{SkillMount, SkillView};
+pub use swarm::{
+    SWARM_BOARD_BATCH_MAX, SWARM_MEMBERS_MAX, SWARM_MESSAGE_TEXT_BYTES_MAX, SWARM_TASKS_MAX,
+    SWARM_TEXT_FIELD_BYTES_MAX, SWARM_THREADS_MAX, SwarmBoardMessage, SwarmGoal, SwarmMember,
+    SwarmSnapshot, SwarmThread,
+};
 pub use usage::{
     CloudSpend, CloudUsageView, HarnessObservation, LlmUsageView, OBSERVATION_WINDOW_SECONDS,
     RateLimitObservation,
@@ -139,4 +145,4 @@ pub use workdir::{
 /// Bumped on every incompatible change to [`wire`]; the control plane
 /// refuses daemons speaking a different version (fast fail, no
 /// best-effort compatibility).
-pub const WIRE_PROTOCOL_VERSION: u32 = 19;
+pub const WIRE_PROTOCOL_VERSION: u32 = 20;

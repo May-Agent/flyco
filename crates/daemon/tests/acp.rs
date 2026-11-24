@@ -1390,3 +1390,70 @@ mod in_process {
         session.shutdown().await.expect("shutdown codex");
     }
 }
+
+#[tokio::test]
+async fn acp_harness_watches_antigravity_swarm_dir_read_only() {
+    let scratch = Scratch::new("swarm-watch");
+    let app_data_root = scratch.join("app-data");
+    let swarm_dir = app_data_root
+        .join("brain")
+        .join("fake-session")
+        .join(".system_generated")
+        .join("swarm");
+
+    let harness = AcpHarness::new(config(), mount())
+        .with_swarm_root(app_data_root)
+        .with_swarm_timings(flyco_daemon::swarm::WatchTimings {
+            idle_poll: std::time::Duration::from_millis(20),
+            active_poll: std::time::Duration::from_millis(20),
+            coalesce: std::time::Duration::from_millis(30),
+        });
+    let started = harness
+        .start(StartRequest {
+            workdir: scratch.join("work"),
+            resume_session_id: None,
+            additional_directories: Vec::new(),
+        })
+        .await
+        .expect("harness starts");
+    let mut outputs = started.outputs;
+    announcements(&mut outputs).await;
+
+    // The watcher must not create the swarm directory on its own.
+    assert!(!swarm_dir.exists());
+
+    std::fs::create_dir_all(&swarm_dir).expect("create swarm dir");
+    std::fs::write(
+        swarm_dir.join("swarm.json"),
+        r#"{"version":1,"backend":"local","swarm_id":"sw-acp"}"#,
+    )
+    .expect("write swarm.json");
+    std::fs::write(
+        swarm_dir.join("members.json"),
+        r#"{"title":"ACP Swarm","members":{"coordinator":{"role":"coordinator","phase":"working"}}}"#,
+    )
+    .expect("write members.json");
+    std::fs::write(
+        swarm_dir.join("board.jsonl"),
+        "{\"seq\":1,\"agent\":\"coordinator\",\"text\":\"@all ready\"}\n",
+    )
+    .expect("write board.jsonl");
+
+    let (snapshot, board_messages) = loop {
+        if let SessionOutput::SwarmUpdated {
+            snapshot,
+            board_messages,
+        } = next(&mut outputs, "swarm_updated").await
+        {
+            break (snapshot, board_messages);
+        }
+    };
+    let snap = snapshot.expect("snapshot emitted");
+    assert_eq!(snap.swarm_id.as_deref(), Some("sw-acp"));
+    assert_eq!(snap.title.as_deref(), Some("ACP Swarm"));
+    assert_eq!(board_messages.len(), 1);
+    assert_eq!(board_messages[0].seq, 1);
+    assert_eq!(board_messages[0].text, "@all ready");
+
+    started.session.shutdown().await.expect("shutdown");
+}

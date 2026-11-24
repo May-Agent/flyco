@@ -956,4 +956,40 @@ mod tests {
         assert!(requests[1].starts_with("POST /v1/sessions/"));
         assert!(requests[1].contains("/shell"));
     }
+
+    #[test]
+    fn swarm_updated_events_round_trip_through_follow_items() {
+        let session = SessionId::generate();
+        let event = ClientEvent::SwarmUpdated {
+            snapshot: Some(flyco_core::SwarmSnapshot {
+                swarm_id: Some("sw-cli".to_owned()),
+                title: Some("CLI check".to_owned()),
+                ..flyco_core::SwarmSnapshot::default()
+            }),
+            board_messages: vec![flyco_core::SwarmBoardMessage {
+                seq: 1,
+                agent: "coordinator".to_owned(),
+                text: "@worker go".to_owned(),
+                time: None,
+                kind: None,
+                truncated: false,
+            }],
+        };
+        let stored = flyco_core::wire::StoredEvent {
+            seq: 7,
+            event: serde_json::to_value(&event).expect("serialize"),
+            at_unix: 1_800_000_000,
+        };
+        let replayed = Item::Replayed(stored);
+        assert_eq!(replayed.event(), Some(event.clone()));
+
+        let live = Item::Live(flyco_core::wire::SessionEvent {
+            session,
+            seq: Some(8),
+            at_unix: 1_800_000_001,
+            event: event.clone(),
+        });
+        assert_eq!(live.event(), Some(event));
+        assert!(!Condition::Idle.met_by_event(&live.event().expect("event")));
+    }
 }

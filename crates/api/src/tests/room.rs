@@ -2068,3 +2068,119 @@ async fn accept_batch_commits_events_turns_and_through_atomically_and_deduplicat
     assert_eq!(turns.turns[0].turn_id, "t-atomic");
     assert!(turns.turns[0].completed_at_unix.is_some());
 }
+
+fn sample_swarm_snapshot() -> flyco_core::SwarmSnapshot {
+    flyco_core::SwarmSnapshot {
+        swarm_id: Some("swarm-412".to_owned()),
+        title: Some("Read-only swarm".to_owned()),
+        goal: Some(flyco_core::SwarmGoal {
+            title: "Ship observation".to_owned(),
+            line: Some("Daemon, room, PWA, CLI".to_owned()),
+        }),
+        threads: vec![flyco_core::SwarmThread {
+            id: "impl".to_owned(),
+            title: "Implementation".to_owned(),
+            goal: None,
+            tasks: vec!["worker-a".to_owned()],
+        }],
+        tasks: std::collections::BTreeMap::from([(
+            "worker-a".to_owned(),
+            "Watch swarm directory".to_owned(),
+        )]),
+        members: vec![flyco_core::SwarmMember {
+            name: "worker-a".to_owned(),
+            role: Some("worker".to_owned()),
+            model: Some("Gemini 4 Neon (High)".to_owned()),
+            workspace_mode: Some("share".to_owned()),
+            state: Some("running".to_owned()),
+            phase: Some("working".to_owned()),
+            last_read_seq: Some(2),
+            killed: false,
+        }],
+    }
+}
+
+#[skyzen::test]
+async fn swarm_updated_frames_are_recorded_forwarded_and_replayed() {
+    let mut room = Room::open().await;
+    room.greet().await;
+
+    let snapshot = sample_swarm_snapshot();
+    let board_batch = vec![
+        flyco_core::SwarmBoardMessage {
+            seq: 1,
+            agent: "coordinator".to_owned(),
+            text: "@worker-a start".to_owned(),
+            time: Some("2026-11-24T13:55:00Z".to_owned()),
+            kind: None,
+            truncated: false,
+        },
+        flyco_core::SwarmBoardMessage {
+            seq: 2,
+            agent: "worker-a".to_owned(),
+            text: "@coordinator done".to_owned(),
+            time: Some("2026-11-24T13:56:00Z".to_owned()),
+            kind: Some("message".to_owned()),
+            truncated: false,
+        },
+    ];
+
+    let emitted = room
+        .deliver_batch(&[
+            DaemonToControl::SwarmUpdated {
+                snapshot: Some(snapshot.clone()),
+                board_messages: board_batch.clone(),
+            },
+            DaemonToControl::SwarmUpdated {
+                snapshot: None,
+                board_messages: vec![flyco_core::SwarmBoardMessage {
+                    seq: 3,
+                    agent: "coordinator".to_owned(),
+                    text: "@all wrapping up".to_owned(),
+                    time: None,
+                    kind: None,
+                    truncated: false,
+                }],
+            },
+        ])
+        .await;
+
+    assert_eq!(emitted.events.len(), 2);
+    assert_eq!(emitted.events[0].seq, Some(1));
+    assert_eq!(emitted.events[1].seq, Some(2));
+    assert_eq!(
+        emitted.events[0].event,
+        ClientEvent::SwarmUpdated {
+            snapshot: Some(snapshot.clone()),
+            board_messages: board_batch.clone(),
+        }
+    );
+
+    let replayed = room.events(0).await;
+    assert_eq!(replayed.events.len(), 2);
+    let first: ClientEvent =
+        serde_json::from_value(replayed.events[0].event.clone()).expect("decode first");
+    assert_eq!(
+        first,
+        ClientEvent::SwarmUpdated {
+            snapshot: Some(snapshot),
+            board_messages: board_batch,
+        }
+    );
+    let second: ClientEvent =
+        serde_json::from_value(replayed.events[1].event.clone()).expect("decode second");
+    assert_eq!(
+        second,
+        ClientEvent::SwarmUpdated {
+            snapshot: None,
+            board_messages: vec![flyco_core::SwarmBoardMessage {
+                seq: 3,
+                agent: "coordinator".to_owned(),
+                text: "@all wrapping up".to_owned(),
+                time: None,
+                kind: None,
+                truncated: false,
+            }],
+        }
+    );
+}

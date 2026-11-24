@@ -16,7 +16,7 @@ use flyco_core::{
     ApprovalId, ApprovalState, ApprovalView, BudgetStage, BudgetView, ContextCost, ContextUsage,
     HarnessEvent, HarnessKind, InterruptedReason, ModelChoice, PausedReason, PermissionMode,
     SessionActivity, SessionDetail, SessionId, SessionRepo, SessionState, ShellRunId,
-    UsageLimitPause, UsageReport,
+    SwarmBoardMessage, SwarmSnapshot, UsageLimitPause, UsageReport,
 };
 
 use crate::follow::Item;
@@ -113,6 +113,8 @@ pub struct Renderer {
     turn_active: bool,
     active_shell: Option<ShellRunId>,
     latest_usage: Option<UsageReport>,
+    latest_swarm: Option<SwarmSnapshot>,
+    last_swarm_seq: u64,
     commands: Vec<HarnessCommand>,
     pending_approvals: VecDeque<PendingApproval>,
     decided_approvals: HashSet<ApprovalId>,
@@ -147,6 +149,8 @@ impl Renderer {
             turn_active,
             active_shell: None,
             latest_usage: None,
+            latest_swarm: None,
+            last_swarm_seq: 0,
             commands: Vec::new(),
             pending_approvals: VecDeque::new(),
             decided_approvals: HashSet::new(),
@@ -444,6 +448,29 @@ impl Renderer {
         );
         if let Some(usage) = self.latest_usage {
             let _ = writeln!(out, "Usage    {}", format_usage(usage));
+        }
+        if let Some(swarm) = &self.latest_swarm {
+            let label = swarm
+                .title
+                .as_deref()
+                .or(swarm.swarm_id.as_deref())
+                .unwrap_or("active");
+            let active = swarm
+                .members
+                .iter()
+                .filter(|m| {
+                    !m.killed
+                        && matches!(
+                            m.phase.as_deref().or(m.state.as_deref()),
+                            Some("working" | "running" | "active")
+                        )
+                })
+                .count();
+            let _ = writeln!(
+                out,
+                "Swarm    {label} ({active}/{} active)",
+                swarm.members.len()
+            );
         }
         if !self.pending_approvals.is_empty() {
             let _ = writeln!(out, "Pending  {} approval(s)", self.pending_approvals.len());
@@ -841,6 +868,12 @@ impl Renderer {
                 let _ = writeln!(out, "{}", self.style.dim(label));
                 self.at_line_start = true;
             }
+            ClientEvent::SwarmUpdated {
+                snapshot,
+                board_messages,
+            } => {
+                self.render_swarm_updated(snapshot.as_ref(), board_messages, &mut out);
+            }
             // Metadata-only or independent shell-pane PTY frames are never
             // mixed into the ACP conversation transcript.
             ClientEvent::Started { .. }
@@ -869,6 +902,35 @@ impl Renderer {
             return out;
         }
         String::new()
+    }
+
+    fn render_swarm_updated(
+        &mut self,
+        snapshot: Option<&SwarmSnapshot>,
+        board_messages: &[SwarmBoardMessage],
+        out: &mut String,
+    ) {
+        if let Some(snap) = snapshot {
+            self.latest_swarm = Some(snap.clone());
+        }
+        let fresh: Vec<SwarmBoardMessage> = board_messages
+            .iter()
+            .filter(|msg| msg.seq > self.last_swarm_seq)
+            .cloned()
+            .collect();
+        if let Some(last) = fresh.last() {
+            self.last_swarm_seq = last.seq;
+        }
+        let rendered = crate::out::format_swarm_update(snapshot, &fresh);
+        if rendered.is_empty() {
+            return;
+        }
+        self.streaming_assistant = false;
+        self.ensure_line_start(out);
+        for line in rendered.lines() {
+            let _ = writeln!(out, "{}", self.style.cyan(&format!("[swarm] {line}")));
+        }
+        self.at_line_start = true;
     }
 
     #[expect(
@@ -1531,6 +1593,100 @@ mod tests {
         assert!(text.contains("[swarm]"));
         assert!(text.contains("verifier"));
         assert!(text.contains("working"));
+    }
+
+    #[test]
+    fn renders_typed_swarm_updated_events_and_status() {
+        let mut renderer = Renderer::new(
+            sample_detail(HarnessKind::Antigravity, SessionState::Active),
+            false,
+        );
+        let snapshot = SwarmSnapshot {
+            swarm_id: Some("sw-412".to_owned()),
+            title: Some("Release swarm".to_owned()),
+            goal: Some(flyco_core::SwarmGoal {
+                title: "Ship 412".to_owned(),
+                line: Some("Read-only observation".to_owned()),
+            }),
+            threads: vec![flyco_core::SwarmThread {
+                id: "t1".to_owned(),
+                title: "Daemon".to_owned(),
+                goal: None,
+                tasks: vec!["worker-1".to_owned()],
+            }],
+            tasks: std::collections::BTreeMap::new(),
+            members: vec![flyco_core::SwarmMember {
+                name: "worker-1".to_owned(),
+                role: Some("worker".to_owned()),
+                model: Some("Gemini 4 Neon (High)".to_owned()),
+                workspace_mode: Some("share".to_owned()),
+                state: Some("running".to_owned()),
+                phase: Some("working".to_owned()),
+                last_read_seq: Some(1),
+                killed: false,
+            }],
+        };
+
+        let first = renderer.apply_event(
+            &ClientEvent::SwarmUpdated {
+                snapshot: Some(snapshot),
+                board_messages: vec![SwarmBoardMessage {
+                    seq: 1,
+                    agent: "coordinator".to_owned(),
+                    text: "@worker-1 start".to_owned(),
+                    time: None,
+                    kind: None,
+                    truncated: false,
+                }],
+            },
+            false,
+        );
+        assert!(first.contains("[swarm] Swarm: Release swarm"), "{first}");
+        assert!(
+            first.contains("[swarm] Goal: Ship 412 — Read-only observation"),
+            "{first}"
+        );
+        assert!(
+            first.contains("[swarm] #1 coordinator: @worker-1 start"),
+            "{first}"
+        );
+
+        // Duplicate seq 1 is suppressed while seq 2 renders cleanly.
+        let second = renderer.apply_event(
+            &ClientEvent::SwarmUpdated {
+                snapshot: None,
+                board_messages: vec![
+                    SwarmBoardMessage {
+                        seq: 1,
+                        agent: "coordinator".to_owned(),
+                        text: "@worker-1 start".to_owned(),
+                        time: None,
+                        kind: None,
+                        truncated: false,
+                    },
+                    SwarmBoardMessage {
+                        seq: 2,
+                        agent: "worker-1".to_owned(),
+                        text: "@coordinator done".to_owned(),
+                        time: None,
+                        kind: None,
+                        truncated: false,
+                    },
+                ],
+            },
+            false,
+        );
+        assert!(!second.contains("#1 "), "{second}");
+        assert!(
+            second.contains("[swarm] #2 worker-1: @coordinator done"),
+            "{second}"
+        );
+
+        let status = renderer.format_status();
+        assert!(
+            status.contains("Swarm    Release swarm (1/1 active)"),
+            "{status}"
+        );
     }
 
     #[test]

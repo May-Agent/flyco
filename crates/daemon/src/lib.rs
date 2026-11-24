@@ -77,6 +77,7 @@ pub mod shell;
 pub mod skills;
 pub mod spot;
 pub mod stop;
+pub mod swarm;
 pub mod terminal;
 pub mod tui;
 pub mod workdir;
