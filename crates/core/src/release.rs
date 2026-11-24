@@ -121,11 +121,11 @@ pub const CLAUDE_MANAGED_DIR: &str = "/etc/claude-code";
 /// tagged by channel (`:dev`), by wire protocol version (`:wire-9`), and
 /// `:latest`; named here so the publisher and every driver that starts one
 /// spell it the same way.
-pub const SESSION_IMAGE: &str = "ghcr.io/lexoliu/flyco-session";
+pub const SESSION_IMAGE: &str = "ghcr.io/may-agent/flyco-session";
 
 /// [`SESSION_IMAGE`] at its `latest` tag: what a host runs unless the user
 /// names another image.
-pub const SESSION_IMAGE_LATEST: &str = "ghcr.io/lexoliu/flyco-session:latest";
+pub const SESSION_IMAGE_LATEST: &str = "ghcr.io/may-agent/flyco-session:latest";
 
 /// [`SESSION_IMAGE`] at the tag matching this control plane's wire protocol.
 ///

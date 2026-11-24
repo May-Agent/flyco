@@ -14,7 +14,7 @@
 //! side fails that test rather than a machine that boots and never phones
 //! home.
 //!
-//! [`DaemonConfig`]: https://github.com/lexoliu/flyco/blob/main/crates/daemon/src/config.rs
+//! [`DaemonConfig`]: https://github.com/May-Agent/flyco/blob/main/crates/daemon/src/config.rs
 
 use core::fmt;
 use std::collections::BTreeMap;

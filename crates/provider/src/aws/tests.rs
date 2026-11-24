@@ -1489,7 +1489,7 @@ const DEFINITION_FAMILY: &str =
 /// The image the described definition already runs, which is deliberately an
 /// older wire tag than this control plane's: a resize carries it over rather
 /// than folding an upgrade into a size change.
-const PROVISIONED_IMAGE: &str = "ghcr.io/lexoliu/flyco-session:wire-9";
+const PROVISIONED_IMAGE: &str = "ghcr.io/may-agent/flyco-session:wire-9";
 
 /// A provisioning request for a container, which is one axis on the spec
 /// rather than a different provider.
@@ -1639,7 +1639,7 @@ async fn provisioning_a_container_creates_the_cluster_then_registers_a_revision(
     assert_eq!(
         container["image"],
         format!(
-            "ghcr.io/lexoliu/flyco-session:wire-{}",
+            "ghcr.io/may-agent/flyco-session:wire-{}",
             flyco_core::WIRE_PROTOCOL_VERSION
         ),
         "pinned to this control plane's wire protocol, never `latest`"

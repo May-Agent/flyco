@@ -12,7 +12,7 @@
 //! documents the enrollment routes exchange. The container jobs themselves
 //! are `flyco_provider::host`, because they carry a daemon bootstrap.
 //!
-//! [`HostRoom`]: https://github.com/lexoliu/flyco/blob/dev/docs/host-enrollment.md
+//! [`HostRoom`]: https://github.com/May-Agent/flyco/blob/main/docs/host-enrollment.md
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;

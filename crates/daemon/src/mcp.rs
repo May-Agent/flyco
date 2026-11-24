@@ -32,7 +32,7 @@
 //! ([`ApiError::LicenseBoundResizeNeedsApproval`]). A rule an agent could
 //! talk its way past is not a rule.
 //!
-//! [`ApiError::LicenseBoundResizeNeedsApproval`]: https://github.com/lexoliu/flyco/blob/main/crates/api/src/error.rs
+//! [`ApiError::LicenseBoundResizeNeedsApproval`]: https://github.com/May-Agent/flyco/blob/main/crates/api/src/error.rs
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
