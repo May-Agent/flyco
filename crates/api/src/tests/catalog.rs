@@ -480,3 +480,83 @@ async fn the_scheduled_sweep_asks_again_once_a_document_is_stale(kv: Kv, db: Db)
 
     assert_eq!(queued(&backend).len(), 1);
 }
+
+#[skyzen::test]
+async fn the_scheduled_sweep_gates_to_at_most_hourly(kv: Kv, db: Db) {
+    let backend = InMemoryQueue::new();
+    let queue = Queue::new(backend.clone());
+    crate::testing::migrate(&db).await;
+    let user = seed_user(&db).await;
+    let first = seed_azure_account(&db, user.id).await;
+    let t0 = crate::clock::now_unix();
+
+    catalog::refresh_stale(&db, &kv, &queue, t0)
+        .await
+        .expect("first sweep");
+    assert_eq!(
+        queued(&backend),
+        vec![ProvisioningJob::RefreshCatalog {
+            user: user.id,
+            account: first,
+        }]
+    );
+
+    // Add a second unread account: a minute later the hourly gate skips the
+    // sweep entirely without querying accounts or KV.
+    let second = seed_azure_account(&db, user.id).await;
+    catalog::refresh_stale(&db, &kv, &queue, t0 + 60)
+        .await
+        .expect("gated sweep");
+    assert_eq!(
+        queued(&backend).len(),
+        1,
+        "a sweep within the hourly window must not scan accounts again"
+    );
+
+    // One hour later the gate opens and enqueues the newly added account.
+    catalog::refresh_stale(&db, &kv, &queue, t0 + catalog::SWEEP_INTERVAL_SECONDS)
+        .await
+        .expect("hourly sweep");
+    assert!(
+        queued(&backend).contains(&ProvisioningJob::RefreshCatalog {
+            user: user.id,
+            account: second,
+        }),
+        "once an hour passes, the sweep runs again"
+    );
+}
+
+#[skyzen::test]
+async fn the_scheduled_sweep_paginates_large_account_sets_across_ticks(kv: Kv, db: Db) {
+    let backend = InMemoryQueue::new();
+    let queue = Queue::new(backend.clone());
+    crate::testing::migrate(&db).await;
+    let user = seed_user(&db).await;
+    let total = catalog::MAX_ACCOUNTS_PER_SWEEP as usize + 2;
+    for _ in 0..total {
+        seed_azure_account(&db, user.id).await;
+    }
+    let t0 = crate::clock::now_unix();
+
+    // First tick checks only MAX_ACCOUNTS_PER_SWEEP accounts.
+    catalog::refresh_stale(&db, &kv, &queue, t0)
+        .await
+        .expect("first page");
+    assert_eq!(
+        queued(&backend).len(),
+        catalog::MAX_ACCOUNTS_PER_SWEEP as usize
+    );
+
+    // Next minute finishes the in-progress pass (remaining 2 accounts).
+    catalog::refresh_stale(&db, &kv, &queue, t0 + 60)
+        .await
+        .expect("second page");
+    assert_eq!(queued(&backend).len(), total);
+
+    // Following minute sleeps behind the hourly gate even if another account arrives.
+    seed_azure_account(&db, user.id).await;
+    catalog::refresh_stale(&db, &kv, &queue, t0 + 120)
+        .await
+        .expect("sleeping behind hourly gate");
+    assert_eq!(queued(&backend).len(), total);
+}

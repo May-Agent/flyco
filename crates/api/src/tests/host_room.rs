@@ -350,6 +350,7 @@ async fn frames_from_a_machine_that_never_attached_are_refused() {
             frames: vec![HostToControl::JobResult {
                 job_id: MachineId::generate(),
                 outcome: JobOutcome::Done,
+                command_seq: None,
             }],
         })
         .await;
@@ -419,6 +420,7 @@ async fn a_job_is_retired_by_its_answer_not_by_being_delivered() {
     room.deliver(&HostToControl::JobResult {
         job_id: machine,
         outcome: JobOutcome::Done,
+        command_seq: None,
     })
     .await;
     assert_eq!(room.status().await.pending_jobs, 0);
@@ -439,6 +441,7 @@ async fn the_oldest_answer_for_a_container_retires_the_oldest_job() {
     room.deliver(&HostToControl::JobResult {
         job_id: machine,
         outcome: JobOutcome::Done,
+        command_seq: None,
     })
     .await;
 
@@ -446,6 +449,70 @@ async fn the_oldest_answer_for_a_container_retires_the_oldest_job() {
         room.status().await.pending_jobs,
         1,
         "one answer retires one job"
+    );
+}
+
+#[skyzen::test]
+async fn command_seq_retires_the_exact_command_row() {
+    let mut room = Room::open().await;
+    room.greet().await;
+    let machine = MachineId::generate();
+
+    room.command(&job_for(machine)).await;
+    room.command(&job_for(machine)).await;
+    let first = room.next_command().await;
+    let second = room.next_command().await;
+    let first_seq = first.seq.expect("first job seq");
+    let second_seq = second.seq.expect("second job seq");
+    assert!(first_seq < second_seq);
+
+    // Answer the second job explicitly by its command_seq; the first must stay pending.
+    room.deliver(&HostToControl::JobResult {
+        job_id: machine,
+        outcome: JobOutcome::Done,
+        command_seq: Some(second_seq),
+    })
+    .await;
+    assert_eq!(room.status().await.pending_jobs, 1);
+
+    // Re-attaching replays only the unanswered first job.
+    room.attach().await;
+    room.open_commands().await;
+    let replayed = room.next_command().await;
+    assert_eq!(replayed.seq, Some(first_seq));
+}
+
+#[skyzen::test]
+async fn revoking_a_live_host_preserves_stop_jobs_and_queues_revoked_after_them() {
+    let mut room = Room::open().await;
+    // Attach so the host is live, then queue Start + Stop + Revoked before
+    // opening the stream so nothing is drained out of `host_commands` early.
+    room.attach().await;
+    let start_machine = MachineId::generate();
+    let stop_machine = MachineId::generate();
+
+    room.command(&ControlToHost::Run {
+        job: ContainerJob::Start {
+            container: container_name(start_machine),
+        },
+    })
+    .await;
+    room.command(&job_for(stop_machine)).await;
+    assert_eq!(room.command(&ControlToHost::Revoked).await, 204);
+    assert_eq!(
+        room.status().await.pending_jobs,
+        1,
+        "only the Stop job remains pending; the non-Stop Start job was dropped"
+    );
+
+    room.open_commands().await;
+    let first = room.next_command().await;
+    let second = room.next_command().await;
+    assert_eq!(first.command, job_for(stop_machine));
+    assert_eq!(second.command, ControlToHost::Revoked);
+    assert!(
+        first.seq.expect("stop seq") < second.seq.expect("revoked seq"),
+        "Revoked must be sequenced strictly after every preserved Stop job"
     );
 }
 
@@ -509,10 +576,67 @@ async fn an_empty_mailbox_replays_nothing_to_a_fresh_attach() {
     room.deliver(&HostToControl::JobResult {
         job_id: machine,
         outcome: JobOutcome::Done,
+        command_seq: None,
     })
     .await;
 
     room.attach().await;
     room.open_commands().await;
     room.expect_quiet().await;
+}
+
+#[skyzen::test]
+async fn accept_batch_retires_jobs_and_advances_through_atomically_across_retries() {
+    let mut room = Room::open().await;
+    room.greet().await;
+    let epoch = room.epoch.expect("attached");
+    let m1 = MachineId::generate();
+    let m2 = MachineId::generate();
+
+    room.command(&job_for(m1)).await;
+    room.command(&job_for(m2)).await;
+    let c1 = room.next_command().await;
+    let c2 = room.next_command().await;
+
+    let batch = HostFrames {
+        epoch,
+        from_seq: 1,
+        ack_through: c2.seq.expect("c2 seq"),
+        frames: vec![
+            HostToControl::JobResult {
+                job_id: m1,
+                outcome: JobOutcome::Done,
+                command_seq: c1.seq,
+            },
+            HostToControl::JobResult {
+                job_id: m2,
+                outcome: JobOutcome::Done,
+                command_seq: c2.seq,
+            },
+        ],
+    };
+
+    let (status, _) = room.deliver_raw(&batch).await;
+    assert_eq!(status, 204);
+    assert_eq!(room.status().await.pending_jobs, 0);
+
+    // Queue a new job on m1, then replay the old batch: the replay must be a
+    // complete no-op and must NEVER delete the newer job on m1.
+    room.command(&job_for(m1)).await;
+    assert_eq!(room.status().await.pending_jobs, 1);
+
+    let (status, _) = room.deliver_raw(&batch).await;
+    assert_eq!(status, 204);
+    assert_eq!(
+        room.status().await.pending_jobs,
+        1,
+        "replaying an already-applied batch must not touch later jobs on the same container"
+    );
+
+    let db = DurableDb::new(room.db.clone());
+    let through: u64 = skyzen::sql!(db, "SELECT through FROM host_frames WHERE epoch = {epoch}")
+        .fetch_scalar()
+        .await
+        .expect("through");
+    assert_eq!(through, 2);
 }

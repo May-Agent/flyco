@@ -1,30 +1,22 @@
-//! `GET /v1/sessions/{id}/turns`'s walk over the room's event stream.
+//! `GET /v1/sessions/{id}/turns` backed by the `SessionRoom` turn projection.
 //!
-//! The fold's own cases are unit-tested beside it in `crate::turns`; what
-//! these pin is the walk's cost — issue #351 billed every event page's
-//! 501-row bound whether or not the tail held it, up to eight pages a
-//! call. The walk is driven against a real [`SessionRoom`] on storage the
-//! test can read back, so the ledger's movement is observed, not assumed.
+//! Every test drives a real [`SessionRoom`] over in-memory SQLite so turn
+//! projection, cursor advancement across >500-event turns, legacy schema v3
+//! backfill, and `row_budget` debits are all verified against actual storage.
 
-use core::future::Future;
-
-use flyco_core::wire::EventPage;
 use flyco_core::{
-    ClientEvent, ContextWindow, HarnessEvent, MessageOrigin, SessionId, UsageReport, Usd,
+    ClientEvent, ContextWindow, HarnessEvent, MessageOrigin, PROMPT_EXCERPT_CHARS, SessionId,
+    TurnPage, UsageReport, Usd,
 };
 use skyzen::durable::DurableObject as _;
 use skyzen::{Method, Request};
 use skyzen_services::durable::DurableDb;
 use skyzen_test::mock::InMemoryDurableDb;
 
-use crate::error::ApiError;
 use crate::room::{EVENT_PAGE_LIMIT, SessionRoom};
 use crate::testing::{room_request, rows_billed};
-use crate::turns::walk;
 
-/// A session room on storage the test can inspect: the walk under test
-/// reads this object's event pages, and the ledger it debits is a table
-/// here rather than behind a namespace.
+/// A session room on storage the test can inspect directly.
 struct Room {
     session: SessionId,
     object: SessionRoom,
@@ -42,8 +34,6 @@ impl Room {
         }
     }
 
-    /// One Worker→room call against this room's storage, injected where
-    /// the simulator would put it.
     fn request(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Request {
         let mut request = room_request(self.session, method, path, body);
         request
@@ -52,7 +42,6 @@ impl Room {
         request
     }
 
-    /// Records one event the way a control-plane broadcast does.
     async fn record(&self, event: &ClientEvent) {
         let request = self.request(
             Method::POST,
@@ -68,34 +57,31 @@ impl Room {
         assert_eq!(response.status().as_u16(), 200, "a broadcast is stored");
     }
 
-    /// The page read the walk is handed: `GET /internal/events`.
-    ///
-    /// The returned future owns its request and router rather than
-    /// borrowing the room, so the walk can hold it across pages.
-    fn events(&self, after: u64) -> impl Future<Output = Result<EventPage, ApiError>> + use<> {
-        let router = self.object.fetch();
+    async fn turns(&self, after: u64, limit: u32) -> TurnPage {
         let request = self.request(
             Method::GET,
-            &format!("/internal/events?after={after}"),
+            &format!("/internal/turns?after={after}&limit={limit}"),
             None,
         );
-        async move {
-            let response = router.go(request).await.expect("the room answered");
-            assert!(
-                response.status().is_success(),
-                "the room refused a page it should answer"
-            );
-            let body = response
-                .into_body()
-                .into_bytes()
-                .await
-                .expect("a readable body");
-            serde_json::from_slice(&body)
-                .map_err(|_| ApiError::Room("the room returned no event page".to_owned()))
-        }
+        let response = self
+            .object
+            .fetch()
+            .go(request)
+            .await
+            .expect("the room answered");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the room should serve a turn page"
+        );
+        let body = response
+            .into_body()
+            .into_bytes()
+            .await
+            .expect("a readable body");
+        serde_json::from_slice(&body).expect("a turn page")
     }
 
-    /// The rows the room's ledger says it read today.
     async fn spent(&self) -> u64 {
         rows_billed(&DurableDb::new(self.db.clone())).await
     }
@@ -113,93 +99,211 @@ fn usage() -> UsageReport {
     }
 }
 
+fn said(text: &str) -> ClientEvent {
+    ClientEvent::UserMessage {
+        text: text.to_owned(),
+        origin: MessageOrigin::User,
+    }
+}
+
+fn harness(event: HarnessEvent) -> ClientEvent {
+    ClientEvent::Harness { event }
+}
+
+fn started(turn: &str) -> ClientEvent {
+    harness(HarnessEvent::TurnStarted {
+        turn_id: turn.to_owned(),
+    })
+}
+
+fn completed(turn: &str) -> ClientEvent {
+    harness(HarnessEvent::TurnCompleted {
+        turn_id: turn.to_owned(),
+        usage: usage(),
+    })
+}
+
 #[skyzen::test]
-async fn a_short_tail_bills_the_rows_the_walk_read() {
+async fn a_turn_is_named_by_the_message_that_began_it_and_bills_only_turn_rows() {
     let room = Room::open().await;
-    // One turn's worth of stream: the message that opened it, its start,
-    // and its completion.
     for event in [
-        ClientEvent::UserMessage {
-            text: "audit the relay".to_owned(),
-            origin: MessageOrigin::User,
-        },
-        ClientEvent::Harness {
-            event: HarnessEvent::TurnStarted {
-                turn_id: "t-1".to_owned(),
-            },
-        },
-        ClientEvent::Harness {
-            event: HarnessEvent::TurnCompleted {
-                turn_id: "t-1".to_owned(),
-                usage: usage(),
-            },
-        },
+        said("audit the relay"),
+        started("t-1"),
+        harness(HarnessEvent::AssistantDelta {
+            turn_id: "t-1".to_owned(),
+            text: "working...".to_owned(),
+        }),
+        completed("t-1"),
     ] {
         room.record(&event).await;
     }
 
-    let page = walk(0, 10, |after| room.events(after))
-        .await
-        .expect("a page of turns");
+    let page = room.turns(0, 10).await;
+    assert_eq!(page.turns.len(), 1);
+    let turn = &page.turns[0];
+    assert_eq!(turn.turn_id, "t-1");
+    assert_eq!(turn.prompt_excerpt, "audit the relay");
+    assert!(turn.completed_at_unix.is_some());
+    assert_eq!(turn.usage, Some(usage()));
+    assert!(page.next_cursor.is_none());
+    assert_eq!(
+        room.spent().await,
+        1,
+        "reading the turn projection bills only the turn rows read, not stream deltas"
+    );
+}
 
-    assert_eq!(page.turns.len(), 1, "the short tail folds to one turn");
-    assert!(page.next_cursor.is_none(), "the tail is fully read");
+#[skyzen::test]
+async fn a_turn_spanning_more_than_500_events_advances_cursor_cleanly() {
+    let room = Room::open().await;
+    let delta_count = usize::try_from(EVENT_PAGE_LIMIT).expect("usize") + 150;
+
+    room.record(&said("large turn")).await;
+    room.record(&started("t-big")).await;
+    for _ in 0..delta_count {
+        room.record(&harness(HarnessEvent::AssistantDelta {
+            turn_id: "t-big".to_owned(),
+            text: ".".to_owned(),
+        }))
+        .await;
+    }
+    room.record(&completed("t-big")).await;
+    room.record(&said("follow-up")).await;
+    room.record(&started("t-next")).await;
+    room.record(&completed("t-next")).await;
+
+    let first = room.turns(0, 1).await;
+    assert_eq!(first.turns.len(), 1);
+    assert_eq!(first.turns[0].turn_id, "t-big");
+    assert!(first.turns[0].completed_at_unix.is_some());
+    let cursor = first
+        .next_cursor
+        .as_deref()
+        .expect("second turn exists")
+        .parse::<u64>()
+        .expect("numeric cursor");
+    assert!(cursor > 0, "cursor must strictly advance past 0");
+
+    let second = room.turns(cursor, 1).await;
+    assert_eq!(second.turns.len(), 1);
+    assert_eq!(second.turns[0].turn_id, "t-next");
+    assert_eq!(second.turns[0].prompt_excerpt, "follow-up");
+    assert!(second.next_cursor.is_none());
+
     assert_eq!(
         room.spent().await,
         3,
-        "the ledger moved by the rows read, not the page's bound"
+        "two pages across a >500-event turn billed only 3 turn rows, not >650 event rows"
     );
 }
 
 #[skyzen::test]
-async fn a_long_tail_stops_at_the_row_bound_with_a_cursor() {
+async fn a_failed_turn_completes_without_usage_and_an_open_turn_has_no_completion() {
     let room = Room::open().await;
-    // A tail a page and a half long: one open turn's unbroken deltas.
-    let rows = usize::try_from(EVENT_PAGE_LIMIT).expect("a usize") + 100;
-    for _ in 0..rows {
-        room.record(&ClientEvent::Harness {
-            event: HarnessEvent::AssistantDelta {
-                turn_id: "t-1".to_owned(),
-                text: "…".to_owned(),
-            },
-        })
-        .await;
+    for event in [
+        said("break something"),
+        started("t-1"),
+        harness(HarnessEvent::TurnFailed {
+            turn_id: "t-1".to_owned(),
+            error: "the model refused".to_owned(),
+        }),
+        said("still running"),
+        started("t-2"),
+    ] {
+        room.record(&event).await;
     }
 
-    let page = walk(0, 10, |after| room.events(after))
-        .await
-        .expect("a page of turns");
-
-    assert_eq!(
-        page.next_cursor.as_deref(),
-        Some("500"),
-        "the walk stopped at the row bound, a full page in"
-    );
-    assert_eq!(
-        room.spent().await,
-        u64::from(EVENT_PAGE_LIMIT) + 1,
-        "one page read, bound plus the lookahead row — not eight pages of bound"
-    );
+    let page = room.turns(0, 10).await;
+    assert_eq!(page.turns.len(), 2);
+    assert_eq!(page.turns[0].turn_id, "t-1");
+    assert!(page.turns[0].completed_at_unix.is_some());
+    assert!(page.turns[0].usage.is_none());
+    assert_eq!(page.turns[1].turn_id, "t-2");
+    assert!(page.turns[1].completed_at_unix.is_none());
+    assert!(page.next_cursor.is_none());
 }
 
-/// A room that claims more to read without carrying an event could not
-/// advance the cursor; the walk refuses it instead of asking again forever.
 #[skyzen::test]
-async fn a_page_with_more_and_no_events_is_refused() {
-    let mut calls = 0_u32;
-    let error = walk(0, 10, |_after| {
-        calls += 1;
-        core::future::ready(Ok(EventPage {
-            events: Vec::new(),
-            more: true,
-        }))
-    })
-    .await
-    .expect_err("an empty page that claims more");
+async fn unprompted_and_long_prompts_and_orphan_completions_match_contract() {
+    let room = Room::open().await;
+    let long = "x".repeat(PROMPT_EXCERPT_CHARS * 2);
+    for event in [
+        completed("t-orphan"),
+        started("t-unprompted"),
+        completed("t-unprompted"),
+        said(&long),
+        started("t-long"),
+        completed("t-long"),
+    ] {
+        room.record(&event).await;
+    }
 
-    assert!(
-        matches!(error, ApiError::Room(_)),
-        "refused as a room fault, got {error:?}"
+    let page = room.turns(0, 10).await;
+    assert_eq!(
+        page.turns
+            .iter()
+            .map(|turn| turn.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["t-unprompted", "t-long"]
     );
-    assert_eq!(calls, 1, "the walk stopped at the first such page");
+    assert_eq!(page.turns[0].prompt_excerpt, "");
+    assert_eq!(
+        page.turns[1].prompt_excerpt.chars().count(),
+        PROMPT_EXCERPT_CHARS
+    );
+    assert!(page.turns[1].prompt_excerpt.ends_with('…'));
+}
+
+#[skyzen::test]
+async fn a_legacy_v3_room_backfills_preexisting_events_on_upgrade() {
+    let db = InMemoryDurableDb::in_memory()
+        .await
+        .expect("an in-memory database");
+    let durable = DurableDb::new(db.clone());
+    // Seed a schema-v3 room with pre-existing `events` rows (no `turns` table yet).
+    for ddl in [
+        "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY CHECK (id = 0), version INTEGER NOT NULL)",
+        "INSERT INTO schema_meta (id, version) VALUES (0, 3)",
+        "CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, json TEXT NOT NULL, at_unix INTEGER NOT NULL)",
+        crate::row_budget::SCHEMA,
+    ] {
+        durable.query(ddl).execute().await.expect("seed v3 ddl");
+    }
+    for (index, event) in [
+        said("before upgrade"),
+        started("t-legacy"),
+        completed("t-legacy"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let json = serde_json::to_string(&event).expect("serialize");
+        let at = 1_800_000_000_u64 + index as u64;
+        skyzen::sql!(
+            durable,
+            "INSERT INTO events (json, at_unix) VALUES ({json}, {at})"
+        )
+        .execute()
+        .await
+        .expect("seed legacy event");
+    }
+
+    let room = Room {
+        session: SessionId::generate(),
+        object: SessionRoom::default(),
+        db,
+    };
+
+    let page = room.turns(0, 10).await;
+    assert_eq!(page.turns.len(), 1);
+    assert_eq!(page.turns[0].turn_id, "t-legacy");
+    assert_eq!(page.turns[0].prompt_excerpt, "before upgrade");
+    assert_eq!(page.turns[0].usage, Some(usage()));
+    let after_first = room.spent().await;
+    assert_eq!(after_first, 4, "3 backfilled events + 1 turn row");
+
+    // Subsequent reads touch only `turns`, never rescanning `events`.
+    let again = room.turns(0, 10).await;
+    assert_eq!(again.turns.len(), 1);
+    assert_eq!(room.spent().await - after_first, 1);
 }

@@ -75,6 +75,15 @@ pub const RESULT_RETRY: Duration = Duration::from_secs(60);
 /// machine.
 pub const RESULT_QUEUE_DEPTH: usize = 256;
 
+/// How long the relay waits for in-flight `Stop` jobs to finish after
+/// receiving [`ControlToHost::Revoked`] before exiting.
+///
+/// Force-removing a host enqueues `ContainerJob::Stop` for every live
+/// container strictly ahead of `Revoked`; exiting immediately would kill
+/// `podman stop` mid-flight and leave containers running on the user's
+/// hardware.
+const REVOKE_STOP_GRACE: Duration = Duration::from_secs(30);
+
 /// Why the relay stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stopped {
@@ -195,6 +204,9 @@ struct Pump<J, A> {
     /// `429 Retry-After` refusal; persists across reconnects so re-attaching
     /// never bypasses a rate-limit cooldown.
     report_blocked_until: Option<tokio::time::Instant>,
+    /// In-flight `ContainerJob::Stop` tasks, awaited before exiting on
+    /// [`Ended::Revoked`] so force-removal drains containers cleanly.
+    in_flight_stops: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Why one attachment ended.
@@ -229,6 +241,7 @@ where
         handled: HashSet::new(),
         retry_hint: None,
         report_blocked_until: None,
+        in_flight_stops: Vec::new(),
     };
     // How far down the room's command log this machine has applied —
     // global across attachments, exactly as the log's sequences are.
@@ -290,6 +303,7 @@ where
                 return Ok(Stopped::Superseded);
             }
             Ended::Revoked => {
+                pump.drain_stops().await;
                 tracing::warn!(
                     "the control plane revoked this machine; \
                      flycod host is stopping and will not reconnect"
@@ -421,7 +435,7 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
 
     /// Performs one job on its own task, so a slow `podman run` does not
     /// hold up the stream.
-    fn start(&self, seq: u64, job: ContainerJob) {
+    fn start(&mut self, seq: u64, job: ContainerJob) {
         let Some(machine) = job.machine() else {
             // Unreachable against this control plane — every Podman name
             // it sends is derived from a machine id — and dropped rather
@@ -434,9 +448,11 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
             );
             return;
         };
+        self.in_flight_stops.retain(|handle| !handle.is_finished());
+        let is_stop = matches!(job, ContainerJob::Stop { .. });
         let jobs = Arc::clone(&self.jobs);
         let results = self.results.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let outcome = jobs.perform(job).await;
             if results
                 .send((
@@ -456,6 +472,29 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
                 );
             }
         });
+        if is_stop {
+            self.in_flight_stops.push(handle);
+        }
+    }
+
+    /// Waits for any in-flight `ContainerJob::Stop` tasks to finish before
+    /// the relay exits on revocation, bounded by [`REVOKE_STOP_GRACE`].
+    async fn drain_stops(&mut self) {
+        self.in_flight_stops.retain(|handle| !handle.is_finished());
+        if self.in_flight_stops.is_empty() {
+            return;
+        }
+        let handles = core::mem::take(&mut self.in_flight_stops);
+        tracing::info!(
+            stops = handles.len(),
+            "waiting for in-flight container stops before exiting on revocation"
+        );
+        if tokio::time::timeout(REVOKE_STOP_GRACE, futures_util::future::join_all(handles))
+            .await
+            .is_err()
+        {
+            tracing::warn!("timed out waiting for in-flight container stops on revocation");
+        }
     }
 
     /// Reports every outstanding result — durable half first, then the
@@ -520,6 +559,7 @@ impl<J: Jobs, A: JobResults + HostTransport> Pump<J, A> {
                 HostToControl::JobResult {
                     job_id: finished.report.job_id,
                     outcome: finished.report.outcome,
+                    command_seq: Some(finished.seq),
                 },
             ));
         }
@@ -859,6 +899,7 @@ mod tests {
             HostToControl::JobResult {
                 job_id: machine,
                 outcome: JobOutcome::Done,
+                command_seq: Some(1),
             },
             "the frame follows once the row is durable"
         );
@@ -905,6 +946,7 @@ mod tests {
             HostToControl::JobResult {
                 job_id: machine,
                 outcome: JobOutcome::Done,
+                command_seq: Some(1),
             }
         );
 
@@ -956,6 +998,34 @@ mod tests {
             stopped.expect("a revocation is not an error"),
             Stopped::Revoked
         );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_machine_awaits_in_flight_stop_jobs_before_exiting() {
+        let mut harness = Harness::start().await;
+        harness.attached().await;
+
+        let machine = MachineId::generate();
+        harness.command(ControlToHost::Run {
+            job: stop_job(machine),
+        });
+        assert_eq!(harness.performed.recv().await, Some(stop_job(machine)));
+
+        // Revoked arrives while the Stop job is still running (`job_gate` held).
+        harness.command(ControlToHost::Revoked);
+        tokio::time::sleep(core::time::Duration::from_millis(200)).await;
+        assert!(
+            !harness.run.is_finished(),
+            "the relay must not exit while an in-flight Stop job is still running"
+        );
+
+        // Once the Stop job finishes, the relay exits cleanly as Revoked.
+        harness.job_gate.notify_one();
+        let stopped = tokio::time::timeout(core::time::Duration::from_secs(5), harness.run)
+            .await
+            .expect("the run ended once the stop drained")
+            .expect("the run did not panic");
+        assert_eq!(stopped.expect("revoked cleanly"), Stopped::Revoked);
     }
 
     #[tokio::test]
@@ -1042,6 +1112,7 @@ mod tests {
             HostToControl::JobResult {
                 job_id: machine,
                 outcome: JobOutcome::Done,
+                command_seq: Some(1),
             }
         );
 
@@ -1252,6 +1323,7 @@ mod tests {
             HostToControl::JobResult {
                 job_id: machine,
                 outcome: JobOutcome::Done,
+                command_seq: Some(1),
             }
         );
         assert!(

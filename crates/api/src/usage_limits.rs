@@ -173,6 +173,14 @@ async fn announce(db: &Db, rooms: &Rooms, session: SessionId, window: &UsageWind
     }
 }
 
+/// Most subrequest-bearing actions (continue, wake, or machine release)
+/// one scheduled tick performs across waiting sessions.
+///
+/// Waiting sessions whose machine is already off consume no provider calls
+/// and do not count against this cap, so a backlog of parked sessions never
+/// starves one whose window just reset.
+pub const MAX_ACTIONS_PER_SWEEP: usize = 3;
+
 /// Carries every waiting session one step further, once a minute.
 ///
 /// One pass over the handful of sessions waiting out a plan window, with the
@@ -181,7 +189,9 @@ async fn announce(db: &Db, rooms: &Rooms, session: SessionId, window: &UsageWind
 ///
 /// A session that refuses one step is logged and the sweep goes on to the
 /// next: one account whose credentials expired must not stop every other
-/// user's session from coming back.
+/// user's session from coming back. At most [`MAX_ACTIONS_PER_SWEEP`]
+/// subrequest-bearing steps run per tick so this leg never crowds the shared
+/// minute cron's subrequest ceiling.
 ///
 /// # Errors
 ///
@@ -195,9 +205,14 @@ pub async fn sweep(
     queue: &Queue,
     at_unix: u64,
 ) -> Result<(), ApiError> {
+    let mut actions = 0_usize;
     for wait in sessions::usage_limit_waits(db).await? {
+        if actions >= MAX_ACTIONS_PER_SWEEP {
+            break;
+        }
         let pause = wait.pause();
         if pause.resets_at_unix <= at_unix && can_hear_us(&wait, &pause) {
+            actions += 1;
             if let Err(error) = continue_session(db, config, rooms, &wait, &pause).await {
                 tracing::warn!(
                     session = %wait.id,
@@ -214,19 +229,29 @@ pub async fn sweep(
             continue;
         };
         if resume_at <= at_unix {
-            if let Err(error) = wake(db, rooms, queue, &wait, at_unix).await {
-                tracing::warn!(
-                    session = %wait.id,
-                    %error,
-                    "a waiting session's machine was not started for its reset"
-                );
+            if wait.state == SessionState::Paused {
+                actions += 1;
+                if let Err(error) = wake(db, rooms, queue, &wait, at_unix).await {
+                    tracing::warn!(
+                        session = %wait.id,
+                        %error,
+                        "a waiting session's machine was not started for its reset"
+                    );
+                }
             }
-        } else if let Err(error) = release(db, config, github, hosts, &wait).await {
-            tracing::warn!(
-                session = %wait.id,
-                %error,
-                "a waiting session's machine could not be released"
-            );
+        } else {
+            match release(db, config, github, hosts, &wait).await {
+                Ok(true) => actions += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    actions += 1;
+                    tracing::warn!(
+                        session = %wait.id,
+                        %error,
+                        "a waiting session's machine could not be released"
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -268,17 +293,18 @@ async fn release(
     github: &impl GithubOauth,
     hosts: &HostRooms,
     wait: &sessions::UsageLimitWait,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     if wait.state != SessionState::Paused {
-        return Ok(());
+        return Ok(false);
     }
     if machines::stop_for_flyco(db, config, github, hosts, wait.user_id, wait.id).await? {
         tracing::info!(
             session = %wait.id,
             "released the compute of a session waiting out a plan window"
         );
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Starts the machine again, ten minutes before the window turns over.

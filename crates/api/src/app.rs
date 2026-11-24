@@ -2843,79 +2843,123 @@ pub async fn fail_stalled_provisions(
     hosts: &HostRooms,
     at_unix: u64,
 ) -> Result<(), ApiError> {
+    let mut handled = 0_usize;
+    let cap = sessions::MAX_STALLED_PER_SWEEP as usize;
+
     for stalled in sessions::stalled_provisions(db, at_unix).await? {
-        // A row the provider never finished — the queue's job is still
-        // running, still failing, or still following a build it handed
-        // back — is not a machine that "was built", and saying so would
-        // send whoever reads the sentence to look at a daemon that never
-        // existed.
-        let built = machines::for_session(db, stalled.id)
-            .await?
-            .is_some_and(|machine| machine.is_provisioned());
-        // The daemon's own sentence when it managed to send one, because
-        // "never reported its agent ready" is what flyco saw and not what
-        // happened.
-        let reason = match (built, sessions::startup_failure(db, stalled.id).await?) {
-            (false, _) => format!(
-                "the provider had not finished building the machine after {} minutes, so flyco \
-                 stopped waiting for it and released the reservation",
-                flyco_core::PROVISION_DEADLINE_SECS / 60
-            ),
-            (true, None) => "the machine was built but never reported its agent ready, so flyco \
-                             stopped waiting for it and released it"
-                .to_owned(),
-            (true, Some(failure)) => format!(
-                "the machine was built but its agent never started: {failure}. flyco stopped \
-                 waiting for it and released it"
-            ),
-        };
-        // Destroyed first: a machine that never came up is still a machine
-        // running up a bill, and a session flyco has given up on must not
-        // go on paying for one. Resuming builds a new one on the same row.
-        // A provider that refuses is logged rather than raised — the
-        // session is failed either way, and a machine left behind is a
-        // cost to report, not a reason to keep the page spinning.
-        if let Err(error) =
-            machines::destroy_for_archive(db, config, github, hosts, stalled.user_id, stalled.id)
-                .await
-        {
+        if handled >= cap {
+            break;
+        }
+        handled += 1;
+        if let Err(error) = fail_one_stalled(db, config, github, rooms, hosts, &stalled).await {
             tracing::warn!(
                 session = %stalled.id,
                 %error,
-                "a stalled session's machine could not be released"
+                "a stalled session could not be failed"
             );
         }
-        sessions::fail(db, rooms, stalled.id, &reason).await?;
     }
 
     // Handoffs whose uploads never finished run on their own, longer
     // clock: `stalled_provisions` skips them while a pending row exists,
     // and this sweep is what fails the ones the sender walked away from.
-    for abandoned in handoffs::abandoned(db, at_unix).await? {
-        let reason = format!(
-            "the handoff's payloads were not uploaded within {} minutes, so flyco \
-             stopped waiting for them and released the reservation",
-            handoffs::HANDOFF_DEADLINE_SECS / 60
-        );
-        if let Err(error) = machines::destroy_for_archive(
-            db,
-            config,
-            github,
-            hosts,
-            abandoned.user_id,
-            abandoned.id,
-        )
-        .await
+    let remaining = cap.saturating_sub(handled);
+    if remaining == 0 {
+        return Ok(());
+    }
+    for abandoned in handoffs::abandoned(db, at_unix)
+        .await?
+        .into_iter()
+        .take(remaining)
+    {
+        if let Err(error) =
+            fail_one_abandoned_handoff(db, config, github, rooms, hosts, &abandoned).await
         {
             tracing::warn!(
                 session = %abandoned.id,
                 %error,
-                "an abandoned handoff's machine could not be released"
+                "an abandoned handoff could not be failed"
             );
         }
-        sessions::fail(db, rooms, abandoned.id, &reason).await?;
     }
     Ok(())
+}
+
+async fn fail_one_stalled(
+    db: &Db,
+    config: &ApiConfig,
+    github: &impl GithubOauth,
+    rooms: &Rooms,
+    hosts: &HostRooms,
+    stalled: &sessions::IdleSession,
+) -> Result<(), ApiError> {
+    // A row the provider never finished — the queue's job is still
+    // running, still failing, or still following a build it handed
+    // back — is not a machine that "was built", and saying so would
+    // send whoever reads the sentence to look at a daemon that never
+    // existed.
+    let built = machines::for_session(db, stalled.id)
+        .await?
+        .is_some_and(|machine| machine.is_provisioned());
+    // The daemon's own sentence when it managed to send one, because
+    // "never reported its agent ready" is what flyco saw and not what
+    // happened.
+    let reason = match (built, sessions::startup_failure(db, stalled.id).await?) {
+        (false, _) => format!(
+            "the provider had not finished building the machine after {} minutes, so flyco \
+             stopped waiting for it and released the reservation",
+            flyco_core::PROVISION_DEADLINE_SECS / 60
+        ),
+        (true, None) => "the machine was built but never reported its agent ready, so flyco \
+                         stopped waiting for it and released it"
+            .to_owned(),
+        (true, Some(failure)) => format!(
+            "the machine was built but its agent never started: {failure}. flyco stopped \
+             waiting for it and released it"
+        ),
+    };
+    // Destroyed first: a machine that never came up is still a machine
+    // running up a bill, and a session flyco has given up on must not
+    // go on paying for one. Resuming builds a new one on the same row.
+    // A provider that refuses is logged rather than raised — the
+    // session is failed either way, and a machine left behind is a
+    // cost to report, not a reason to keep the page spinning.
+    if let Err(error) =
+        machines::destroy_for_archive(db, config, github, hosts, stalled.user_id, stalled.id).await
+    {
+        tracing::warn!(
+            session = %stalled.id,
+            %error,
+            "a stalled session's machine could not be released"
+        );
+    }
+    sessions::fail(db, rooms, stalled.id, &reason).await
+}
+
+async fn fail_one_abandoned_handoff(
+    db: &Db,
+    config: &ApiConfig,
+    github: &impl GithubOauth,
+    rooms: &Rooms,
+    hosts: &HostRooms,
+    abandoned: &sessions::IdleSession,
+) -> Result<(), ApiError> {
+    let reason = format!(
+        "the handoff's payloads were not uploaded within {} minutes, so flyco \
+         stopped waiting for them and released the reservation",
+        handoffs::HANDOFF_DEADLINE_SECS / 60
+    );
+    if let Err(error) =
+        machines::destroy_for_archive(db, config, github, hosts, abandoned.user_id, abandoned.id)
+            .await
+    {
+        tracing::warn!(
+            session = %abandoned.id,
+            %error,
+            "an abandoned handoff's machine could not be released"
+        );
+    }
+    sessions::fail(db, rooms, abandoned.id, &reason).await
 }
 
 /// Records why this session's daemon stopped before it could report in.

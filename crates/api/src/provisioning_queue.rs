@@ -91,6 +91,18 @@ const RETRY_DELAY: Duration = Duration::from_secs(30);
 /// being one invocation, not a pause for the provider's sake.
 const CONTINUE_DELAY: Duration = Duration::from_secs(10);
 
+/// Most continuation legs one build may run before it is failed outright.
+///
+/// Paired with [`flyco_core::PROVISION_DEADLINE_SECS`] (900 seconds = 90
+/// legs at [`CONTINUE_DELAY`]), this bounds builds that keep answering
+/// `Pending` even when queue deliveries run faster than wall clock or a
+/// legacy message arrived without a `started_at_unix`.
+pub const MAX_CONTINUE_LEGS: u32 = 90;
+
+const fn first_leg() -> u32 {
+    1
+}
+
 /// One job on the provisioning queue.
 ///
 /// The machine id is carried rather than looked up, and that is what makes a
@@ -139,6 +151,17 @@ pub enum ProvisioningJob {
         attempt: u32,
         /// Where the provider's driver got to.
         continuation: Continuation,
+        /// When the build began, seconds since the Unix epoch.
+        ///
+        /// Carried across legs so a build that keeps answering `Pending`
+        /// fails once [`flyco_core::PROVISION_DEADLINE_SECS`] elapses rather
+        /// than polling forever. Defaults to `0` for messages serialized
+        /// before this field existed.
+        #[serde(default)]
+        started_at_unix: u64,
+        /// Which continuation leg this is, counting from one.
+        #[serde(default = "first_leg")]
+        leg: u32,
     },
     /// Put a session back on the machine a provider reclaimed.
     ///
@@ -284,18 +307,22 @@ impl ProvisioningJob {
         }
     }
 
-    /// The first attempt at putting a reclaimed session back.
+    /// The next leg of a build the provider handed back.
     #[must_use]
     pub const fn continuing(
         session: SessionId,
         machine: MachineId,
         continuation: Continuation,
+        started_at_unix: u64,
+        leg: u32,
     ) -> Self {
         Self::Continue {
             session,
             machine,
             attempt: 1,
             continuation,
+            started_at_unix,
+            leg,
         }
     }
 
@@ -424,11 +451,15 @@ impl ProvisioningJob {
                 machine,
                 attempt,
                 continuation,
+                started_at_unix,
+                leg,
             } => Self::Continue {
                 session,
                 machine,
                 attempt: attempt.saturating_add(1),
                 continuation,
+                started_at_unix,
+                leg,
             },
             Self::Recover {
                 session,
@@ -579,6 +610,40 @@ pub async fn consume(
     QueueBatchDisposition::PerMessage(decisions)
 }
 
+/// Handles non-machine catalog/marketplace refresh jobs, returning `None` for
+/// session-scoped jobs that must go through machine claiming and retry logic.
+async fn perform_catalog_job(
+    db: &Db,
+    config: &ApiConfig,
+    kv: &Kv,
+    queue: &Queue,
+    github: &impl GithubOauth,
+    job: &ProvisioningJob,
+) -> Option<Settled> {
+    match job {
+        ProvisioningJob::RefreshCatalog { user, account } => Some(settle(
+            refresh_catalog(db, config, kv, queue, github, *user, *account).await,
+        )),
+        ProvisioningJob::RefreshCatalogRegion {
+            user,
+            account,
+            region,
+        } => Some(settle(
+            refresh_region(db, config, kv, github, *user, *account, region).await,
+        )),
+        ProvisioningJob::RefreshMarketplace {
+            user,
+            repo,
+            git_ref,
+        } => Some(settle(
+            refresh_marketplace(db, config, kv, github, *user, repo, git_ref.clone()).await,
+        )),
+        ProvisioningJob::Provision { .. }
+        | ProvisioningJob::Continue { .. }
+        | ProvisioningJob::Recover { .. } => None,
+    }
+}
+
 /// Performs exactly one job.
 async fn perform(
     db: &Db,
@@ -591,34 +656,8 @@ async fn perform(
 ) -> Settled {
     // A catalog refresh is decided entirely by itself: it never claims a
     // machine row, never counts attempts, and never fails a session.
-    match &job {
-        ProvisioningJob::RefreshCatalog { user, account } => {
-            return settle(
-                refresh_catalog(db, config, kv, queue, clients.github, *user, *account).await,
-            );
-        }
-        ProvisioningJob::RefreshCatalogRegion {
-            user,
-            account,
-            region,
-        } => {
-            return settle(
-                refresh_region(db, config, kv, clients.github, *user, *account, region).await,
-            );
-        }
-        ProvisioningJob::RefreshMarketplace {
-            user,
-            repo,
-            git_ref,
-        } => {
-            return settle(
-                refresh_marketplace(db, config, kv, clients.github, *user, repo, git_ref.clone())
-                    .await,
-            );
-        }
-        ProvisioningJob::Provision { .. }
-        | ProvisioningJob::Continue { .. }
-        | ProvisioningJob::Recover { .. } => {}
+    if let Some(settled) = perform_catalog_job(db, config, kv, queue, clients.github, &job).await {
+        return settled;
     }
 
     let outcome = match job {
@@ -628,7 +667,10 @@ async fn perform(
             Err(error) => return Settled::Redeliver(error),
         },
         ProvisioningJob::Continue {
-            ref continuation, ..
+            ref continuation,
+            started_at_unix,
+            leg,
+            ..
         } => match claim(db, rooms, job.clone()).await {
             Ok(None) => return Settled::Done,
             Ok(Some(claimed)) => {
@@ -641,6 +683,8 @@ async fn perform(
                     clients,
                     &claimed,
                     continuation,
+                    started_at_unix,
+                    leg,
                 )
                 .await
             }
@@ -1204,6 +1248,7 @@ async fn build(
             .map_err(Provisioned::from)?;
     }
 
+    let started_at_unix = now_unix();
     announce(db, rooms, claim.session, ProvisioningStage::Reserving).await;
     let outcome = clients
         .provisioner
@@ -1217,7 +1262,7 @@ async fn build(
         )
         .await
         .map_err(|error| classify(&error))?;
-    settle_build(db, rooms, queue, claim, &entry, outcome).await
+    settle_build(db, rooms, queue, claim, &entry, started_at_unix, 0, outcome).await
 }
 
 /// Carries on a build the provider handed back (issue #257).
@@ -1225,10 +1270,15 @@ async fn build(
 /// The same ending as [`build`], reached without a new bootstrap or a new
 /// `reserving` stage: the machine is the one already being built, and the
 /// user has been watching it since the first leg.
+///
+/// Deliberately does **not** touch `sessions::note_progress`: polling a build
+/// that is still `Pending` is waiting, not a new milestone, so a stuck build
+/// still hits both the 15-minute [`flyco_core::PROVISION_DEADLINE_SECS`]
+/// deadline and [`MAX_CONTINUE_LEGS`] cleanly instead of looping forever.
 #[expect(
     clippy::too_many_arguments,
-    reason = "a continuation names the claim, the continuation token, and \
-              every service the settle touches"
+    reason = "a continuation names the claim, the continuation token, its \
+              deadline bounds, and every service the settle touches"
 )]
 async fn carry_on(
     db: &Db,
@@ -1239,7 +1289,14 @@ async fn carry_on(
     clients: &mut Clients<'_, impl Provisioner, impl GithubOauth>,
     claim: &Claim,
     continuation: &Continuation,
+    started_at_unix: u64,
+    leg: u32,
 ) -> Result<(), Provisioned> {
+    let now = now_unix();
+    if continuation_timed_out(started_at_unix, leg, now) {
+        return Err(Provisioned::Failed(build_timeout_reason()));
+    }
+
     let account = provisioning::account(
         db,
         config,
@@ -1255,30 +1312,64 @@ async fn carry_on(
         .as_provider_machine()
         .map_err(Provisioned::from)?;
 
-    // Progress, as far as the stall sweep is concerned: the provider is
-    // still working, and a session it is working on is not stalled.
-    sessions::note_progress(db, claim.session)
-        .await
-        .map_err(Provisioned::from)?;
+    let effective_started = if started_at_unix == 0 {
+        now
+    } else {
+        started_at_unix
+    };
     let outcome = clients
         .provisioner
         .resume(&account, &pending, continuation)
         .await
         .map_err(|error| classify(&error))?;
-    settle_build(db, rooms, queue, claim, &entry, outcome).await
+    settle_build(
+        db,
+        rooms,
+        queue,
+        claim,
+        &entry,
+        effective_started,
+        leg,
+        outcome,
+    )
+    .await
+}
+
+const fn continuation_timed_out(started_at_unix: u64, leg: u32, now: u64) -> bool {
+    leg > MAX_CONTINUE_LEGS
+        || (started_at_unix > 0
+            && now.saturating_sub(started_at_unix) >= flyco_core::PROVISION_DEADLINE_SECS)
+}
+
+fn build_timeout_reason() -> String {
+    format!(
+        "the provider had not finished building the machine after {} minutes, so flyco \
+         stopped waiting for it and released the reservation",
+        flyco_core::PROVISION_DEADLINE_SECS / 60
+    )
 }
 
 /// Records what a provision or a resumed build answered.
 ///
 /// A machine is recorded and the session told it is booting; a build still
 /// in progress is recorded by what exists of it and asked for again after
-/// [`CONTINUE_DELAY`], so the next leg polls under its own budget.
+/// [`CONTINUE_DELAY`], so the next leg polls under its own budget — until
+/// either [`flyco_core::PROVISION_DEADLINE_SECS`] or [`MAX_CONTINUE_LEGS`]
+/// is reached, at which point the session fails cleanly and the sweep
+/// releases any pending cloud resource.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "settle records the machine, prices it against the catalog entry, \
+              and carries the build's deadline into the next continuation leg"
+)]
 async fn settle_build(
     db: &Db,
     rooms: &Rooms,
     queue: &Queue,
     claim: &Claim,
     entry: &flyco_core::MachineCatalogEntry,
+    started_at_unix: u64,
+    leg: u32,
     outcome: Provisioning,
 ) -> Result<(), Provisioned> {
     let machine = match outcome {
@@ -1288,15 +1379,26 @@ async fn settle_build(
             continuation,
         } => {
             machines::record_pending(db, &machine).await?;
+            let next_leg = leg.saturating_add(1);
+            if continuation_timed_out(started_at_unix, next_leg, now_unix()) {
+                return Err(Provisioned::Failed(build_timeout_reason()));
+            }
             enqueue_after(
                 queue,
-                ProvisioningJob::continuing(claim.session, machine.id, continuation),
+                ProvisioningJob::continuing(
+                    claim.session,
+                    machine.id,
+                    continuation,
+                    started_at_unix,
+                    next_leg,
+                ),
                 CONTINUE_DELAY,
             )
             .await?;
             tracing::info!(
                 session = %claim.session,
                 machine = %machine.id,
+                leg = next_leg,
                 "the provider is still building a session's machine; the build carries on \
                  in its next leg"
             );

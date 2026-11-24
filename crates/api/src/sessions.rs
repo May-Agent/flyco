@@ -23,6 +23,22 @@ use crate::machines;
 use crate::rooms::Rooms;
 use crate::session_repos;
 
+/// Most stalled provisions or abandoned handoffs one scheduled tick fails.
+///
+/// Each stalled session may destroy a cloud machine and broadcast to its room;
+/// bounding the batch keeps the shared minute cron well under the Worker
+/// subrequest ceiling while the next tick picks up any remainder.
+pub const MAX_STALLED_PER_SWEEP: u32 = 3;
+
+/// Most ended sessions whose lingering machines one scheduled tick releases.
+pub const MAX_RELEASE_ENDED_PER_SWEEP: u32 = 3;
+
+/// Most idle sessions one scheduled tick archives.
+pub const MAX_IDLE_ARCHIVES_PER_SWEEP: u32 = 3;
+
+/// Most idle sessions whose machines one scheduled tick suspends.
+pub const MAX_IDLE_SUSPENDS_PER_SWEEP: u32 = 3;
+
 /// The repositories a session checks out, packed into the session row.
 ///
 /// A session's rows are one-to-many with `session_repos`, and the shape
@@ -603,7 +619,10 @@ pub async fn set_budget_limit(
     let row = load(db, user, id).await?;
     let budget = budgets::set_limit(db, row.budget_id, limit).await?;
 
-    if row.state == SessionState::Paused && budget.stage != BudgetStage::Exhausted {
+    if row.state == SessionState::Paused
+        && row.paused_reason != Some(PausedReason::UsageLimit)
+        && budget.stage != BudgetStage::Exhausted
+    {
         let session = transition(db, user, id, SessionState::Active).await?;
         return Ok(BudgetRaise {
             session,
@@ -684,13 +703,29 @@ pub async fn transition(
             to: error.to,
         })?;
 
-    sql!(
-        db,
-        "UPDATE sessions SET state = {next}, last_active_unix = {now_unix()} \
-         WHERE id = {id} AND user_id = {user}"
-    )
-    .execute()
-    .await?;
+    if matches!(
+        next,
+        SessionState::Active | SessionState::Archived | SessionState::Failed
+    ) {
+        sql!(
+            db,
+            "UPDATE sessions SET state = {next}, paused_reason = NULL, \
+             usage_limit_window = NULL, usage_limit_resets_at_unix = NULL, \
+             usage_limit_resume_at_unix = NULL, usage_limit_queued_message = NULL, \
+             last_active_unix = {now_unix()} \
+             WHERE id = {id} AND user_id = {user}"
+        )
+        .execute()
+        .await?;
+    } else {
+        sql!(
+            db,
+            "UPDATE sessions SET state = {next}, last_active_unix = {now_unix()} \
+             WHERE id = {id} AND user_id = {user}"
+        )
+        .execute()
+        .await?;
+    }
 
     find(db, user, id).await
 }
@@ -708,6 +743,21 @@ pub async fn is_owned_by(db: &Db, user: UserId, session: SessionId) -> Result<bo
     .fetch_scalar()
     .await?;
     Ok(owned > 0)
+}
+
+/// The lifecycle state of a session by id alone, or `None` if it is gone.
+///
+/// Used by background sweeps (such as the budget-signal outbox) that have
+/// no authenticated user context and need to drop work for already-terminal
+/// sessions without touching their room.
+///
+/// # Errors
+///
+/// Returns [`ApiError`] if the database fails.
+pub async fn state_by_id(db: &Db, id: SessionId) -> Result<Option<SessionState>, ApiError> {
+    Ok(sql!(db, "SELECT state FROM sessions WHERE id = {id}")
+        .fetch_scalar_optional()
+        .await?)
 }
 
 /// The lifecycle state of one of the caller's sessions.
@@ -915,7 +965,9 @@ pub async fn fail(db: &Db, rooms: &Rooms, id: SessionId, reason: &str) -> Result
     sql!(
         db,
         "UPDATE sessions SET state = {next}, failure_reason = {reason.to_owned()}, \
-         last_active_unix = {now_unix()} WHERE id = {id}"
+         paused_reason = NULL, usage_limit_window = NULL, \
+         usage_limit_resets_at_unix = NULL, usage_limit_resume_at_unix = NULL, \
+         usage_limit_queued_message = NULL, last_active_unix = {now_unix()} WHERE id = {id}"
     )
     .execute()
     .await?;
@@ -1495,6 +1547,7 @@ struct StartupFailure {
 pub async fn stalled_provisions(db: &Db, at_unix: u64) -> Result<Vec<IdleSession>, ApiError> {
     let cutoff = at_unix.saturating_sub(PROVISION_DEADLINE_SECS);
     let provisioning = SessionState::Provisioning;
+    let limit = MAX_STALLED_PER_SWEEP;
     // Pending handoffs are excluded rather than merely given a longer
     // clock: they sit in `provisioning` by design while the sender uploads,
     // so "no machine progress" is the expected state and not a stall.
@@ -1505,7 +1558,8 @@ pub async fn stalled_provisions(db: &Db, at_unix: u64) -> Result<Vec<IdleSession
          WHERE state = {provisioning} AND created_at_unix <= {cutoff} \
          AND last_active_unix <= {cutoff} \
          AND NOT EXISTS (SELECT 1 FROM handoffs h WHERE h.session_id = sessions.id \
-                         AND h.completed_at_unix IS NULL)"
+                         AND h.completed_at_unix IS NULL) \
+         ORDER BY last_active_unix, id LIMIT {limit}"
     )
     .fetch_all()
     .await?)
@@ -1532,12 +1586,14 @@ pub async fn ended_holding_a_machine(db: &Db) -> Result<Vec<IdleSession>, ApiErr
     let failed = SessionState::Failed;
     let archived = SessionState::Archived;
     let destroyed = flyco_core::machine::MachineState::Destroyed;
+    let limit = MAX_RELEASE_ENDED_PER_SWEEP;
     Ok(sql!(
         db,
         "SELECT sessions.id AS id, sessions.user_id AS user_id FROM sessions \
          JOIN machines ON machines.session_id = sessions.id \
          WHERE (sessions.state = {failed} OR sessions.state = {archived}) \
-         AND machines.state != {destroyed}"
+         AND machines.state != {destroyed} \
+         ORDER BY sessions.last_active_unix, sessions.id LIMIT {limit}"
     )
     .fetch_all()
     .await?)
@@ -1562,12 +1618,14 @@ pub async fn idle_since(db: &Db, at_unix: u64) -> Result<Vec<IdleSession>, ApiEr
     let paused = SessionState::Paused;
     let interrupted = SessionState::Interrupted;
     let failed = SessionState::Failed;
+    let limit = MAX_IDLE_ARCHIVES_PER_SWEEP;
     Ok(sql!(
         db,
         "SELECT id, user_id FROM sessions \
          WHERE ((state = {active} OR state = {paused} OR state = {interrupted}) \
                 AND last_active_unix <= {idle_cutoff}) \
-            OR (state = {failed} AND last_active_unix <= {finished_cutoff})"
+            OR (state = {failed} AND last_active_unix <= {finished_cutoff}) \
+         ORDER BY last_active_unix, id LIMIT {limit}"
     )
     .fetch_all()
     .await?)
@@ -1612,6 +1670,7 @@ pub async fn suspendable(db: &Db, at_unix: u64) -> Result<Vec<IdleSession>, ApiE
     let pending = ApprovalState::Pending;
     let running = flyco_core::machine::MachineState::Running;
     let deallocated = flyco_core::machine::MachineState::Deallocated;
+    let limit = MAX_IDLE_SUSPENDS_PER_SWEEP;
     Ok(sql!(
         db,
         "SELECT sessions.id AS id, sessions.user_id AS user_id FROM sessions \
@@ -1625,7 +1684,8 @@ pub async fn suspendable(db: &Db, at_unix: u64) -> Result<Vec<IdleSession>, ApiE
                          AND approvals.created_at_unix <= {cutoff})) \
          AND (sessions.awake_until_unix IS NULL \
               OR sessions.awake_until_unix <= {at_unix}) \
-         AND (machines.state = {running} OR machines.state = {deallocated})"
+         AND (machines.state = {running} OR machines.state = {deallocated}) \
+         ORDER BY sessions.last_active_unix, sessions.id LIMIT {limit}"
     )
     .fetch_all()
     .await?)
@@ -1708,7 +1768,9 @@ pub async fn pause_for_usage_limit(
     .await?
     .ok_or(ApiError::SessionNotFound)?;
     let limit = PausedReason::UsageLimit;
-    if row.paused_reason == Some(limit) {
+    if !matches!(row.state, SessionState::Archived | SessionState::Failed)
+        && row.paused_reason == Some(limit)
+    {
         return Ok(false);
     }
     let next = row
@@ -1762,18 +1824,21 @@ pub async fn queue_usage_limit_message(
     text: &str,
 ) -> Result<bool, ApiError> {
     let limit = PausedReason::UsageLimit;
+    let archived = SessionState::Archived;
+    let failed = SessionState::Failed;
     let written = sql!(
         db,
         "UPDATE sessions SET usage_limit_queued_message = {text}, \
          last_active_unix = {now_unix()} \
-         WHERE id = {id} AND user_id = {user} AND paused_reason = {limit}"
+         WHERE id = {id} AND user_id = {user} AND paused_reason = {limit} \
+         AND state != {archived} AND state != {failed}"
     )
     .execute()
     .await?;
     Ok(written.rows_written > 0)
 }
 
-/// Every session waiting out a spent plan window.
+/// Every non-terminal session waiting out a spent plan window.
 ///
 /// Not filtered by time: the sweep has three different deadlines to compare
 /// each row against, and a query per deadline would read the same handful of
@@ -1786,12 +1851,15 @@ pub async fn queue_usage_limit_message(
 /// Returns [`ApiError`] if the database fails.
 pub async fn usage_limit_waits(db: &Db) -> Result<Vec<UsageLimitWait>, ApiError> {
     let limit = PausedReason::UsageLimit;
+    let archived = SessionState::Archived;
+    let failed = SessionState::Failed;
     Ok(sql!(
         db,
         "SELECT id, user_id, state, usage_limit_window, usage_limit_resets_at_unix, \
          usage_limit_resume_at_unix, usage_limit_queued_message FROM sessions \
          WHERE paused_reason = {limit} AND usage_limit_window IS NOT NULL \
          AND usage_limit_resets_at_unix IS NOT NULL \
+         AND state != {archived} AND state != {failed} \
          ORDER BY usage_limit_resets_at_unix"
     )
     .fetch_all()

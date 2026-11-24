@@ -5097,6 +5097,16 @@ export interface components {
         HostState: "online" | "offline" | "draining" | "removed";
         /** @description Messages from an enrolled machine to the control plane. */
         HostToControl: {
+            /**
+             * Format: int64
+             * @description The room command sequence this result answers.
+             *
+             *     Optional on the wire so older daemons that do not send it still
+             *     deserialize; the host room retires `WHERE seq = command_seq` when
+             *     present and falls back to the oldest row for the container only
+             *     when absent.
+             */
+            command_seq?: number | null;
             /** @description The machine the job acted on, which is the job's identity. */
             job_id: components["schemas"]["Uuid"];
             /** @description What came of it. */

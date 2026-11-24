@@ -46,7 +46,7 @@ use std::time::Duration;
 use flyco_core::Problem;
 use flyco_core::host::HostFacts;
 use flyco_provider::host::{
-    ControlToHost, HostAttach, HostCommand, HostFrames, HostToControl, container_name,
+    ContainerJob, ControlToHost, HostAttach, HostCommand, HostFrames, HostToControl, container_name,
 };
 use serde::{Deserialize, Serialize};
 use skyzen::durable::{DurableObject, DurableObjectError};
@@ -63,7 +63,7 @@ use crate::clock::now_unix;
 use crate::extract::Headers;
 use crate::problem::Outcome;
 use crate::respond::NoContent;
-use crate::room::{HEADER_INTERNAL, INTERNAL};
+use crate::room::{BatchGate, HEADER_INTERNAL, INTERNAL};
 use crate::schema_version::Cache;
 use crate::sse::Signal;
 
@@ -82,6 +82,12 @@ const PRESENCE_REFRESH_SECONDS: u64 = 10;
 
 /// Most queued commands one SSE step reads at a time.
 const COMMAND_BATCH_LIMIT: u64 = 256;
+
+/// Most frame-log rows written in one atomic multi-row `INSERT` statement.
+///
+/// Four bound parameters per row keeps each statement at 80 bindings, safely
+/// inside Cloudflare Durable Object SQLite's 100-parameter limit.
+const MAX_FRAME_ROWS_PER_STATEMENT: usize = 20;
 
 /// KV key holding the facts the machine last reported.
 const KEY_FACTS: &str = "host:facts";
@@ -145,6 +151,10 @@ pub struct HostRoom {
     /// Wakes open command streams on new mailbox rows or a superseding attach.
     #[serde(skip)]
     commands: Signal,
+    /// Serializes concurrent `accept_frames` batches on this activation so
+    /// overlapping retries never read the same `through` cursor.
+    #[serde(skip)]
+    batch_gate: BatchGate,
 }
 
 impl DurableObject for HostRoom {
@@ -162,6 +172,7 @@ impl DurableObject for HostRoom {
         ))
         .with(State(self.schema.clone()))
         .with(State(self.commands.clone()))
+        .with(State(self.batch_gate.clone()))
         .build()
     }
 }
@@ -216,6 +227,10 @@ async fn attach_inner(
         .await
         .map_err(|error| room_failed(&error))?;
     sql!(db, "DELETE FROM host_frames WHERE epoch != {epoch}")
+        .execute()
+        .await
+        .map_err(|error| room_failed(&error))?;
+    sql!(db, "DELETE FROM host_frame_log WHERE epoch != {epoch}")
         .execute()
         .await
         .map_err(|error| room_failed(&error))?;
@@ -445,9 +460,12 @@ async fn accept_frames(
     headers: Headers,
     Json(batch): Json<HostFrames>,
     State(cache): State<Cache>,
+    State(batch_gate): State<BatchGate>,
     db: DurableDb,
 ) -> Outcome<NoContent> {
-    accept_batch(&headers, batch, &db, &cache).await.into()
+    accept_batch(&headers, batch, &db, &cache, &batch_gate)
+        .await
+        .into()
 }
 
 async fn accept_batch(
@@ -455,8 +473,10 @@ async fn accept_batch(
     batch: HostFrames,
     db: &DurableDb,
     cache: &Cache,
+    batch_gate: &BatchGate,
 ) -> Result<NoContent, ApiError> {
     internal(headers)?;
+    let _guard = batch_gate.lock().await;
     ensure_schema(db, cache)
         .await
         .map_err(|error| room_failed(&error))?;
@@ -490,38 +510,47 @@ async fn accept_batch(
     }
     let skip = usize::try_from(next.saturating_sub(batch.from_seq)).unwrap_or(usize::MAX);
     let fresh = batch.frames.get(skip..).unwrap_or(&[]);
-    for frame in fresh {
-        match frame {
-            HostToControl::JobResult { job_id, outcome } => {
-                tracing::info!(
-                    machine = %job_id,
-                    outcome = ?core::mem::discriminant(outcome),
-                    "a host answered a container job"
-                );
-                // Keyed by the container the job named, which is how the
-                // mailbox holds it: the name is derived from the machine
-                // id, so the answer and the job agree without a second
-                // column.
-                answered(db, &container_name(*job_id), cache)
-                    .await
-                    .map_err(|error| room_failed(&error))?;
+    let first_fresh_seq = batch
+        .from_seq
+        .saturating_add(u64::try_from(skip).unwrap_or(0));
+
+    // Apply frames and advance `host_frames.through` atomically in chunks via
+    // `host_frame_log`'s `AFTER INSERT` trigger. A failure rolls back the
+    // whole SQLite statement so `host_commands` and `host_frames.through`
+    // never drift apart.
+    for (chunk_idx, chunk) in fresh.chunks(MAX_FRAME_ROWS_PER_STATEMENT).enumerate() {
+        let base_seq = first_fresh_seq
+            .saturating_add(u64::try_from(chunk_idx * MAX_FRAME_ROWS_PER_STATEMENT).unwrap_or(0));
+        let placeholders = vec!["(?, ?, ?, ?)"; chunk.len()].join(", ");
+        let statement = format!(
+            "INSERT OR IGNORE INTO host_frame_log (epoch, frame_seq, machine, command_seq) \
+             VALUES {placeholders}"
+        );
+        let mut query = db.query(&statement);
+        for (offset, frame) in chunk.iter().enumerate() {
+            let frame_seq = base_seq.saturating_add(u64::try_from(offset).unwrap_or(0));
+            match frame {
+                HostToControl::JobResult {
+                    job_id,
+                    outcome,
+                    command_seq,
+                } => {
+                    tracing::info!(
+                        machine = %job_id,
+                        command_seq,
+                        outcome = ?core::mem::discriminant(outcome),
+                        "a host answered a container job"
+                    );
+                    let container = container_name(*job_id);
+                    query = query
+                        .bind(epoch)
+                        .bind(frame_seq)
+                        .bind(container)
+                        .bind(*command_seq);
+                }
             }
         }
-    }
-    if !batch.frames.is_empty() {
-        let new_through = batch
-            .from_seq
-            .saturating_add(u64::try_from(batch.frames.len()).unwrap_or(0))
-            .saturating_sub(1);
-        sql!(
-            db,
-            "INSERT INTO host_frames (epoch, through) VALUES ({epoch}, {new_through}) \
-             ON CONFLICT (epoch) DO UPDATE SET \
-                 through = max(excluded.through, host_frames.through)"
-        )
-        .execute()
-        .await
-        .map_err(|error| room_failed(&error))?;
+        query.execute().await.map_err(|error| room_failed(&error))?;
     }
 
     // Ephemeral rows — a `Revoked` — are retired by acknowledgement. Job
@@ -592,40 +621,49 @@ async fn hold(
     Ok(())
 }
 
-/// Forgets the oldest outstanding job for one container.
+/// Drops outstanding container jobs when a host is revoked.
 ///
-/// The oldest rather than all of them: a session that was created and
-/// then stopped has two jobs on the same container, and the answer to the
-/// first says nothing about the second.
-async fn answered(
+/// When `keep_stops` is true (a live host is currently streaming commands),
+/// `ContainerJob::Stop` rows are preserved so the host drains running
+/// containers before acting on the `Revoked` command queued right after them,
+/// while pending `Create`/`Start`/`Remove` rows are cancelled. When the host
+/// is offline (`keep_stops == false`), its token is already revoked and it
+/// can never attach again, so every pending job row is cleared.
+async fn forget_jobs(
     db: &DurableDb,
-    container: &str,
     cache: &Cache,
+    keep_stops: bool,
 ) -> Result<(), DurableObjectError> {
     ensure_schema(db, cache).await?;
-    sql!(
+    if !keep_stops {
+        sql!(db, "DELETE FROM host_commands WHERE machine IS NOT NULL")
+            .execute()
+            .await
+            .map_err(|error| stored(&error))?;
+        return Ok(());
+    }
+
+    let rows: Vec<CommandRow> = sql!(
         db,
-        "DELETE FROM host_commands WHERE seq = \
-         (SELECT MIN(seq) FROM host_commands WHERE machine = {container})"
+        "SELECT seq, json FROM host_commands WHERE machine IS NOT NULL"
     )
-    .execute()
+    .fetch_all()
     .await
     .map_err(|error| stored(&error))?;
-    Ok(())
-}
-
-/// Drops every outstanding container job.
-///
-/// A revoked host will never attach again, so a job left in its mailbox
-/// is work that is never going to happen: keeping it would make the
-/// room's own status lie about what is pending. Non-job rows are left —
-/// the `Revoked` itself is one, and it is owed delivery.
-async fn forget_jobs(db: &DurableDb, cache: &Cache) -> Result<(), DurableObjectError> {
-    ensure_schema(db, cache).await?;
-    sql!(db, "DELETE FROM host_commands WHERE machine IS NOT NULL")
-        .execute()
-        .await
-        .map_err(|error| stored(&error))?;
+    for row in rows {
+        let is_stop = matches!(
+            serde_json::from_value::<ControlToHost>(row.json),
+            Ok(ControlToHost::Run {
+                job: ContainerJob::Stop { .. }
+            })
+        );
+        if !is_stop {
+            sql!(db, "DELETE FROM host_commands WHERE seq = {row.seq}")
+                .execute()
+                .await
+                .map_err(|error| stored(&error))?;
+        }
+    }
     Ok(())
 }
 
@@ -648,7 +686,7 @@ async fn pending_jobs(db: &DurableDb, cache: &Cache) -> Result<u32, DurableObjec
 /// itself remembers having read it: checking an answer the object already
 /// holds costs nothing at all. Bump it when the DDL below changes so a
 /// room built by an older build upgrades once, on its next call.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Creates the mailbox if this is the room's first write.
 ///
@@ -662,9 +700,9 @@ async fn ensure_schema(db: &DurableDb, cache: &Cache) -> Result<(), DurableObjec
         SCHEMA_VERSION,
         &[
             // Every command owed to the host. `machine` names the container a
-            // job acts on — the answer deletes by it — and is NULL for the
-            // commands that are not container work, which acknowledgement
-            // deletes instead.
+            // job acts on — the answer deletes by `seq` (or oldest for that
+            // container when a legacy daemon omits `command_seq`) — and is
+            // NULL for non-job commands, which acknowledgement deletes instead.
             "CREATE TABLE IF NOT EXISTS host_commands (\
              seq     INTEGER PRIMARY KEY AUTOINCREMENT, \
              machine TEXT, \
@@ -682,6 +720,27 @@ async fn ensure_schema(db: &DurableDb, cache: &Cache) -> Result<(), DurableObjec
             "CREATE TABLE IF NOT EXISTS host_frames (\
              epoch   INTEGER PRIMARY KEY, \
              through INTEGER NOT NULL)",
+            // Per-frame receipt log for atomic, idempotent batch application.
+            // Inserting rows here fires `host_frame_log_apply` in the same
+            // implicit SQLite transaction, retiring each answered job and
+            // advancing `host_frames.through` atomically without BEGIN/COMMIT.
+            "CREATE TABLE IF NOT EXISTS host_frame_log (\
+             epoch       INTEGER NOT NULL, \
+             frame_seq   INTEGER NOT NULL, \
+             machine     TEXT    NOT NULL, \
+             command_seq INTEGER, \
+             PRIMARY KEY (epoch, frame_seq))",
+            "CREATE TRIGGER IF NOT EXISTS host_frame_log_apply \
+             AFTER INSERT ON host_frame_log \
+             BEGIN \
+                 DELETE FROM host_commands \
+                 WHERE (NEW.command_seq IS NOT NULL AND seq = NEW.command_seq AND machine = NEW.machine) \
+                    OR (NEW.command_seq IS NULL AND seq = (\
+                        SELECT MIN(seq) FROM host_commands WHERE machine = NEW.machine)); \
+                 INSERT INTO host_frames (epoch, through) VALUES (NEW.epoch, NEW.frame_seq) \
+                 ON CONFLICT (epoch) DO UPDATE SET \
+                     through = max(excluded.through, host_frames.through); \
+             END",
             // The room's row-read ledger — one row per UTC day, debited by
             // `row_budget::charge_reads`, and the circuit breaker that keeps a
             // runaway reader here from spending the account's quota.
@@ -807,23 +866,26 @@ async fn dispatch_command(
                 "superseded is the room's own last word on a superseded stream, not a command it accepts",
             ))));
         }
-        _ if live => {
+        ControlToHost::Revoked if live => {
+            // Cancel non-Stop jobs first, preserving any `ContainerJob::Stop`
+            // drain rows, then enqueue `Revoked` strictly after them in `seq`
+            // order so the live host drains stops before exiting.
+            forget_jobs(db, cache, true)
+                .await
+                .map_err(|error| room_failed(&error))?;
             hold(db, None, command, cache, commands)
                 .await
                 .map_err(|error| room_failed(&error))?;
         }
         ControlToHost::Revoked => {
+            forget_jobs(db, cache, false)
+                .await
+                .map_err(|error| room_failed(&error))?;
             tracing::warn!(
                 ?command,
                 "dropped a command: this host has no live attachment"
             );
         }
-    }
-
-    if matches!(command, ControlToHost::Revoked) {
-        forget_jobs(db, cache)
-            .await
-            .map_err(|error| room_failed(&error))?;
     }
     Ok(NoContent)
 }

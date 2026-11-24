@@ -37,6 +37,7 @@ use flyco_core::{
     ReportJobResult, UpdateHost, UserId,
 };
 use flyco_provider::host::{ContainerJob, ControlToHost};
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use serde::Deserialize;
 use skyzen::extract::Query;
 use skyzen::routing::{CreateRouteNode, Params, Route, RouteNode, Routes as _};
@@ -266,6 +267,17 @@ pub async fn enroll(
     })
 }
 
+/// How stale an online host's `last_seen_unix` may be before a read stamps D1
+/// again when `state` and `facts` are unchanged.
+///
+/// Matches [`crate::api_keys::TOUCH_EVERY_SECONDS`]: `GET /v1/hosts` and
+/// `GET /v1/hosts/{id}` are read routes and must not perform an unconditional
+/// D1 write on every call.
+pub const LAST_SEEN_EVERY_SECONDS: u64 = 3_600;
+
+/// Maximum number of host Durable Objects [`list`] refreshes concurrently.
+const HOST_LIST_CONCURRENCY: usize = 8;
+
 /// Lists the caller's hosts, refreshed from their rooms.
 ///
 /// # Errors
@@ -282,11 +294,11 @@ pub async fn list(db: &Db, rooms: &HostRooms, user: UserId) -> Result<Vec<HostVi
     .fetch_all()
     .await?;
 
-    let mut views = Vec::with_capacity(rows.len());
-    for row in rows {
-        views.push(refresh(db, rooms, row).await?);
-    }
-    Ok(views)
+    futures_util::stream::iter(rows)
+        .map(|row| refresh(db, rooms, row))
+        .buffered(HOST_LIST_CONCURRENCY)
+        .try_collect()
+        .await
 }
 
 /// Loads one of the caller's hosts.
@@ -377,8 +389,12 @@ pub async fn refresh(db: &Db, rooms: &HostRooms, row: HostRow) -> Result<HostVie
         HostState::Offline
     };
     let facts = status.facts.unwrap_or_else(|| row.facts.clone());
-    let last_seen = if status.connected {
-        Some(now_unix())
+    let now = now_unix();
+    let stamp_due = row
+        .last_seen_unix
+        .is_none_or(|stamped| now.saturating_sub(stamped) >= LAST_SEEN_EVERY_SECONDS);
+    let last_seen = if status.connected && (state != row.state || facts != row.facts || stamp_due) {
+        Some(now)
     } else {
         row.last_seen_unix
     };

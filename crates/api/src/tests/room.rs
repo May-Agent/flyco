@@ -1971,3 +1971,100 @@ async fn a_quiet_stream_still_says_it_is_alive() {
         }
     }
 }
+
+#[skyzen::test]
+async fn accept_batch_commits_events_turns_and_through_atomically_and_deduplicates_retries() {
+    let mut room = Room::open().await;
+    room.greet().await;
+    let epoch = room.epoch.expect("attached");
+
+    // 1. Send a multi-frame batch containing a full turn; verify events,
+    // turns projection, and daemon_frames.through all advance together.
+    let batch = DaemonFrames {
+        epoch,
+        from_seq: 1,
+        ack_through: 0,
+        frames: vec![
+            DaemonToControl::Harness {
+                event: HarnessEvent::TurnStarted {
+                    turn_id: "t-atomic".to_owned(),
+                },
+            },
+            DaemonToControl::Harness {
+                event: HarnessEvent::AssistantDelta {
+                    turn_id: "t-atomic".to_owned(),
+                    text: "hello".to_owned(),
+                },
+            },
+            DaemonToControl::Harness {
+                event: HarnessEvent::TurnCompleted {
+                    turn_id: "t-atomic".to_owned(),
+                    usage: flyco_core::UsageReport {
+                        input_tokens: 5,
+                        output_tokens: 7,
+                        context: None,
+                        estimated_cost: None,
+                    },
+                },
+            },
+        ],
+    };
+
+    let (status, _) = room.deliver_raw(&batch).await;
+    assert_eq!(status, 200);
+    assert_eq!(room.events(0).await.events.len(), 3);
+
+    // 2. Retransmitting the exact same batch (or an overlapping tail) must not
+    // duplicate any event or turn.
+    let (status, _) = room.deliver_raw(&batch).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        room.events(0).await.events.len(),
+        3,
+        "retrying an already-applied batch must not duplicate events"
+    );
+
+    let overlapping = DaemonFrames {
+        epoch,
+        from_seq: 2,
+        ack_through: 0,
+        frames: vec![
+            batch.frames[1].clone(),
+            batch.frames[2].clone(),
+            DaemonToControl::Harness {
+                event: HarnessEvent::AssistantDelta {
+                    turn_id: "t-atomic".to_owned(),
+                    text: "tail".to_owned(),
+                },
+            },
+        ],
+    };
+    let (status, _) = room.deliver_raw(&overlapping).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        room.events(0).await.events.len(),
+        4,
+        "only the one frame past `through` is appended"
+    );
+
+    // 3. Verify `daemon_frames.through` matches the applied frame count.
+    let db = DurableDb::new(room.db.clone());
+    let through: u64 = skyzen::sql!(
+        db,
+        "SELECT through FROM daemon_frames WHERE epoch = {epoch}"
+    )
+    .fetch_scalar()
+    .await
+    .expect("through");
+    assert_eq!(through, 4);
+
+    // 4. Verify `turns` was projected atomically from the batch.
+    let (status, body) = room
+        .call(Method::GET, "/internal/turns?after=0&limit=10", None)
+        .await;
+    assert_eq!(status, 200);
+    let turns: flyco_core::TurnPage = serde_json::from_slice(&body).expect("turn page");
+    assert_eq!(turns.turns.len(), 1);
+    assert_eq!(turns.turns[0].turn_id, "t-atomic");
+    assert!(turns.turns[0].completed_at_unix.is_some());
+}
