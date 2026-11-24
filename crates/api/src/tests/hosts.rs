@@ -178,14 +178,14 @@ async fn an_expired_or_unknown_token_enrolls_nothing(ctx: TestContext, kv: Kv, d
         response.assert_status(410);
     }
 
-    assert!(
+    assert_eq!(
         client
             .get("/v1/hosts")
             .bearer(&session)
             .send()
             .await
-            .json::<Vec<HostView>>()
-            .is_empty()
+            .json::<Vec<HostView>>(),
+        [] as [flyco_core::HostView; 0]
     );
 }
 
@@ -220,7 +220,10 @@ async fn an_enrolled_machine_is_a_provider_account_offering_itself(
         .bearer(&session)
         .send()
         .await;
-    assert!(catalog.json::<MachineCatalog>().entries.is_empty());
+    assert_eq!(
+        catalog.json::<MachineCatalog>().entries,
+        [] as [flyco_core::MachineCatalogEntry; 0]
+    );
 
     // The relay upgrade is where the control plane sees it arrive.
     connect(&client, enrolled.host_id, &enrolled.host_token).await;
@@ -741,33 +744,33 @@ async fn removing_a_machine_with_a_session_on_it_is_refused_until_forced(
     );
 
     // It is gone from every list it was in, and offers nothing.
-    assert!(
+    assert_eq!(
         client
             .get("/v1/hosts")
             .bearer(&caller.token)
             .send()
             .await
-            .json::<Vec<HostView>>()
-            .is_empty()
+            .json::<Vec<HostView>>(),
+        [] as [flyco_core::HostView; 0]
     );
-    assert!(
+    assert_eq!(
         client
             .get("/v1/providers")
             .bearer(&caller.token)
             .send()
             .await
-            .json::<Vec<ProviderAccountView>>()
-            .is_empty()
+            .json::<Vec<ProviderAccountView>>(),
+        [] as [flyco_core::ProviderAccountView; 0]
     );
-    assert!(
+    assert_eq!(
         client
             .get("/v1/machines/catalog")
             .bearer(&caller.token)
             .send()
             .await
             .json::<MachineCatalog>()
-            .entries
-            .is_empty()
+            .entries,
+        [] as [flyco_core::MachineCatalogEntry; 0]
     );
 }
 

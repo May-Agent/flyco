@@ -99,7 +99,7 @@ async fn one_objects_budget_leaves_anothers_alone() {
 #[skyzen::test]
 async fn an_empty_events_page_leaves_the_ledger_unwritten() {
     let session = SessionId::generate();
-    let mut object = SessionRoom::default();
+    let object = SessionRoom::default();
     let backend = InMemoryDurableDb::in_memory()
         .await
         .expect("an in-memory database");
@@ -131,7 +131,7 @@ async fn an_empty_events_page_leaves_the_ledger_unwritten() {
 #[skyzen::test]
 async fn an_events_page_is_billed_the_rows_it_returned() {
     let session = SessionId::generate();
-    let mut object = SessionRoom::default();
+    let object = SessionRoom::default();
     let backend = InMemoryDurableDb::in_memory()
         .await
         .expect("an in-memory database");
@@ -181,7 +181,7 @@ async fn an_events_page_is_billed_the_rows_it_returned() {
 #[skyzen::test]
 async fn a_room_past_its_budget_answers_429() {
     let session = SessionId::generate();
-    let mut object = SessionRoom::default();
+    let object = SessionRoom::default();
     let backend = InMemoryDurableDb::in_memory()
         .await
         .expect("an in-memory database");
@@ -213,4 +213,277 @@ async fn a_room_past_its_budget_answers_429() {
         ROWS_PER_DAY,
         "a refused page debits nothing"
     );
+}
+
+#[derive(Debug, Clone)]
+struct CountingStreamDb {
+    inner: skyzen_services::durable::SqliteDurableDb,
+    table: &'static str,
+    selects: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingStreamDb {
+    async fn open(table: &'static str) -> Self {
+        Self {
+            inner: skyzen_services::durable::SqliteDurableDb::in_memory()
+                .await
+                .expect("an in-memory database"),
+            table,
+            selects: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    fn reset(&self) {
+        self.selects.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn count(&self) -> usize {
+        self.selects.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl skyzen_services::DurableDbBackend for CountingStreamDb {
+    async fn query(
+        &self,
+        query: &str,
+        params: &[skyzen_services::DbValue],
+    ) -> Result<skyzen_services::DbExecResult, skyzen_services::DurableDbError> {
+        if query.contains(self.table) && query.contains("WHERE seq >") {
+            self.selects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.query(query, params).await
+    }
+
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[skyzen_services::DbValue],
+    ) -> Result<skyzen_services::DbExecResult, skyzen_services::DurableDbError> {
+        self.inner.execute(query, params).await
+    }
+
+    async fn database_size(&self) -> Result<u64, skyzen_services::DurableDbError> {
+        self.inner.database_size().await
+    }
+
+    async fn sync(&self) -> Result<(), skyzen_services::DurableDbError> {
+        self.inner.sync().await
+    }
+}
+
+async fn assert_sse_eof(response: skyzen::Response, label: &str) {
+    use std::time::Duration;
+
+    use futures_util::StreamExt as _;
+
+    assert_eq!(response.status().as_u16(), 200);
+    let mut sse = response.into_body().into_sse();
+    let timeout = futures_timer::Delay::new(Duration::from_secs(5));
+    let next_item = sse.next();
+    futures_util::pin_mut!(next_item, timeout);
+    match futures_util::future::select(next_item, timeout).await {
+        futures_util::future::Either::Left((None, _)) => {}
+        futures_util::future::Either::Left((Some(item), _)) => {
+            panic!("expected {label} EOF on exhausted budget, got {item:?}")
+        }
+        futures_util::future::Either::Right(_) => {
+            panic!("{label} timed out instead of closing on exhausted budget")
+        }
+    }
+}
+
+#[skyzen::test]
+async fn an_exhausted_row_budget_closes_session_command_and_desktop_streams() {
+    use flyco_core::wire::{DaemonAttach, DaemonFrames};
+    use flyco_core::{ControlToDaemon, DaemonToControl, WIRE_PROTOCOL_VERSION};
+    use skyzen_services::durable::DurableKv;
+    use skyzen_test::mock::InMemoryDurableKv;
+
+    let cmd_db = CountingStreamDb::open("FROM daemon_commands").await;
+    let kv = InMemoryDurableKv::new();
+    let session = SessionId::generate();
+    let object = SessionRoom::default();
+
+    let make_req = |db: &CountingStreamDb, method: Method, path: &str, body: Option<Vec<u8>>| {
+        let mut request = room_request(session, method, path, body);
+        request.extensions_mut().insert(DurableDb::new(db.clone()));
+        request.extensions_mut().insert(DurableKv::new(kv.clone()));
+        request
+    };
+
+    for (path, body) in [
+        (
+            "/internal/daemon-attach",
+            serde_json::to_vec(&DaemonAttach {
+                protocol_version: WIRE_PROTOCOL_VERSION,
+            })
+            .expect("serialize"),
+        ),
+        (
+            "/internal/command",
+            serde_json::to_vec(&ControlToDaemon::UserMessage {
+                text: "queued".to_owned(),
+                origin: MessageOrigin::User,
+            })
+            .expect("serialize"),
+        ),
+        (
+            "/internal/frames",
+            serde_json::to_vec(&DaemonFrames {
+                epoch: 1,
+                from_seq: 1,
+                ack_through: 0,
+                frames: vec![DaemonToControl::DesktopChunk {
+                    keyframe: true,
+                    data: b"key".to_vec(),
+                }],
+            })
+            .expect("serialize"),
+        ),
+    ] {
+        let resp = object
+            .fetch()
+            .go(make_req(&cmd_db, Method::POST, path, Some(body)))
+            .await
+            .expect("room answered");
+        assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    let db = DurableDb::new(cmd_db.clone());
+    charge_reads(&db, ROWS_PER_DAY)
+        .await
+        .expect("spend the day's budget");
+    cmd_db.reset();
+
+    let commands_resp = object
+        .fetch()
+        .go(make_req(
+            &cmd_db,
+            Method::GET,
+            "/internal/commands?epoch=1",
+            None,
+        ))
+        .await
+        .expect("command stream answered");
+    assert_sse_eof(commands_resp, "command stream").await;
+    assert_eq!(
+        cmd_db.count(),
+        0,
+        "command stream must not query daemon_commands once budget is exhausted"
+    );
+
+    let chunk_db = CountingStreamDb {
+        inner: cmd_db.inner.clone(),
+        table: "FROM desktop_chunks",
+        selects: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    let desktop_resp = object
+        .fetch()
+        .go(make_req(
+            &chunk_db,
+            Method::GET,
+            "/internal/desktop/watch",
+            None,
+        ))
+        .await
+        .expect("desktop stream answered");
+    assert_sse_eof(desktop_resp, "desktop stream").await;
+    assert_eq!(
+        chunk_db.count(),
+        0,
+        "desktop stream must not query desktop_chunks once budget is exhausted"
+    );
+    assert_eq!(rows_billed(&db).await, ROWS_PER_DAY);
+}
+
+#[skyzen::test]
+async fn an_exhausted_row_budget_closes_host_command_stream() {
+    use flyco_core::{HostId, MachineId};
+    use flyco_provider::host::{ContainerJob, ControlToHost, HostAttach, container_name};
+    use skyzen::Body;
+    use skyzen_services::durable::DurableKv;
+    use skyzen_test::mock::InMemoryDurableKv;
+
+    use crate::host_room::{HEADER_HOST, HostRoom};
+    use crate::room::{HEADER_INTERNAL, INTERNAL};
+
+    let backend = CountingStreamDb::open("FROM host_commands").await;
+    let kv = InMemoryDurableKv::new();
+    let host = HostId::generate();
+    let object = HostRoom::default();
+
+    let make_req = |method: Method, path: &str, body: Option<Vec<u8>>| {
+        let mut request = Request::new(body.map_or_else(Body::empty, Body::from));
+        *request.method_mut() = method;
+        *request.uri_mut() = format!("https://host-room.flyco.invalid{path}")
+            .parse()
+            .expect("a valid host room URL");
+        request
+            .headers_mut()
+            .insert(HEADER_INTERNAL, INTERNAL.parse().expect("valid header"));
+        request
+            .headers_mut()
+            .insert(HEADER_HOST, host.to_string().parse().expect("valid header"));
+        request.headers_mut().insert(
+            skyzen::header::CONTENT_TYPE,
+            skyzen::header::HeaderValue::from_static("application/json"),
+        );
+        request
+            .extensions_mut()
+            .insert(DurableDb::new(backend.clone()));
+        request.extensions_mut().insert(DurableKv::new(kv.clone()));
+        request
+    };
+
+    let attach = object
+        .fetch()
+        .go(make_req(
+            Method::POST,
+            "/internal/attach",
+            Some(
+                serde_json::to_vec(&HostAttach {
+                    facts: Box::new(crate::testing::host_facts()),
+                })
+                .expect("serialize"),
+            ),
+        ))
+        .await
+        .expect("attach answered");
+    assert_eq!(attach.status().as_u16(), 200);
+
+    let job = ControlToHost::Run {
+        job: ContainerJob::Stop {
+            container: container_name(MachineId::generate()),
+        },
+    };
+    let queued = object
+        .fetch()
+        .go(make_req(
+            Method::POST,
+            "/internal/command",
+            Some(serde_json::to_vec(&job).expect("serialize")),
+        ))
+        .await
+        .expect("command answered");
+    assert_eq!(queued.status().as_u16(), 204);
+
+    let db = DurableDb::new(backend.clone());
+    charge_reads(&db, ROWS_PER_DAY)
+        .await
+        .expect("spend the day's budget");
+    backend.reset();
+
+    let stream_resp = object
+        .fetch()
+        .go(make_req(Method::GET, "/internal/commands?epoch=1", None))
+        .await
+        .expect("host command stream answered");
+    assert_sse_eof(stream_resp, "host command stream").await;
+    assert_eq!(
+        backend.count(),
+        0,
+        "host command stream must not query host_commands once budget is exhausted"
+    );
+    assert_eq!(rows_billed(&db).await, ROWS_PER_DAY);
 }

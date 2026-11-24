@@ -255,7 +255,10 @@ fn unpack(mount: &SkillMount, bundle: Vec<u8>, limit: u64) -> Result<Vec<Entry>,
         let mut entry = archive
             .by_index(index)
             .map_err(|error| bad(error.to_string()))?;
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|error| bad(error.to_string()))?
+            .into_owned();
         // `enclosed_name` refuses `..` but *rewrites* an absolute path —
         // `/etc/x` would land at `<dir>/etc/x` — so the raw name is
         // checked too: every component must be ordinary or `.`.

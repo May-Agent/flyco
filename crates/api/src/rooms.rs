@@ -69,7 +69,7 @@ pub trait RoomKind {
     /// Origin of the internal Worker→room URLs.
     const ORIGIN: &'static str;
     /// The Durable Object behind the room.
-    type Object: skyzen::durable::DurableObject + Send;
+    type Object: skyzen::durable::DurableObject + Send + Sync;
     /// What one room is addressed by.
     type Id: core::fmt::Display + Copy + Send + Sync;
 }
@@ -731,13 +731,11 @@ impl Rooms {
     ///
     /// # Why the wait lives inside the room
     ///
-    /// skyzen rebuilds a Durable Object around every event, so the room
-    /// has no in-memory rendezvous: the `fetch` that forwards the question
-    /// and the `frames` POST that carries the reply are two activations
-    /// with no memory between them. What they share is the room's storage,
-    /// so the room holds the question's request open and the answer stream
-    /// polls the reply table inside it — the same shape every stream in
-    /// the room already takes. The Worker makes exactly one room call per
+    /// The `fetch` that forwards the question and the `frames` POST that
+    /// carries the reply meet on the same Durable Object activation: the
+    /// reply lands in storage (surviving eviction and covering replies that
+    /// race the wait's opening) and pulses an in-memory signal that wakes
+    /// the held stream at once. The Worker makes exactly one room call per
     /// browser request, where coming back for the answer every 120 ms
     /// cost it up to a hundred.
     ///

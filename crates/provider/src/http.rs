@@ -281,7 +281,7 @@ pub trait HttpTransport {
 }
 
 /// The production transport: zenwave, which is hyper natively and the
-/// runtime's `fetch` on wasm32 (zenwave 0.5.2 hands it the body as bytes).
+/// runtime's `fetch` on wasm32.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LiveTransport;
 
@@ -322,25 +322,10 @@ impl HttpTransport for LiveTransport {
                 .map_err(transport)?;
         }
 
-        let response = match builder.bytes_body(request.body).await {
-            Ok(response) => response,
-            // zenwave reports a 4xx/5xx as an error carrying the response.
-            // For this transport that is not an error at all: OpenAI says
-            // "still pending" with a 403, Azure says "wrong secret" with a
-            // 401, and the driver is the one that reads them. Surfacing the
-            // status as a transport failure turned every provider refusal
-            // into an opaque 502 for the user.
-            Err(zenwave::Error::Http {
-                status, response, ..
-            }) => {
-                return Ok(HttpResponse {
-                    status: status.as_u16(),
-                    headers: lowercased(response.response.headers()),
-                    body: response.body_text.unwrap_or_default().into_bytes(),
-                });
-            }
-            Err(error) => return Err(transport(error)),
-        };
+        // zenwave returns every response as Ok regardless of status, so
+        // non-2xx provider answers (401, 403, 404, ...) flow straight to the
+        // driver with their status, headers, and body intact.
+        let response = builder.bytes_body(request.body).await.map_err(transport)?;
         let status = response.status().as_u16();
         let headers = lowercased(response.headers());
         let body = response.into_bytes().await.map_err(transport)?;

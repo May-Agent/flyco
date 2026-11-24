@@ -27,7 +27,7 @@ use crate::respond::{Created, NoContent};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jwt_compact::{AlgorithmExt as _, Claims, Header, alg::Es256};
 use web_push_native::{Auth, WebPushBuilder, p256::PublicKey};
-use zenwave::Client as _;
+use zenwave::{Client as _, ResponseExt as _};
 
 const PUSH_TTL_SECONDS: u32 = 60 * 60;
 
@@ -350,13 +350,18 @@ async fn deliver(
             .header(name.as_str(), value.as_bytes())
             .map_err(|error| ApiError::PushDeliveryFailed(error.to_string()))?;
     }
-    match outbound.bytes_body(body).await {
-        Ok(_) => Ok(Delivery::Sent),
-        Err(zenwave::Error::Http { status, .. }) if matches!(status.as_u16(), 404 | 410) => {
-            Ok(Delivery::Expired)
-        }
-        Err(error) => Err(ApiError::PushDeliveryFailed(error.to_string())),
+    let response = outbound
+        .bytes_body(body)
+        .await
+        .map_err(|error| ApiError::PushDeliveryFailed(error.to_string()))?;
+    if matches!(response.status().as_u16(), 404 | 410) {
+        return Ok(Delivery::Expired);
     }
+    response
+        .error_for_status()
+        .await
+        .map_err(|error| ApiError::PushDeliveryFailed(error.to_string()))?;
+    Ok(Delivery::Sent)
 }
 
 fn build_message(

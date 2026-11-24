@@ -2063,7 +2063,10 @@ mod tests {
         // And a region with no disk meter offers nothing: a session's disk is
         // sized from its spec, so an unpriced GiB is an unpriced machine.
         prices.ephemeral_gib_hourly = None;
-        assert!(catalog(REGION, &prices).is_empty());
+        assert_eq!(
+            catalog(REGION, &prices),
+            [] as [flyco_core::MachineCatalogEntry; 0]
+        );
     }
 
     #[test]

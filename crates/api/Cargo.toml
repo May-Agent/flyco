@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # crate's manifest for why it is a feature rather than always on.
 flyco-core = { workspace = true, features = ["sql"] }
 flyco-provider.workspace = true
-skyzen.workspace = true
+skyzen = { workspace = true, features = ["json", "query", "sse", "rt", "openapi"] }
 skyzen-services.workspace = true
 zenwave.workspace = true
 serde.workspace = true
@@ -50,7 +50,7 @@ utoipa.workspace = true
 uuid.workspace = true
 jwt-compact.workspace = true
 web-push-native.workspace = true
-serde_urlencoded = "0.7"
+serde_urlencoded = { version = "0.7", default-features = false }
 zip.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -61,8 +61,8 @@ skyzen-cloudflare.workspace = true
 wasm-bindgen = "=0.2.120"
 # Worker-side tracing: `console.*` is what Workers Logs retains (flyco #119).
 tracing-subscriber.workspace = true
-tracing-web = "0.1"
-console_error_panic_hook = "0.1"
+tracing-web = { version = "0.1", default-features = false }
+console_error_panic_hook = { version = "0.1", default-features = false }
 
 # The native binary exists for `skyzen dev` and the `openapi.json` export. Its
 # portable-service wiring in `Skyzen.toml` resolves to skyzen's in-memory KV
@@ -72,11 +72,9 @@ console_error_panic_hook = "0.1"
 # The global executor the native runtime installs at start-up — `sse::serve`
 # spawns a stream's polling task onto it. The version matches skyzen's own
 # dependency so both resolve to one `GLOBAL_EXECUTOR`.
-executor-core = { version = "0.7.1", default-features = false, features = ["std"] }
-skyzen-services = { workspace = true, features = [
-    "sqlite",
-    "runtime-async-std-rustls",
-] }
+executor-core = { version = "0.7.2", default-features = false, features = ["std"] }
+skyzen = { workspace = true, features = ["static-files", "sqlite"] }
+skyzen-services = { workspace = true, features = ["sqlite"] }
 skyzen-test.workspace = true
 zenwave = { workspace = true, features = ["hyper-rustls"] }
 
@@ -89,7 +87,7 @@ default = ["openapi"]
 openapi = []
 
 [dev-dependencies]
-skyzen-test = { workspace = true, features = ["runtime-tokio-rustls"] }
+skyzen-test.workspace = true
 # The recorded transport the Anthropic OAuth client is pinned against, the
 # same one every provider driver is tested with.
 flyco-provider = { workspace = true, features = ["testing"] }

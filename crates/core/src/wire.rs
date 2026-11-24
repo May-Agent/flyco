@@ -2387,7 +2387,7 @@ mod tests {
             // an answer addressed to the one HTTP request that asked for
             // it.
             let hidden = matches!(frame, DaemonToControl::WorkdirReply { .. });
-            assert_eq!(ClientEvent::from_daemon(frame.clone()).is_none(), hidden);
+            assert_eq!(ClientEvent::from_daemon(frame).is_none(), hidden);
         }
     }
 

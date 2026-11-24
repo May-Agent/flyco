@@ -243,13 +243,13 @@ mod tests {
         chunk.extend_from_slice(b"\xAC");
         let (send, hold) = split_utf8(&chunk);
         assert_eq!(send, "€".as_bytes());
-        assert!(hold.is_empty());
+        assert_eq!(hold, [] as [u8; 0]);
     }
 
     #[test]
     fn an_invalid_byte_is_dropped() {
         let (send, hold) = split_utf8(b"a\xFFb".as_slice());
         assert_eq!(send, b"ab");
-        assert!(hold.is_empty());
+        assert_eq!(hold, [] as [u8; 0]);
     }
 }

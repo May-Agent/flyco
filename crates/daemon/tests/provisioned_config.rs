@@ -292,7 +292,10 @@ fn it_carries_the_mcp_registry_and_the_directory_that_makes_it_binding() {
     // key nobody could write.
     let mut none = claude(ClaudeCredential::Inherit);
     none.mcp_servers.clear();
-    assert!(parse(&none).mcp_servers.is_empty());
+    assert_eq!(
+        parse(&none).mcp_servers,
+        [] as [flyco_core::McpServerMount; 0]
+    );
 }
 
 #[test]

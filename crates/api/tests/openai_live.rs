@@ -28,7 +28,7 @@ async fn live_device_poll_before_approval_is_pending() {
     let auth = request_user_code_over(&transport, &client_id)
         .await
         .expect("OpenAI issues a device authorization");
-    assert!(!auth.user_code.is_empty());
+    assert_ne!(auth.user_code, "");
 
     let poll = poll_device_code_over(&transport, &auth.device_auth_id, &auth.user_code)
         .await

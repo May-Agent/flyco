@@ -24,7 +24,7 @@ shell-escape.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "ansi"] }
 which.workspace = true
 # The same HTTP client the daemon uses, with the native TLS backend: the
 # publish reads `/v1/healthz` and the served checksums over TLS.

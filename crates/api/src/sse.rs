@@ -1,12 +1,14 @@
 //! Server-Sent Events out of a Durable Object.
 //!
-//! An object serving a route shares no memory with the object's other
-//! activations — every `fetch` may reconstruct it — so a stream cannot
-//! subscribe to anything. What it can do is poll its own storage: each
-//! tick asks the feed for what is new, waits when the answer is nothing,
-//! and ends when the feed says the stream is over.
+//! Under skyzen 0.6 a Durable Object activation is constructed once and
+//! serves concurrent requests through `&self`, so a stream does not poll
+//! storage on a fixed sleep loop. Instead, writers commit to storage and
+//! pulse an in-memory [`Signal`], and readers snapshot [`Signal::version`]
+//! before reading storage and await [`Signal::changed`] when nothing new
+//! is there yet. Storage remains the source of truth across eviction;
+//! [`Signal`] only eliminates the poll latency and idle read load.
 //!
-//! The polling task writes into the bounded channel behind
+//! The stream task writes into the bounded channel behind
 //! [`Sse::channel_with_capacity`], because the response body must be
 //! `Sync` and a `DurableDb` query future is not: the task needs only
 //! `Send`, which the channel gives it for free on both targets — the
@@ -15,17 +17,15 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll as TaskPoll, Waker};
 use std::time::Duration;
 
 use skyzen::responder::Sse;
 use skyzen::responder::sse::{Event, Sender};
 
-/// How often an idle feed re-asks its storage.
-///
-/// Short enough that a command or an event feels immediate, long enough
-/// that a quiet room costs a read a fraction of a second — which a
-/// Durable Object's SQLite answers from its own disk cache.
-const POLL: Duration = Duration::from_millis(150);
+/// How long a stream waits before retrying after a transient storage error.
+pub const RETRY_WAIT: Duration = Duration::from_secs(1);
 
 /// How long a stream may say nothing before it proves itself alive.
 ///
@@ -39,46 +39,159 @@ pub const HEARTBEAT: Duration = Duration::from_secs(15);
 /// gone away does not need its command log copied into memory.
 const CAPACITY: usize = 64;
 
-/// What one poll of a feed concluded.
+/// An in-memory wakeup broadcast shared across concurrent requests on one
+/// Durable Object activation.
+///
+/// Writers call [`Signal::notify`] after committing a row to storage;
+/// readers snapshot [`Signal::version`] *before* querying storage and wait
+/// on [`Signal::changed`] when storage had nothing yet. Because the
+/// version advances monotonically under the lock, a notification that
+/// lands between the read and the await wakes the reader immediately with
+/// no lost-wakeup window.
+#[derive(Debug, Clone, Default)]
+pub struct Signal(Arc<Mutex<SignalState>>);
+
+#[derive(Debug, Default)]
+struct SignalState {
+    version: u64,
+    next_waiter: u64,
+    wakers: Vec<(u64, Waker)>,
+}
+
+impl Signal {
+    /// Current generation counter, snapshotted before a storage read.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .version
+    }
+
+    /// Advances the generation and wakes every waiter currently parked on
+    /// this signal.
+    pub fn notify(&self) {
+        let wakers = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            state.version = state.version.wrapping_add(1);
+            std::mem::take(&mut state.wakers)
+        };
+        for (_, waker) in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Future that resolves as soon as [`Self::version`] differs from `seen`.
+    #[must_use]
+    pub fn changed(&self, seen: u64) -> Changed {
+        Changed {
+            signal: self.clone(),
+            seen,
+            waiter_id: None,
+        }
+    }
+}
+
+/// Future returned by [`Signal::changed`].
+///
+/// Deregisters its waker on drop so long-lived streams whose waits are
+/// cancelled by heartbeats or deadlines never leave stale entries behind.
+#[derive(Debug)]
+pub struct Changed {
+    signal: Signal,
+    seen: u64,
+    waiter_id: Option<u64>,
+}
+
+impl Future for Changed {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<()> {
+        let mut state = self.signal.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.version != self.seen {
+            return TaskPoll::Ready(());
+        }
+        if let Some(id) = self.waiter_id
+            && let Some((_, existing)) = state.wakers.iter_mut().find(|(entry, _)| *entry == id)
+        {
+            existing.clone_from(cx.waker());
+            return TaskPoll::Pending;
+        }
+        let id = state.next_waiter;
+        state.next_waiter = state.next_waiter.wrapping_add(1);
+        state.wakers.push((id, cx.waker().clone()));
+        drop(state);
+        self.waiter_id = Some(id);
+        TaskPoll::Pending
+    }
+}
+
+impl Drop for Changed {
+    fn drop(&mut self) {
+        if let Some(id) = self.waiter_id {
+            let mut state = self.signal.0.lock().unwrap_or_else(PoisonError::into_inner);
+            state.wakers.retain(|(entry, _)| *entry != id);
+        }
+    }
+}
+
+/// What one step of a feed concluded.
 #[derive(Debug)]
 pub enum Poll {
-    /// Events to emit, in the order they arrived. Never empty — an empty
-    /// answer is [`Poll::Idle`].
+    /// Events to emit, in the order they arrived. Never empty.
     Emit(Vec<Event>),
-    /// Nothing new this tick.
-    Idle,
+    /// Nothing new yet: park until `signal` advances past its snapshotted
+    /// version, or until `after` elapses (whichever comes first).
+    /// Heartbeats still fire on `heartbeat` while parked without
+    /// re-stepping the feed.
+    Wait {
+        /// In-memory wakeup signal and the version snapshotted before the
+        /// feed read storage.
+        signal: Option<(Signal, u64)>,
+        /// Optional deadline after which the feed should run again (for
+        /// presence/lease renewal, a request timeout, or error backoff).
+        after: Option<Duration>,
+    },
     /// The stream is over: the body ends cleanly.
     End,
 }
 
-/// A poll over a feed's state.
+/// A step over a feed's state.
 ///
-/// Boxed because the concrete future of each feed's poll is unnameable;
+/// Boxed because the concrete future of each feed's step is unnameable;
 /// a plain `fn` returning this type satisfies the bound. `Send` is the
 /// most the future can promise — a `DurableDb` query's boxed future is
 /// never `Sync` — and all either executor needs.
 pub type PollFn<'a> = Pin<Box<dyn Future<Output = Poll> + Send + 'a>>;
 
-/// Serves `poll` over `state` as a `text/event-stream` responder.
+/// Serves `step` over `state` as a `text/event-stream` responder.
 ///
-/// Each tick calls `poll`: [`Poll::Emit`] puts the events on the channel,
-/// [`Poll::Idle`] waits out [`POLL`], and [`Poll::End`] ends the body. A
-/// stream quiet for `heartbeat` says `ping`, which is what the interval
-/// is for. A gone reader turns the next `send` into an error, which ends
-/// the task — the channel dropping is the only cancellation the feed
-/// needs.
-pub fn serve<S, F>(state: S, poll: F, heartbeat: Duration) -> Sse
+/// Each iteration calls `step`: [`Poll::Emit`] puts the events on the
+/// channel, [`Poll::Wait`] parks on the feed's in-memory signal and/or
+/// deadline while emitting `ping` comments every `heartbeat`, and
+/// [`Poll::End`] ends the body. A gone reader turns the next `send` into
+/// an error, which ends the task — the channel dropping is the only
+/// cancellation the feed needs.
+pub fn serve<S, F>(state: S, step: F, heartbeat: Duration) -> Sse
 where
     S: Send + 'static,
     F: for<'a> FnMut(&'a mut S) -> PollFn<'a> + Send + 'static,
 {
     let (sender, sse) = Sse::channel_with_capacity(CAPACITY);
-    spawn(drive(state, poll, sender, heartbeat));
+    spawn(drive(state, step, sender, heartbeat));
     sse
 }
 
-/// The polling loop behind a served stream.
-async fn drive<S, F>(mut state: S, mut poll: F, sender: Sender, heartbeat: Duration)
+/// What woke a parked stream.
+enum Wake {
+    /// The feed's signal fired or its deadline elapsed: re-step the feed.
+    Step,
+    /// The heartbeat interval elapsed: emit a `ping` comment and stay parked.
+    Ping,
+}
+
+/// The event-driven loop behind a served stream.
+async fn drive<S, F>(mut state: S, mut step: F, sender: Sender, heartbeat: Duration)
 where
     F: for<'a> FnMut(&'a mut S) -> PollFn<'a>,
 {
@@ -87,7 +200,7 @@ where
     // which `now_unix` cannot express — and so a test can ask for one.
     let mut ping_at = futures_timer::Delay::new(heartbeat);
     loop {
-        match poll(&mut state).await {
+        match step(&mut state).await {
             Poll::Emit(events) => {
                 debug_assert!(
                     !events.is_empty(),
@@ -100,14 +213,37 @@ where
                 }
                 ping_at.reset(heartbeat);
             }
-            Poll::Idle => {
-                if futures_util::FutureExt::now_or_never(&mut ping_at).is_some() {
-                    ping_at.reset(heartbeat);
-                    if sender.send(Event::comment("ping")).await.is_err() {
-                        return;
+            Poll::Wait { signal, after } => {
+                let mut changed = signal.map(|(sig, seen)| sig.changed(seen));
+                let mut deadline = after.map(futures_timer::Delay::new);
+                loop {
+                    let wake = futures_util::future::poll_fn(|cx| {
+                        if let Some(fut) = changed.as_mut()
+                            && Pin::new(fut).poll(cx).is_ready()
+                        {
+                            return TaskPoll::Ready(Wake::Step);
+                        }
+                        if let Some(fut) = deadline.as_mut()
+                            && Pin::new(fut).poll(cx).is_ready()
+                        {
+                            return TaskPoll::Ready(Wake::Step);
+                        }
+                        if Pin::new(&mut ping_at).poll(cx).is_ready() {
+                            return TaskPoll::Ready(Wake::Ping);
+                        }
+                        TaskPoll::Pending
+                    })
+                    .await;
+                    match wake {
+                        Wake::Step => break,
+                        Wake::Ping => {
+                            ping_at.reset(heartbeat);
+                            if sender.send(Event::comment("ping")).await.is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
-                futures_timer::Delay::new(POLL).await;
             }
             Poll::End => return,
         }

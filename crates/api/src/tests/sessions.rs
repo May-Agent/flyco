@@ -2770,7 +2770,10 @@ async fn a_model_the_harness_does_not_offer_is_refused_before_anything_is_writte
         .send()
         .await;
     listed.assert_status(200);
-    assert!(listed.json::<Vec<SessionSummary>>().is_empty());
+    assert_eq!(
+        listed.json::<Vec<SessionSummary>>(),
+        [] as [flyco_core::SessionSummary; 0]
+    );
 }
 
 #[skyzen::test]

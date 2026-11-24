@@ -1155,7 +1155,7 @@ mod tests {
     fn placeholders_are_found_once_each_in_order() {
         assert_eq!(placeholders("Bearer {token}"), vec!["token"]);
         assert_eq!(placeholders("{a}/{b}/{a}"), vec!["a", "b"]);
-        assert!(placeholders("no holes {").is_empty());
+        assert_eq!(placeholders("no holes {"), [] as [&str; 0]);
     }
 
     #[test]
@@ -1306,7 +1306,7 @@ mod tests {
                         "/workspace"
                     ]
                 );
-                assert!(env.is_empty());
+                assert_eq!(env, [] as [flyco_core::EnvEntry; 0]);
             }
             other @ McpServerConfig::Http { .. } => {
                 panic!("expected a stdio config, got {other:?}")

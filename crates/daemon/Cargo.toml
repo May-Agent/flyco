@@ -59,21 +59,21 @@ rustix.workspace = true
 time = { workspace = true, features = ["std", "parsing"] }
 tokio.workspace = true
 toml.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "ansi"] }
 url.workspace = true
 zip = { workspace = true, features = ["deflate"] }
 
 # The desktop's capture and hands: X11 protocol plus the XTEST extension
 # that injects input. Pure Rust, so the same module compiles on macOS —
 # where it simply finds no X server to claim.
-x11rb = { version = "0.13", features = ["xtest"] }
+x11rb = { version = "0.14", default-features = false, features = ["xtest"] }
 # The stream's encoder. `asm` stays off: the nasm toolchain it needs is
 # not a provisioned dependency, and the software path is already fast
 # enough at the stream's few-frames-a-second cadence.
 rav1e = { version = "0.8", default-features = false, features = ["threading"] }
 # The agent's screenshots: PNG is what harnesses accept as image
 # content, and the encoder is a leaf with no C.
-png = "0.18"
+png = { version = "0.18", default-features = false }
 
 [dev-dependencies]
 # `tests/provisioned_config.rs` pins the configuration a provisioner writes

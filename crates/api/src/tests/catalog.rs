@@ -156,7 +156,7 @@ async fn an_unread_account_answers_pending_rather_than_empty(ctx: TestContext, k
     let account = seed_azure_account(&db, caller.user).await;
 
     let catalog = read_catalog(&caller).await;
-    assert!(catalog.entries.is_empty());
+    assert_eq!(catalog.entries, [] as [flyco_core::MachineCatalogEntry; 0]);
     assert_eq!(
         catalog.pending_accounts,
         vec![account],
@@ -254,7 +254,7 @@ async fn a_consumed_refresh_settles_the_account_it_named(ctx: TestContext, kv: K
         catalog.pending_accounts.is_empty(),
         "read and refused is not pending"
     );
-    assert!(catalog.entries.is_empty());
+    assert_eq!(catalog.entries, [] as [flyco_core::MachineCatalogEntry; 0]);
 }
 
 #[skyzen::test]

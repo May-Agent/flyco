@@ -555,7 +555,7 @@ impl GithubOauth for TestGithub {
             .files
             .iter()
             .find(|(repo, _)| *repo == wanted)
-            .map(|(_, files)| {
+            .map_or_default(|(_, files)| {
                 files
                     .iter()
                     .map(|(path, body)| crate::github::TreeEntry {
@@ -564,8 +564,7 @@ impl GithubOauth for TestGithub {
                         size: body.len() as u64,
                     })
                     .collect()
-            })
-            .unwrap_or_default();
+            });
         ready(Ok(crate::github::TreeListing {
             entries,
             truncated: false,
@@ -718,8 +717,7 @@ impl crate::mcp_catalog::McpRegistry for TestRegistry {
                         page.servers.iter().any(|entry| entry.server.name == wanted)
                     })
             })
-            .map(|(_, page)| page.clone())
-            .unwrap_or_default();
+            .map_or_default(|(_, page)| page.clone());
         core::future::ready(Ok(page))
     }
 }

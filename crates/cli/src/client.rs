@@ -331,7 +331,7 @@ impl Api {
             Some(body) => builder.json_body(body)?,
             None => builder,
         };
-        with_timeout(async move { builder.await }).await
+        with_timeout(async move { builder.await?.error_for_status().await }).await
     }
 }
 

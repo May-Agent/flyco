@@ -1302,9 +1302,9 @@ mod tests {
             let defaults = models.iter().filter(|model| model.is_default).count();
             assert_eq!(defaults, 1, "{harness:?} must name exactly one default");
             for model in &models {
-                assert!(!model.id.is_empty());
-                assert!(!model.label.is_empty());
-                assert!(!model.description.is_empty());
+                assert_ne!(model.id, "");
+                assert_ne!(model.label, "");
+                assert_ne!(model.description, "");
             }
         }
     }

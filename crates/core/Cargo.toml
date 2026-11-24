@@ -15,7 +15,7 @@ base64.workspace = true
 # `computer_input` MCP tool describes its `Vec<DesktopInputEvent>` argument
 # with a schemars schema — and flyco-api, which compiles this crate to wasm,
 # pays for the derive on every build it is left on.
-schemars = { version = "1.2", optional = true }
+schemars = { version = "1.2", default-features = false, features = ["derive", "std"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

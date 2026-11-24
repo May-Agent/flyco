@@ -740,8 +740,7 @@ async fn catalog_of(account: &LinkedAccount) -> Result<Vec<MachineCatalogEntry>,
         // taken.
         ProviderCredentials::Host { .. } => Ok(account
             .schedulable_host()
-            .map(|host| Host::new(host.id, host.facts.clone()).catalog())
-            .unwrap_or_default()),
+            .map_or_default(|host| Host::new(host.id, host.facts.clone()).catalog())),
         ProviderCredentials::Aws {
             access_key_id,
             secret_access_key,

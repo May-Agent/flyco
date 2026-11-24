@@ -75,7 +75,7 @@ impl Buffer {
     }
 
     /// Publishes one session's emitted events onto the buffer.
-    async fn publish(&mut self, session: SessionId, events: &[EmittedEvent]) -> u16 {
+    async fn publish(&self, session: SessionId, events: &[EmittedEvent]) -> u16 {
         let body = PublishEvents {
             session,
             events: events.to_vec(),
@@ -94,7 +94,7 @@ impl Buffer {
     }
 
     /// Opens the stream on a path — `""`, `"?after=2"`, `"?session=…"`.
-    async fn stream(&mut self, query: &str) -> SseStream {
+    async fn stream(&self, query: &str) -> SseStream {
         let response = self
             .object
             .fetch()
@@ -107,7 +107,7 @@ impl Buffer {
 
     /// Calls a route with no internal marker: a request that arrived off
     /// the open internet.
-    async fn unmarked(&mut self, method: Method, path: &str, body: Option<Vec<u8>>) -> u16 {
+    async fn unmarked(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> u16 {
         let mut request = self.request(method, path, body);
         request.headers_mut().remove(HEADER_INTERNAL);
         let response = self
@@ -170,7 +170,7 @@ fn emitted(seq: Option<u64>, text: &str) -> EmittedEvent {
 /// session's own `events?after=` pages' job to serve.
 #[skyzen::test]
 async fn a_fresh_stream_starts_at_the_live_tail() {
-    let mut buffer = Buffer::open().await;
+    let buffer = Buffer::open().await;
     let session = SessionId::generate();
     buffer
         .publish(
@@ -204,7 +204,7 @@ async fn a_fresh_stream_starts_at_the_live_tail() {
 /// already saw, nothing it skipped.
 #[skyzen::test]
 async fn a_reconnect_resumes_strictly_after_its_cursor() {
-    let mut buffer = Buffer::open().await;
+    let buffer = Buffer::open().await;
     let session = SessionId::generate();
     buffer
         .publish(
@@ -232,7 +232,7 @@ async fn a_reconnect_resumes_strictly_after_its_cursor() {
 /// session's rows stay buffered for whoever is following them.
 #[skyzen::test]
 async fn a_stream_filtered_to_a_session_skips_the_others() {
-    let mut buffer = Buffer::open().await;
+    let buffer = Buffer::open().await;
     let followed = SessionId::generate();
     let other = SessionId::generate();
 
@@ -264,7 +264,7 @@ async fn a_stream_filtered_to_a_session_skips_the_others() {
 /// composed — still stream; `seq` is simply absent from their envelopes.
 #[skyzen::test]
 async fn an_unsequenced_event_streams_without_a_position() {
-    let mut buffer = Buffer::open().await;
+    let buffer = Buffer::open().await;
     let session = SessionId::generate();
 
     let mut stream = buffer.stream("").await;
@@ -290,7 +290,7 @@ async fn an_unsequenced_event_streams_without_a_position() {
 /// these routes answer Worker→object calls, not the internet.
 #[skyzen::test]
 async fn a_call_without_the_internal_marker_is_refused() {
-    let mut buffer = Buffer::open().await;
+    let buffer = Buffer::open().await;
     assert_eq!(
         buffer.unmarked(Method::GET, "/internal/stream", None).await,
         502
@@ -308,5 +308,201 @@ async fn a_call_without_the_internal_marker_is_refused() {
             )
             .await,
         502
+    );
+}
+
+/// `?session=` uses the `(session, seq)` composite index rather than
+/// scanning sibling sessions, and bills only the matching session's rows.
+#[skyzen::test]
+async fn user_events_uses_the_session_seq_index_and_bills_filtered_reads() {
+    #[derive(skyzen::FromRow)]
+    struct PlanRow {
+        detail: String,
+    }
+
+    let buffer = Buffer::open().await;
+    let followed = SessionId::generate();
+    let other = SessionId::generate();
+
+    buffer
+        .publish(
+            other,
+            &[
+                emitted(Some(1), "sibling 1"),
+                emitted(Some(2), "sibling 2"),
+                emitted(Some(3), "sibling 3"),
+            ],
+        )
+        .await;
+    buffer
+        .publish(
+            followed,
+            &[emitted(Some(1), "mine 1"), emitted(Some(2), "mine 2")],
+        )
+        .await;
+
+    let db = DurableDb::new(buffer.db.clone());
+    let index_name: Option<String> = db
+        .query(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'index' AND name = 'user_events_session_seq'",
+        )
+        .fetch_scalar_optional()
+        .await
+        .expect("sqlite_master reads");
+    assert_eq!(
+        index_name.as_deref(),
+        Some("user_events_session_seq"),
+        "schema version 3 must create the (session, seq) index"
+    );
+
+    let followed_str = followed.to_string();
+    let plan: Vec<PlanRow> = skyzen::sql!(
+        db,
+        "EXPLAIN QUERY PLAN SELECT seq, json FROM user_events \
+         WHERE session = {followed_str} AND seq > 0 ORDER BY seq LIMIT 500"
+    )
+    .fetch_all()
+    .await
+    .expect("query plan reads");
+    assert!(
+        plan.iter()
+            .any(|row| row.detail.contains("user_events_session_seq")),
+        "filtered query must use user_events_session_seq, got: {:?}",
+        plan.iter().map(|row| &row.detail).collect::<Vec<_>>()
+    );
+
+    let mut stream = buffer.stream(&format!("?after=0&session={followed}")).await;
+    let (_, first) = next(&mut stream).await;
+    let (_, second) = next(&mut stream).await;
+    assert_eq!(first.session, followed);
+    assert_eq!(second.session, followed);
+    expect_quiet(&mut stream).await;
+
+    assert_eq!(
+        crate::testing::rows_billed(&db).await,
+        2,
+        "only the matching session's rows were read and billed"
+    );
+}
+
+#[derive(Debug, Clone)]
+struct CountingEventsDb {
+    inner: skyzen_services::durable::SqliteDurableDb,
+    event_selects: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl skyzen_services::DurableDbBackend for CountingEventsDb {
+    async fn query(
+        &self,
+        query: &str,
+        params: &[skyzen_services::DbValue],
+    ) -> Result<skyzen_services::DbExecResult, skyzen_services::DurableDbError> {
+        if query.contains("FROM user_events") && query.contains("WHERE") {
+            self.event_selects
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.inner.query(query, params).await
+    }
+
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[skyzen_services::DbValue],
+    ) -> Result<skyzen_services::DbExecResult, skyzen_services::DurableDbError> {
+        self.inner.execute(query, params).await
+    }
+
+    async fn database_size(&self) -> Result<u64, skyzen_services::DurableDbError> {
+        self.inner.database_size().await
+    }
+
+    async fn sync(&self) -> Result<(), skyzen_services::DurableDbError> {
+        self.inner.sync().await
+    }
+}
+
+/// Once the daily row budget is spent, `UserEvents`'s SSE stream closes
+/// cleanly instead of looping `SELECT` queries against SQLite.
+#[skyzen::test]
+async fn an_exhausted_row_budget_closes_the_event_stream_without_querying_events() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let backend = CountingEventsDb {
+        inner: skyzen_services::durable::SqliteDurableDb::in_memory()
+            .await
+            .expect("an in-memory database"),
+        event_selects: Arc::new(AtomicUsize::new(0)),
+    };
+    let object = UserEvents::default();
+    let user = UserId::generate();
+    let session = SessionId::generate();
+
+    let make_request = |method: Method, path: &str, body: Option<Vec<u8>>| {
+        let mut request = Request::new(body.map_or_else(Body::empty, Body::from));
+        *request.method_mut() = method;
+        *request.uri_mut() = format!("https://user-events.flyco.invalid{path}")
+            .parse()
+            .expect("a valid stream URL");
+        request
+            .headers_mut()
+            .insert(HEADER_INTERNAL, INTERNAL.parse().expect("a valid header"));
+        request.headers_mut().insert(
+            HEADER_USER,
+            user.to_string().parse().expect("a valid header"),
+        );
+        request.headers_mut().insert(
+            skyzen::header::CONTENT_TYPE,
+            skyzen::header::HeaderValue::from_static("application/json"),
+        );
+        request
+            .extensions_mut()
+            .insert(DurableDb::new(backend.clone()));
+        request
+    };
+
+    let publish = PublishEvents {
+        session,
+        events: vec![emitted(Some(1), "queued")],
+    };
+    let status = object
+        .fetch()
+        .go(make_request(
+            Method::POST,
+            "/internal/publish",
+            Some(serde_json::to_vec(&publish).expect("serialize")),
+        ))
+        .await
+        .expect("publish answered")
+        .status()
+        .as_u16();
+    assert_eq!(status, 204);
+
+    let db = DurableDb::new(backend.clone());
+    crate::row_budget::charge_reads(&db, crate::row_budget::ROWS_PER_DAY)
+        .await
+        .expect("spend the day's budget");
+    backend.event_selects.store(0, Ordering::SeqCst);
+
+    let response = object
+        .fetch()
+        .go(make_request(Method::GET, "/internal/stream?after=0", None))
+        .await
+        .expect("stream answered");
+    assert_eq!(response.status().as_u16(), 200);
+    let mut stream = response.into_body().into_sse();
+    match tokio_select_quiet(&mut stream, PATIENCE).await {
+        Some(None) => {}
+        other => panic!("expected clean EOF on exhausted budget, got {other:?}"),
+    }
+    assert_eq!(
+        backend.event_selects.load(Ordering::SeqCst),
+        0,
+        "an exhausted budget must refuse before selecting from user_events"
+    );
+    assert_eq!(
+        crate::testing::rows_billed(&db).await,
+        crate::row_budget::ROWS_PER_DAY
     );
 }

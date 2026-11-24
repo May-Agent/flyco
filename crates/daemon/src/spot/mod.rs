@@ -265,17 +265,17 @@ async fn perform(request: MetadataRequest<'_>) -> Result<Option<Vec<u8>>, Metada
             .map_err(|error| MetadataError::Unreachable(error.to_string()))?;
     }
 
-    let response = match builder.bytes_body(Vec::new()).await {
-        Ok(response) => response,
-        Err(error) => {
-            if let zenwave::Error::Http { status, .. } = &error
-                && status.as_u16() == NOT_FOUND
-            {
-                return Ok(None);
-            }
-            return Err(MetadataError::Unreachable(error.to_string()));
-        }
-    };
+    let response = builder
+        .bytes_body(Vec::new())
+        .await
+        .map_err(|error| MetadataError::Unreachable(error.to_string()))?;
+    if response.status().as_u16() == NOT_FOUND {
+        return Ok(None);
+    }
+    let response = response
+        .error_for_status()
+        .await
+        .map_err(|error| MetadataError::Unreachable(error.to_string()))?;
 
     let body = response
         .into_bytes()

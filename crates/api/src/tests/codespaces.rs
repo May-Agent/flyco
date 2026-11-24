@@ -170,7 +170,7 @@ async fn a_codespaces_sign_in_starts_at_github_asking_for_the_codespace_scope(
     for needed in ["repo", "codespace", "read:packages"] {
         assert!(scope.contains(needed), "the link needs `{needed}`: {scope}");
     }
-    assert!(!state_of(&started).is_empty());
+    assert_ne!(state_of(&started), "");
 }
 
 #[skyzen::test]

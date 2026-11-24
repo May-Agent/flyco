@@ -63,6 +63,8 @@
 //! cannot drift, only trail: a stale answer costs one storage read and is
 //! then true again.
 
+use std::time::Duration;
+
 use flyco_core::wire::{DaemonAttach, DaemonFrames, EventPage, StoredEvent};
 use flyco_core::workdir::WorkdirReply;
 use flyco_core::{
@@ -85,6 +87,7 @@ use crate::extract::Headers;
 use crate::problem::Outcome;
 use crate::respond::NoContent;
 use crate::schema_version::Cache;
+use crate::sse::Signal;
 
 /// Names the session a Worker→room call belongs to.
 pub const HEADER_SESSION: &str = "x-flyco-session";
@@ -97,6 +100,9 @@ pub const INTERNAL: &str = "1";
 
 /// Most events one catch-up page returns.
 pub const EVENT_PAGE_LIMIT: u32 = 500;
+
+/// Most queued commands one SSE step reads at a time.
+const COMMAND_BATCH_LIMIT: u64 = 256;
 
 /// How long a daemon's presence marker survives its last contact.
 ///
@@ -221,16 +227,43 @@ struct PresenceRow {
     gone_reported: u8,
 }
 
+/// Shared in-memory wakeup signals owned by one [`SessionRoom`] activation.
+///
+/// Every durable fact still lands in storage first (so eviction is lossless);
+/// pulsing the matching signal wakes any held stream immediately instead of
+/// waiting on a storage poll timer.
+#[derive(Debug, Clone, Default)]
+struct RoomSignals {
+    /// Wakes `stream_commands` when commands are queued or an attach supersedes.
+    commands: Signal,
+    /// Wakes `ask_workdir` when a `WorkdirReply` frame lands.
+    workdir: Signal,
+    /// Wakes `watch_desktop` when a `DesktopChunk` frame lands.
+    chunks: Signal,
+}
+
 /// The relay room for one session.
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[skyzen::durable_object]
 pub struct SessionRoom {
-    /// The schema version this activation already verified — a memo,
-    /// reset with the object on every event, never a fact of its own: it
-    /// can only trail the `schema_meta` row, never lead it. Not part of
-    /// the state blob, which stays the `null` a rolled-back build reads.
+    /// The schema version this activation already verified — a memo shared
+    /// across every request on this activation, never part of the state
+    /// blob.
     #[serde(skip)]
     schema: Cache,
+    /// In-memory wakeup handles shared across concurrent `fetch(&self)` calls.
+    #[serde(skip)]
+    signals: RoomSignals,
+}
+
+#[cfg(test)]
+impl SessionRoom {
+    /// Pulses the command stream's wakeup signal, used by tests that mutate
+    /// watcher expiry rows directly in SQLite to trigger reconciliation
+    /// deterministically.
+    pub(crate) fn notify_commands(&self) {
+        self.signals.commands.notify();
+    }
 }
 
 impl DurableObject for SessionRoom {
@@ -238,7 +271,7 @@ impl DurableObject for SessionRoom {
     /// blob to load and save around an event.
     const PERSIST: bool = false;
 
-    fn fetch(&mut self) -> Router {
+    fn fetch(&self) -> Router {
         Route::new((
             "/internal/daemon-attach".post(attach_daemon),
             "/internal/commands".at(stream_commands),
@@ -253,6 +286,7 @@ impl DurableObject for SessionRoom {
             "/internal/desktop/input".post(desktop_input),
         ))
         .with(State(self.schema.clone()))
+        .with(State(self.signals.clone()))
         .build()
     }
 }
@@ -271,9 +305,12 @@ async fn attach_daemon(
     headers: Headers,
     Json(attach): Json<DaemonAttach>,
     State(cache): State<Cache>,
+    State(signals): State<RoomSignals>,
     db: DurableDb,
 ) -> Outcome<Json<AttachResponse>> {
-    attach_inner(&headers, &attach, &db, &cache).await.into()
+    attach_inner(&headers, &attach, &db, &cache, &signals)
+        .await
+        .into()
 }
 
 async fn attach_inner(
@@ -281,6 +318,7 @@ async fn attach_inner(
     attach: &DaemonAttach,
     db: &DurableDb,
     cache: &Cache,
+    signals: &RoomSignals,
 ) -> Result<Json<AttachResponse>, ApiError> {
     internal(headers)?;
     if attach.protocol_version != flyco_core::WIRE_PROTOCOL_VERSION {
@@ -318,6 +356,7 @@ async fn attach_inner(
         .await
         .map_err(|error| room_failed(&error))?;
 
+    signals.commands.notify();
     tracing::info!(epoch, "a daemon attached to its session room");
     let events = vec![EmittedEvent {
         seq: None,
@@ -329,17 +368,17 @@ async fn attach_inner(
 /// Holds a daemon's command stream open.
 ///
 /// The stream is a cursor over `daemon_commands`: it emits every row past
-/// its cursor, then polls the table for more until the attach it serves
-/// is superseded. Storage is the rendezvous because the object serving
-/// this request shares no memory with the objects serving any other —
-/// the rows are the only thing every activation sees identically.
+/// its cursor, then waits on the room's in-memory command signal (with a
+/// periodic wake for presence renewal and desktop-lease reconciliation)
+/// until the attach it serves is superseded.
 async fn stream_commands(
     headers: Headers,
     Query(cursor): Query<CommandCursor>,
     State(cache): State<Cache>,
+    State(signals): State<RoomSignals>,
     db: DurableDb,
 ) -> Outcome<Sse> {
-    open_command_stream(&headers, cursor.epoch, db, &cache)
+    open_command_stream(&headers, cursor.epoch, db, &cache, signals.commands)
         .await
         .into()
 }
@@ -349,6 +388,7 @@ async fn open_command_stream(
     epoch: u64,
     db: DurableDb,
     cache: &Cache,
+    signal: Signal,
 ) -> Result<Sse, ApiError> {
     internal(headers)?;
     ensure_schema(&db, cache)
@@ -372,6 +412,7 @@ async fn open_command_stream(
     let feed = CommandFeed {
         db,
         cache: cache.clone(),
+        signal,
         epoch,
         cursor: 0,
         sent_resize: false,
@@ -386,37 +427,52 @@ async fn open_command_stream(
     ))
 }
 
-/// One poll of the command stream.
+/// One step of the command stream.
 ///
 /// The remembered pane size goes first — before anything queued — because
 /// the daemon's PTY should be born fitted rather than refitted a message
 /// in. Then every `daemon_commands` row past the cursor, oldest first.
-/// The stream ends when the attach it serves has been superseded.
+/// The stream ends when the attach it serves has been superseded or when
+/// the room's daily row-read budget is exhausted.
 fn poll_command_feed(feed: &mut CommandFeed) -> crate::sse::PollFn<'_> {
-    Box::pin(async move {
-        command_feed_step(feed)
-            .await
-            .unwrap_or(crate::sse::Poll::Idle)
-    })
+    Box::pin(command_feed_step(feed))
 }
 
-/// One poll step, fallible so a failed read surfaces once as a warning
-/// rather than killing the stream — storage retries answer next tick.
-async fn command_feed_step(feed: &mut CommandFeed) -> Result<crate::sse::Poll, ()> {
-    let now = now_unix();
-    let db = &feed.db;
+/// Helper to park a feed briefly after a transient storage failure, or
+/// emit any events already gathered in the step.
+fn retry_or_emit(signal: &Signal, seen: u64, emitted: Vec<Event>) -> crate::sse::Poll {
+    if !emitted.is_empty() {
+        return crate::sse::Poll::Emit(emitted);
+    }
+    crate::sse::Poll::Wait {
+        signal: Some((signal.clone(), seen)),
+        after: Some(crate::sse::RETRY_WAIT),
+    }
+}
 
+/// Handles initial terminal-size replay, attach supersession, and presence
+/// renewal for a daemon command stream step.
+async fn step_daemon_presence(
+    feed: &mut CommandFeed,
+    seen: u64,
+    now: u64,
+) -> Option<crate::sse::Poll> {
+    let db = &feed.db;
     if !feed.sent_resize {
         feed.sent_resize = true;
         let size: Option<TerminalSizeRow> =
-            sql!(db, "SELECT cols, rows FROM terminal_size WHERE id = 0")
+            match sql!(db, "SELECT cols, rows FROM terminal_size WHERE id = 0")
                 .fetch_optional()
                 .await
-                .map_err(|error| {
+            {
+                Ok(size) => size,
+                Err(error) => {
                     tracing::warn!(%error, "a command stream could not read the terminal size");
-                })?;
+                    return Some(retry_or_emit(&feed.signal, seen, Vec::new()));
+                }
+            };
         if let Some(TerminalSizeRow { cols, rows }) = size {
-            return Ok(crate::sse::Poll::Emit(vec![command_event(
+            return Some(crate::sse::Poll::Emit(vec![command_event(
                 None,
                 &serde_json::json!({
                     "type": "terminal_resize",
@@ -427,56 +483,65 @@ async fn command_feed_step(feed: &mut CommandFeed) -> Result<crate::sse::Poll, (
         }
     }
 
-    let presence = read_presence(&feed.db).await.map_err(|error| {
-        tracing::warn!(%error, "a command stream could not read daemon presence");
-    })?;
-    if let Some(row) = presence {
-        // The attach this stream serves was superseded; the newer
-        // epoch's stream is the one the room answers now. The superseded
-        // daemon is told outright before the stream ends — a bare EOF is
-        // indistinguishable from a dropped connection, and an uninformed
-        // loser re-attaches into the epoch that replaced it, ending the
-        // winner's stream in turn. The poll cannot emit and end in one
-        // step, so the command goes out this tick and `Poll::End` the next.
-        if row.epoch != feed.epoch {
-            if feed.superseded_announced {
-                return Ok(crate::sse::Poll::End);
-            }
-            feed.superseded_announced = true;
-            let command = command_value(&ControlToDaemon::Superseded).map_err(|error| {
-                tracing::warn!(%error, "a command stream could not encode its supersession");
-            })?;
-            return Ok(crate::sse::Poll::Emit(vec![command_event(None, &command)]));
+    let presence = match read_presence(&feed.db).await {
+        Ok(presence) => presence,
+        Err(error) => {
+            tracing::warn!(%error, "a command stream could not read daemon presence");
+            return Some(retry_or_emit(&feed.signal, seen, Vec::new()));
         }
+    };
+    if let Some(row) = presence
+        && row.epoch != feed.epoch
+    {
+        if feed.superseded_announced {
+            return Some(crate::sse::Poll::End);
+        }
+        feed.superseded_announced = true;
+        let command = match command_value(&ControlToDaemon::Superseded) {
+            Ok(command) => command,
+            Err(error) => {
+                tracing::warn!(%error, "a command stream could not encode its supersession");
+                return Some(crate::sse::Poll::End);
+            }
+        };
+        return Some(crate::sse::Poll::Emit(vec![command_event(None, &command)]));
     }
     if now.saturating_sub(feed.last_touch) >= PRESENCE_REFRESH_SECONDS {
         let live_until = now.saturating_add(PRESENCE_TTL_SECONDS);
         let epoch = feed.epoch;
-        sql!(
+        if let Err(error) = sql!(
             db,
             "UPDATE daemon_presence SET live_until = {live_until} \
              WHERE id = 0 AND epoch = {epoch}"
         )
         .execute()
         .await
-        .map_err(|error| {
+        {
             tracing::warn!(%error, "a command stream could not renew daemon presence");
-        })?;
+            return Some(retry_or_emit(&feed.signal, seen, Vec::new()));
+        }
         feed.last_touch = now;
     }
+    None
+}
 
+/// One step of the command stream: checks the row budget before reading
+/// `daemon_commands`, debits rows read, and closes cleanly on
+/// [`ApiError::RowBudgetExceeded`].
+async fn command_feed_step(feed: &mut CommandFeed) -> crate::sse::Poll {
+    let seen = feed.signal.version();
+    let now = now_unix();
+    if let Some(poll) = step_daemon_presence(feed, seen, now).await {
+        return poll;
+    }
+
+    let db = &feed.db;
     let mut emitted = Vec::new();
     if feed.desktop_fresh {
         feed.desktop_fresh = false;
         emitted.extend(fresh_desktop_announce(db, &feed.cache, now).await);
     }
 
-    // Reconcile the desktop leases against what the daemon was last
-    // told. A watcher that joined or lapsed since the last tick changes
-    // what the encoder should be doing, and this stream is the room's
-    // only way to say so — which is also what carries the correction to
-    // a fresh attach's first poll. State announcements go ahead of the
-    // queued rows so a daemon learns who owns the screen before the work.
     emitted.extend(
         reconcile_desktop(db, &feed.cache, now)
             .await
@@ -486,33 +551,51 @@ async fn command_feed_step(feed: &mut CommandFeed) -> Result<crate::sse::Poll, (
             }),
     );
 
+    if let Err(error) = crate::row_budget::check_budget(db).await {
+        if matches!(error, ApiError::RowBudgetExceeded) {
+            tracing::warn!("a command stream closed: row budget exhausted");
+            return crate::sse::Poll::End;
+        }
+        tracing::warn!(%error, "a command stream could not check the row budget");
+        return retry_or_emit(&feed.signal, seen, emitted);
+    }
+
     let cursor = feed.cursor;
-    let rows: Vec<CommandRow> = sql!(
+    let limit = COMMAND_BATCH_LIMIT;
+    let rows: Vec<CommandRow> = match sql!(
         db,
-        "SELECT seq, json FROM daemon_commands WHERE seq > {cursor} ORDER BY seq"
+        "SELECT seq, json FROM daemon_commands WHERE seq > {cursor} ORDER BY seq LIMIT {limit}"
     )
     .fetch_all()
     .await
-    .map_err(|error| {
-        tracing::warn!(%error, "a command stream could not poll its commands");
-    })?;
-    if rows.is_empty() && emitted.is_empty() {
-        return Ok(crate::sse::Poll::Idle);
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "a command stream could not poll its commands");
+            return retry_or_emit(&feed.signal, seen, emitted);
+        }
+    };
+    if !rows.is_empty()
+        && let Err(error) = crate::row_budget::debit_reads(db, rows.len() as u64).await
+    {
+        tracing::warn!(%error, "a command stream could not debit the row budget");
+        return retry_or_emit(&feed.signal, seen, emitted);
     }
-    // The poll just drained `rows` of backlog — bill them. An idle poll
-    // reads nothing and is billed nothing: a stream's keepalive cadence
-    // must not spend the budget a backlog could.
-    crate::row_budget::charge_reads(db, rows.len() as u64)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "a command stream hit the row budget");
-        })?;
+    if rows.is_empty() && emitted.is_empty() {
+        let refresh_in = PRESENCE_REFRESH_SECONDS
+            .saturating_sub(now.saturating_sub(feed.last_touch))
+            .max(1);
+        return crate::sse::Poll::Wait {
+            signal: Some((feed.signal.clone(), seen)),
+            after: Some(Duration::from_secs(refresh_in)),
+        };
+    }
     feed.cursor = rows.last().map_or(feed.cursor, |row| row.seq);
     emitted.extend(
         rows.iter()
             .map(|row| command_event(Some(row.seq), &row.json)),
     );
-    Ok(crate::sse::Poll::Emit(emitted))
+    crate::sse::Poll::Emit(emitted)
 }
 
 /// Reads the desktop lease table against what the daemon was last told,
@@ -749,9 +832,11 @@ fn command_event(seq: Option<u64>, command: &serde_json::Value) -> Event {
 /// The command stream's working state.
 struct CommandFeed {
     db: DurableDb,
-    /// The object's remembered schema version — the poll's `append`
+    /// The object's remembered schema version — the step's `append`
     /// reaches it through `reconcile_desktop`/`note_desktop_state`.
     cache: Cache,
+    /// Shared wakeup signal notified on new commands or a superseding attach.
+    signal: Signal,
     /// The attach this stream serves; a newer one ends it.
     epoch: u64,
     /// How far down `daemon_commands` this stream has handed over.
@@ -759,10 +844,10 @@ struct CommandFeed {
     /// Whether the remembered pane size has been replayed yet.
     sent_resize: bool,
     /// Whether this stream still owes its daemon the desktop aggregate —
-    /// set only for the attach it opens on, cleared by the first poll.
+    /// set only for the attach it opens on, cleared by the first step.
     desktop_fresh: bool,
     /// Whether the supersession notice has already been emitted — the next
-    /// poll ends the body.
+    /// step ends the body.
     superseded_announced: bool,
     /// When presence was last renewed, seconds.
     last_touch: u64,
@@ -779,10 +864,13 @@ async fn accept_frames(
     headers: Headers,
     Json(batch): Json<DaemonFrames>,
     State(cache): State<Cache>,
+    State(signals): State<RoomSignals>,
     db: DurableDb,
     kv: DurableKv,
 ) -> Outcome<Json<Emitted>> {
-    accept_batch(&headers, batch, &db, &kv, &cache).await.into()
+    accept_batch(&headers, batch, &db, &kv, &cache, &signals)
+        .await
+        .into()
 }
 
 async fn accept_batch(
@@ -791,6 +879,7 @@ async fn accept_batch(
     db: &DurableDb,
     kv: &DurableKv,
     cache: &Cache,
+    signals: &RoomSignals,
 ) -> Result<Json<Emitted>, ApiError> {
     internal(headers)?;
     ensure_schema(db, cache)
@@ -834,7 +923,7 @@ async fn accept_batch(
     let fresh = batch.frames.get(skip..).unwrap_or(&[]);
     let mut emitted = Vec::with_capacity(fresh.len());
     for frame in fresh {
-        emitted.extend(apply_daemon_frame(frame, db, kv, cache).await?);
+        emitted.extend(apply_daemon_frame(frame, db, kv, cache, signals).await?);
     }
     if !batch.frames.is_empty() {
         let new_through = batch
@@ -884,11 +973,12 @@ async fn apply_daemon_frame(
     db: &DurableDb,
     kv: &DurableKv,
     cache: &Cache,
+    signals: &RoomSignals,
 ) -> Result<Vec<EmittedEvent>, ApiError> {
     // Addressed rather than fanned out: one browser is waiting on the
     // HTTP request this answers, and nobody else has any use for it.
     if let DaemonToControl::WorkdirReply { id, reply } = frame {
-        store_workdir_reply(db, cache, *id, reply)
+        store_workdir_reply(db, cache, *id, reply, &signals.workdir)
             .await
             .map_err(|error| room_failed(&error))?;
         return Ok(Vec::new());
@@ -898,7 +988,7 @@ async fn apply_daemon_frame(
     // table, where watch streams read them, and never in `events` — a
     // replayed transcript is not a screen recording.
     if let DaemonToControl::DesktopChunk { keyframe, data } = frame {
-        store_desktop_chunk(db, *keyframe, data)
+        store_desktop_chunk(db, *keyframe, data, &signals.chunks)
             .await
             .map_err(|error| room_failed(&error))?;
         return Ok(Vec::new());
@@ -929,9 +1019,10 @@ async fn run_command(
     headers: Headers,
     Json(command): Json<ControlToDaemon>,
     State(cache): State<Cache>,
+    State(signals): State<RoomSignals>,
     db: DurableDb,
 ) -> Outcome<Json<Emitted>> {
-    dispatch_command(&headers, &command, &db, &cache)
+    dispatch_command(&headers, &command, &db, &cache, &signals.commands)
         .await
         .into()
 }
@@ -941,6 +1032,7 @@ async fn dispatch_command(
     command: &ControlToDaemon,
     db: &DurableDb,
     cache: &Cache,
+    commands: &Signal,
 ) -> Result<Json<Emitted>, ApiError> {
     internal(headers)?;
     ensure_schema(db, cache)
@@ -959,10 +1051,19 @@ async fn dispatch_command(
 
     match command {
         ControlToDaemon::UserMessage { text, origin } => {
-            deliver_user_message(db, cache, live, text, *origin, &mut events).await?;
+            deliver_user_message(db, cache, commands, live, text, *origin, &mut events).await?;
         }
         ControlToDaemon::ShellCommand { command } => {
-            deliver_shell_command(db, cache, live, gone_announced, command, &mut events).await?;
+            deliver_shell_command(
+                db,
+                cache,
+                commands,
+                live,
+                gone_announced,
+                command,
+                &mut events,
+            )
+            .await?;
         }
         // A pane size is a state, not an instant: it is kept for whichever
         // daemon attaches next, and one that is here now is told at once.
@@ -974,7 +1075,7 @@ async fn dispatch_command(
                 .await
                 .map_err(|error| room_failed(&error))?;
             if live {
-                queue_command(db, command)
+                queue_command(db, command, commands)
                     .await
                     .map_err(|error| room_failed(&error))?;
             }
@@ -1000,7 +1101,7 @@ async fn dispatch_command(
             // the room instead — a client that pressed Stop and was told
             // nothing waits on a turn no longer being run.
             if live || command.survives_a_disconnect() {
-                queue_command(db, command)
+                queue_command(db, command, commands)
                     .await
                     .map_err(|error| room_failed(&error))?;
             } else {
@@ -1078,6 +1179,7 @@ async fn announce_stale_presence(
 async fn queue_command(
     db: &DurableDb,
     command: &ControlToDaemon,
+    commands: &Signal,
 ) -> Result<u64, DurableObjectError> {
     let json = serde_json::to_string(command)
         .map_err(|error| DurableObjectError::Serialization(error.to_string()))?;
@@ -1088,13 +1190,15 @@ async fn queue_command(
     .execute()
     .await
     .map_err(|error| stored(&error))?;
-    sql!(
+    let seq = sql!(
         db,
         "SELECT seq FROM daemon_commands ORDER BY seq DESC LIMIT 1"
     )
     .fetch_scalar()
     .await
-    .map_err(|error| stored(&error))
+    .map_err(|error| stored(&error))?;
+    commands.notify();
+    Ok(seq)
 }
 
 /// Records a user message, echoes it, and queues it for the daemon.
@@ -1108,6 +1212,7 @@ async fn queue_command(
 async fn deliver_user_message(
     db: &DurableDb,
     cache: &Cache,
+    commands: &Signal,
     live: bool,
     text: &str,
     origin: MessageOrigin,
@@ -1138,7 +1243,7 @@ async fn deliver_user_message(
         text: text.to_owned(),
         origin: MessageOrigin::User,
     };
-    queue_command(db, &command)
+    queue_command(db, &command, commands)
         .await
         .map_err(|error| room_failed(&error))?;
     if !live {
@@ -1170,6 +1275,7 @@ async fn deliver_user_message(
 async fn deliver_shell_command(
     db: &DurableDb,
     cache: &Cache,
+    commands: &Signal,
     live: bool,
     gone_announced: bool,
     command: &str,
@@ -1193,7 +1299,7 @@ async fn deliver_shell_command(
             run,
             command: command.to_owned(),
         };
-        queue_command(db, &instruction)
+        queue_command(db, &instruction, commands)
             .await
             .map_err(|error| room_failed(&error))?;
         return Ok(());
@@ -1741,6 +1847,7 @@ async fn store_workdir_reply(
     cache: &Cache,
     id: WorkdirRequestId,
     reply: &WorkdirReply,
+    workdir_signal: &Signal,
 ) -> Result<(), DurableObjectError> {
     let json = serde_json::to_string(reply)
         .map_err(|error| DurableObjectError::Serialization(error.to_string()))?;
@@ -1761,6 +1868,7 @@ async fn store_workdir_reply(
         .execute()
         .await
         .map_err(|error| stored(&error))?;
+    workdir_signal.notify();
     Ok(())
 }
 
@@ -1779,9 +1887,10 @@ async fn ask_workdir(
     headers: Headers,
     Json(command): Json<ControlToDaemon>,
     State(cache): State<Cache>,
+    State(signals): State<RoomSignals>,
     db: DurableDb,
 ) -> Outcome<Sse> {
-    ask(&headers, &command, &db, &cache).await.into()
+    ask(&headers, &command, &db, &cache, &signals).await.into()
 }
 
 async fn ask(
@@ -1789,6 +1898,7 @@ async fn ask(
     command: &ControlToDaemon,
     db: &DurableDb,
     cache: &Cache,
+    signals: &RoomSignals,
 ) -> Result<Sse, ApiError> {
     internal(headers)?;
     let ControlToDaemon::InspectWorkdir { id, .. } = command else {
@@ -1803,12 +1913,13 @@ async fn ask(
     if !daemon_live(db).await.map_err(|error| room_failed(&error))? {
         return Err(ApiError::SessionDaemonOffline);
     }
-    queue_command(db, command)
+    queue_command(db, command, &signals.commands)
         .await
         .map_err(|error| room_failed(&error))?;
     Ok(crate::sse::serve(
         WorkdirFeed {
             db: db.clone(),
+            signal: signals.workdir.clone(),
             request: *id,
             deadline: now_unix().saturating_add(WORKDIR_DEADLINE_SECONDS),
             terminal_sent: false,
@@ -1821,23 +1932,23 @@ async fn ask(
 /// The wait a held workdir question runs.
 struct WorkdirFeed {
     db: DurableDb,
+    /// Shared wakeup signal notified whenever `store_workdir_reply` commits.
+    signal: Signal,
     /// The question this wait is for.
     request: WorkdirRequestId,
     /// The unix second the wait gives up at.
     deadline: u64,
-    /// Whether the terminal event has been emitted — the next poll ends
+    /// Whether the terminal event has been emitted — the next step ends
     /// the body.
     terminal_sent: bool,
 }
 
-/// One poll of a held workdir question.
+/// One step of a held workdir question.
 ///
-/// The reply row is the rendezvous: the `frames` POST that stores the
-/// answer and the request this stream holds open are different
-/// activations of the object, and storage is the only state they share.
-/// The feed's first tick doubles as the fallback for a reply that landed
-/// between queueing the command and opening the wait — it reads the same
-/// row either way, so a reply that raced the ask is found, not missed.
+/// The first step checks storage as the fallback for a reply that landed
+/// between queueing the command and opening the wait; if the reply is not
+/// yet there, the stream parks on `signal` until `store_workdir_reply`
+/// wakes it or the deadline elapses.
 ///
 /// The deadline is read before storage is, so a read that keeps failing
 /// still ends the wait with [`WORKDIR_TIMEOUT_EVENT`] on time: the Worker
@@ -1847,15 +1958,26 @@ fn poll_workdir_reply(feed: &mut WorkdirFeed) -> crate::sse::PollFn<'_> {
         if feed.terminal_sent {
             return crate::sse::Poll::End;
         }
-        let expired = now_unix() >= feed.deadline;
+        let seen = feed.signal.version();
+        let now = now_unix();
+        let expired = now >= feed.deadline;
+        let remaining = Duration::from_secs(feed.deadline.saturating_sub(now).max(1));
         let terminal = match take_workdir_reply(&feed.db, feed.request).await {
             Ok(Some(json)) => Event::data(json).event(WORKDIR_REPLY_EVENT),
             Ok(None) if expired => Event::data("timed out").event(WORKDIR_TIMEOUT_EVENT),
-            Ok(None) => return crate::sse::Poll::Idle,
+            Ok(None) => {
+                return crate::sse::Poll::Wait {
+                    signal: Some((feed.signal.clone(), seen)),
+                    after: Some(remaining),
+                };
+            }
             Err(error) => {
                 tracing::warn!(%error, request = %feed.request, "a workdir wait could not read its reply");
                 if !expired {
-                    return crate::sse::Poll::Idle;
+                    return crate::sse::Poll::Wait {
+                        signal: Some((feed.signal.clone(), seen)),
+                        after: Some(remaining.min(crate::sse::RETRY_WAIT)),
+                    };
                 }
                 Event::data("timed out").event(WORKDIR_TIMEOUT_EVENT)
             }
@@ -1901,15 +2023,19 @@ async fn take_workdir_reply(
 async fn watch_desktop(
     headers: Headers,
     State(cache): State<Cache>,
+    State(signals): State<RoomSignals>,
     db: DurableDb,
 ) -> Outcome<Sse> {
-    open_desktop_stream(&headers, db, &cache).await.into()
+    open_desktop_stream(&headers, db, &cache, &signals)
+        .await
+        .into()
 }
 
 async fn open_desktop_stream(
     headers: &Headers,
     db: DurableDb,
     cache: &Cache,
+    signals: &RoomSignals,
 ) -> Result<Sse, ApiError> {
     internal(headers)?;
     ensure_schema(&db, cache)
@@ -1935,8 +2061,8 @@ async fn open_desktop_stream(
     .map_or(0, |seq| seq.saturating_sub(1));
 
     // A join is already an audience flip: land it now rather than on the
-    // command feed's next reconcile, so the encoder starts one tick
-    // sooner. The CAS keeps a second watcher's stream from re-announcing.
+    // command feed's next reconcile, so the encoder starts at once.
+    // The CAS keeps a second watcher's stream from re-announcing.
     if note_audience(&db, true)
         .await
         .map_err(|error| room_failed(&error))?
@@ -1944,13 +2070,18 @@ async fn open_desktop_stream(
             .await
             .map_err(|error| room_failed(&error))?
     {
-        queue_command(&db, &ControlToDaemon::DesktopAudience { watching: true })
-            .await
-            .map_err(|error| room_failed(&error))?;
+        queue_command(
+            &db,
+            &ControlToDaemon::DesktopAudience { watching: true },
+            &signals.commands,
+        )
+        .await
+        .map_err(|error| room_failed(&error))?;
     }
 
     let feed = ChunkFeed {
         db,
+        signal: signals.chunks.clone(),
         watcher,
         cursor,
         greeted: false,
@@ -1974,9 +2105,12 @@ async fn desktop_takeover(
     headers: Headers,
     Json(request): Json<DesktopTakeoverRequest>,
     State(cache): State<Cache>,
+    State(signals): State<RoomSignals>,
     db: DurableDb,
 ) -> Outcome<Json<Emitted>> {
-    take_desktop(&headers, &request, &db, &cache).await.into()
+    take_desktop(&headers, &request, &db, &cache, &signals.commands)
+        .await
+        .into()
 }
 
 async fn take_desktop(
@@ -1984,6 +2118,7 @@ async fn take_desktop(
     request: &DesktopTakeoverRequest,
     db: &DurableDb,
     cache: &Cache,
+    commands: &Signal,
 ) -> Result<Json<Emitted>, ApiError> {
     internal(headers)?;
     ensure_schema(db, cache)
@@ -2049,9 +2184,13 @@ async fn take_desktop(
             event,
         });
         if daemon_live(db).await.map_err(|error| room_failed(&error))? {
-            queue_command(db, &ControlToDaemon::DesktopTakeover { active: takeover })
-                .await
-                .map_err(|error| room_failed(&error))?;
+            queue_command(
+                db,
+                &ControlToDaemon::DesktopTakeover { active: takeover },
+                commands,
+            )
+            .await
+            .map_err(|error| room_failed(&error))?;
         }
     }
     Ok(Json(Emitted { events }))
@@ -2067,9 +2206,10 @@ async fn desktop_input(
     headers: Headers,
     Json(request): Json<DesktopInputRequest>,
     State(cache): State<Cache>,
+    State(signals): State<RoomSignals>,
     db: DurableDb,
 ) -> Outcome<NoContent> {
-    drive_desktop_input(&headers, &request, &db, &cache)
+    drive_desktop_input(&headers, &request, &db, &cache, &signals.commands)
         .await
         .into()
 }
@@ -2079,6 +2219,7 @@ async fn drive_desktop_input(
     request: &DesktopInputRequest,
     db: &DurableDb,
     cache: &Cache,
+    commands: &Signal,
 ) -> Result<NoContent, ApiError> {
     internal(headers)?;
     ensure_schema(db, cache)
@@ -2117,31 +2258,26 @@ async fn drive_desktop_input(
         &ControlToDaemon::DesktopInput {
             events: request.events.clone(),
         },
+        commands,
     )
     .await
     .map_err(|error| room_failed(&error))?;
     Ok(NoContent)
 }
 
-/// One poll of a desktop watch stream.
+/// One step of a desktop watch stream.
 fn poll_chunk_feed(feed: &mut ChunkFeed) -> crate::sse::PollFn<'_> {
-    Box::pin(async move {
-        chunk_feed_step(feed)
-            .await
-            .unwrap_or(crate::sse::Poll::Idle)
-    })
+    Box::pin(chunk_feed_step(feed))
 }
 
-/// One poll step, fallible so a failed read surfaces once as a warning
-/// rather than killing the stream — storage retries answer next tick.
-async fn chunk_feed_step(feed: &mut ChunkFeed) -> Result<crate::sse::Poll, ()> {
-    let now = now_unix();
+/// Greets a newly opened desktop watch stream and renews its watcher lease
+/// when due.
+async fn step_desktop_watcher(
+    feed: &mut ChunkFeed,
+    now: u64,
+    events: &mut Vec<Event>,
+) -> Result<(), ()> {
     let db = &feed.db;
-    let mut events = Vec::new();
-
-    // The hello names this watcher's lease — the id takeover and input
-    // calls carry — and says whether the screen is already driven, so
-    // the panel opens on the truth rather than on its first refusal.
     if !feed.greeted {
         feed.greeted = true;
         let taken: u64 = sql!(
@@ -2181,10 +2317,12 @@ async fn chunk_feed_step(feed: &mut ChunkFeed) -> Result<crate::sse::Poll, ()> {
         })?;
         feed.last_touch = now;
     }
+    Ok(())
+}
 
-    // A GOP trim that ran ahead of this cursor took rows the stream still
-    // owed: jump to the newest keyframe and mark the cut for the client,
-    // whose decoder cannot span it.
+/// Resyncs `feed.cursor` to the newest keyframe if a GOP trim passed it.
+async fn resync_desktop_cursor(feed: &mut ChunkFeed, events: &mut Vec<Event>) -> Result<(), ()> {
+    let db = &feed.db;
     let oldest: Option<u64> = sql!(db, "SELECT seq FROM desktop_chunks ORDER BY seq LIMIT 1")
         .fetch_scalar_optional()
         .await
@@ -2204,28 +2342,56 @@ async fn chunk_feed_step(feed: &mut ChunkFeed) -> Result<crate::sse::Poll, ()> {
         feed.cursor = head.map_or(0, |seq| seq.saturating_sub(1));
         events.push(Event::data("{}").event("resync"));
     }
+    Ok(())
+}
 
+/// One step of a desktop watch stream: checks the row budget before
+/// reading `desktop_chunks`, debits rows read, and closes cleanly on
+/// [`ApiError::RowBudgetExceeded`].
+async fn chunk_feed_step(feed: &mut ChunkFeed) -> crate::sse::Poll {
+    let seen = feed.signal.version();
+    let now = now_unix();
+    let mut events = Vec::new();
+    if step_desktop_watcher(feed, now, &mut events).await.is_err() {
+        return retry_or_emit(&feed.signal, seen, events);
+    }
+
+    let db = &feed.db;
+    if let Err(error) = crate::row_budget::check_budget(db).await {
+        if matches!(error, ApiError::RowBudgetExceeded) {
+            tracing::warn!("a desktop stream closed: row budget exhausted");
+            return crate::sse::Poll::End;
+        }
+        tracing::warn!(%error, "a desktop stream could not check the row budget");
+        return retry_or_emit(&feed.signal, seen, events);
+    }
+
+    if resync_desktop_cursor(feed, &mut events).await.is_err() {
+        return retry_or_emit(&feed.signal, seen, events);
+    }
+
+    let db = &feed.db;
     let cursor = feed.cursor;
     let limit = DESKTOP_CHUNK_BATCH;
-    let rows: Vec<ChunkRow> = sql!(
+    let rows: Vec<ChunkRow> = match sql!(
         db,
         "SELECT seq, keyframe, data FROM desktop_chunks \
          WHERE seq > {cursor} ORDER BY seq LIMIT {limit}"
     )
     .fetch_all()
     .await
-    .map_err(|error| {
-        tracing::warn!(%error, "a desktop stream could not poll its chunks");
-    })?;
-    // A cursor feed bills the rows it actually returned — an idle poll
-    // reads nothing and is billed nothing, so a quiet screen costs the
-    // watcher nothing.
-    if !rows.is_empty() {
-        crate::row_budget::charge_reads(db, rows.len() as u64)
-            .await
-            .map_err(|error| {
-                tracing::warn!(%error, "a desktop stream hit the row budget");
-            })?;
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "a desktop stream could not poll its chunks");
+            return retry_or_emit(&feed.signal, seen, events);
+        }
+    };
+    if !rows.is_empty()
+        && let Err(error) = crate::row_budget::debit_reads(db, rows.len() as u64).await
+    {
+        tracing::warn!(%error, "a desktop stream could not debit the row budget");
+        return retry_or_emit(&feed.signal, seen, events);
     }
     feed.cursor = rows.last().map_or(feed.cursor, |row| row.seq);
     events.extend(rows.iter().map(|row| {
@@ -2240,14 +2406,22 @@ async fn chunk_feed_step(feed: &mut ChunkFeed) -> Result<crate::sse::Poll, ()> {
         .id(row.seq.to_string())
     }));
     if events.is_empty() {
-        return Ok(crate::sse::Poll::Idle);
+        let refresh_in = WATCHER_REFRESH_SECONDS
+            .saturating_sub(now.saturating_sub(feed.last_touch))
+            .max(1);
+        return crate::sse::Poll::Wait {
+            signal: Some((feed.signal.clone(), seen)),
+            after: Some(Duration::from_secs(refresh_in)),
+        };
     }
-    Ok(crate::sse::Poll::Emit(events))
+    crate::sse::Poll::Emit(events)
 }
 
 /// The watch stream's working state.
 struct ChunkFeed {
     db: DurableDb,
+    /// Shared wakeup signal notified whenever a desktop chunk is stored.
+    signal: Signal,
     /// The lease this stream minted and renews.
     watcher: u64,
     /// How far down `desktop_chunks` it has handed over.
@@ -2286,6 +2460,7 @@ async fn store_desktop_chunk(
     db: &DurableDb,
     keyframe: bool,
     data: &[u8],
+    chunks_signal: &Signal,
 ) -> Result<(), DurableObjectError> {
     use base64::Engine as _;
     let data = base64::engine::general_purpose::STANDARD.encode(data);
@@ -2313,6 +2488,7 @@ async fn store_desktop_chunk(
     .execute()
     .await
     .map_err(|error| stored(&error))?;
+    chunks_signal.notify();
     Ok(())
 }
 

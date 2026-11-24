@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn an_empty_catalog_curates_to_an_empty_catalog() {
-        assert!(curate(Vec::new()).is_empty());
+        assert_eq!(curate(Vec::new()), Vec::new());
     }
 
     #[test]
