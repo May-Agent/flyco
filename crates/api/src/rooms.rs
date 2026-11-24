@@ -45,6 +45,7 @@ use crate::room::{
 };
 use crate::user_events::{HEADER_USER, PublishEvents};
 use flyco_core::wire::EventPage;
+use flyco_core::TurnPage;
 
 /// Cloudflare binding the session-room namespace is exposed under.
 pub const BINDING: &str = "SESSION_ROOMS";
@@ -629,6 +630,28 @@ impl Rooms {
                 session,
                 &format!("/internal/events?after={after}"),
                 "an event page",
+            )
+            .await
+    }
+
+    /// Reads one page of a session's projected turn summaries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Room`] if the room could not be reached or its
+    /// answer was not a turn page, or [`ApiError::RoomRefused`] if the room
+    /// refused the read (for example when its daily row budget is exhausted).
+    pub async fn turns(
+        &self,
+        session: SessionId,
+        after: u64,
+        limit: u32,
+    ) -> Result<TurnPage, ApiError> {
+        self.rooms
+            .get_json(
+                session,
+                &format!("/internal/turns?after={after}&limit={limit}"),
+                "a turn page",
             )
             .await
     }

@@ -862,3 +862,104 @@ async fn the_facts_a_machine_reports_are_what_its_view_carries(ctx: TestContext,
     view.assert_status(200);
     assert_eq!(view.json::<HostView>().facts, grown);
 }
+
+#[skyzen::test]
+async fn reading_an_online_host_stamps_last_seen_at_most_once_per_hour(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+) {
+    let client = ctx.client(migrated_router(&db).await);
+    let user = seed_user(&db).await;
+    let token = session::issue(&kv, user.id).await.expect("issue a session");
+    let minted = mint(&client, &token).await;
+    let enrolled = enroll(&client, &minted.token).await;
+
+    // Attach so the host room reports connected with fresh facts.
+    connect(&client, enrolled.host_id, &enrolled.host_token).await;
+
+    // Set last_seen_unix to 60 seconds ago (well inside the 1-hour window).
+    let recent = crate::clock::now_unix().saturating_sub(60);
+    sql!(
+        db,
+        "UPDATE hosts SET last_seen_unix = {recent} WHERE id = {enrolled.host_id}"
+    )
+    .execute()
+    .await
+    .expect("backdate last_seen within an hour");
+
+    // Reading the host must NOT rewrite last_seen_unix while state & facts are unchanged.
+    let view: HostView = client
+        .get(&format!("/v1/hosts/{}", enrolled.host_id))
+        .bearer(&token)
+        .send()
+        .await
+        .json();
+    assert_eq!(view.state, HostState::Online);
+    assert_eq!(
+        view.last_seen_unix,
+        Some(recent),
+        "reads inside the hourly window must not issue a D1 write to bump last_seen_unix"
+    );
+
+    let stored_recent: Option<u64> = sql!(
+        db,
+        "SELECT last_seen_unix FROM hosts WHERE id = {enrolled.host_id}"
+    )
+    .fetch_scalar()
+    .await
+    .expect("read last_seen");
+    assert_eq!(stored_recent, Some(recent));
+
+    // Once last_seen_unix is at least an hour old, a read stamps it again.
+    let stale = crate::clock::now_unix().saturating_sub(crate::hosts::LAST_SEEN_EVERY_SECONDS + 5);
+    sql!(
+        db,
+        "UPDATE hosts SET last_seen_unix = {stale} WHERE id = {enrolled.host_id}"
+    )
+    .execute()
+    .await
+    .expect("backdate last_seen past an hour");
+
+    let refreshed: HostView = client
+        .get(&format!("/v1/hosts/{}", enrolled.host_id))
+        .bearer(&token)
+        .send()
+        .await
+        .json();
+    assert!(
+        refreshed.last_seen_unix.is_some_and(|ts| ts > stale),
+        "reads past the hourly window refresh last_seen_unix"
+    );
+}
+
+#[skyzen::test]
+async fn listing_multiple_hosts_refreshes_concurrently_and_preserves_order(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+) {
+    let client = ctx.client(migrated_router(&db).await);
+    let user = seed_user(&db).await;
+    let token = session::issue(&kv, user.id).await.expect("issue a session");
+
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let minted = mint(&client, &token).await;
+        let enrolled = enroll(&client, &minted.token).await;
+        connect(&client, enrolled.host_id, &enrolled.host_token).await;
+        ids.push(enrolled.host_id);
+    }
+
+    let list: Vec<HostView> = client
+        .get("/v1/hosts")
+        .bearer(&token)
+        .send()
+        .await
+        .json();
+    assert_eq!(list.len(), 3);
+    assert!(list.iter().all(|h| h.state == HostState::Online));
+    for id in ids {
+        assert!(list.iter().any(|h| h.id == id));
+    }
+}

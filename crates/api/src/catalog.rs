@@ -364,6 +364,34 @@ pub async fn ask_for_refresh(
     Ok(true)
 }
 
+/// How often the scheduled catalog sweep checks linked accounts for staleness.
+///
+/// Catalog entries live for six hours ([`TTL_SECONDS`]), so checking every
+/// account every minute burns 1,440 KV reads per account per day for nothing
+/// (~70 accounts already exhaust the free-plan 100k/day ceiling). Sweeping
+/// once an hour keeps catalogs fresh while holding steady-state KV traffic
+/// to one gate check per minute plus one pass per hour.
+pub const SWEEP_INTERVAL_SECONDS: u64 = 3_600;
+
+/// Most accounts one scheduled tick checks when a sweep pass is due.
+///
+/// Bounding each tick keeps the shared minute cron well under the Cloudflare
+/// Workers 50-subrequest ceiling; when more accounts exist, the cursor in
+/// [`SWEEP_STATE_KEY`] resumes on the next minute until the full pass finishes.
+pub const MAX_ACCOUNTS_PER_SWEEP: u32 = 6;
+
+/// KV key holding the scheduled sweep's hourly gate and pagination cursor.
+const SWEEP_STATE_KEY: &str = "catalog-refresh:sweep-state";
+
+/// Persistent progress of [`refresh_stale`] across minute cron ticks.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SweepState {
+    /// When the last full pass completed, in seconds since the Unix epoch.
+    completed_at_unix: Option<u64>,
+    /// Last account id checked in an in-progress pass, or `None` between passes.
+    after_account: Option<ProviderAccountId>,
+}
+
 /// One linked cloud account, as the scheduled sweep reads it.
 #[derive(Debug, skyzen::FromRow)]
 struct AccountRow {
@@ -372,37 +400,96 @@ struct AccountRow {
 }
 
 /// Asks for a refresh of every cloud account whose document is missing or
-/// stale.
+/// stale, at most once per [`SWEEP_INTERVAL_SECONDS`].
 ///
 /// The scheduled leg, and the only thing that keeps a catalog current for a
 /// user who is not looking at it. It rides the existing minute cron rather
-/// than adding a second one, and it is cheap because [`ask_for_refresh`]
-/// refuses to ask twice inside [`REFRESH_CLAIM_SECONDS`].
+/// than adding a second one, and gates on [`SWEEP_STATE_KEY`] so non-due
+/// minutes cost one KV read and zero per-account KV reads. When more than
+/// [`MAX_ACCOUNTS_PER_SWEEP`] accounts exist, one pass spreads across
+/// consecutive minutes before sleeping for the next hour.
 ///
 /// Host accounts are excluded in SQL: their catalog is never cached, so a
 /// refresh would have nothing to write.
 ///
 /// # Errors
 ///
-/// Returns [`ApiError`] if the database, the store, or the queue fails.
+/// Returns [`ApiError`] if reading or writing the sweep state or querying the
+/// accounts fails. Per-account KV or queue errors are logged and skipped so
+/// one broken account cannot starve the rest.
 pub async fn refresh_stale(db: &Db, kv: &Kv, queue: &Queue, at_unix: u64) -> Result<(), ApiError> {
-    let host = flyco_core::CloudProviderKind::Host;
-    let rows: Vec<AccountRow> = sql!(
-        db,
-        "SELECT id, user_id FROM provider_accounts \
-         WHERE unlinked_at_unix IS NULL AND kind != {host}"
-    )
-    .fetch_all()
-    .await?;
+    let state: SweepState = kv.get_json(SWEEP_STATE_KEY).await?.unwrap_or_default();
+    if state.after_account.is_none()
+        && state
+            .completed_at_unix
+            .is_some_and(|completed| at_unix.saturating_sub(completed) < SWEEP_INTERVAL_SECONDS)
+    {
+        return Ok(());
+    }
 
-    for row in rows {
-        let due = read(kv, row.id)
+    let host = flyco_core::CloudProviderKind::Host;
+    let limit = MAX_ACCOUNTS_PER_SWEEP + 1;
+    let rows: Vec<AccountRow> = match state.after_account {
+        Some(after) => {
+            sql!(
+                db,
+                "SELECT id, user_id FROM provider_accounts \
+                 WHERE unlinked_at_unix IS NULL AND kind != {host} AND id > {after} \
+                 ORDER BY id LIMIT {limit}"
+            )
+            .fetch_all()
             .await?
-            .is_none_or(|document| document.is_stale(at_unix));
-        if due && ask_for_refresh(kv, queue, row.user_id, row.id).await? {
-            tracing::info!(account = %row.id, "asked for a scheduled catalog refresh");
+        }
+        None => {
+            sql!(
+                db,
+                "SELECT id, user_id FROM provider_accounts \
+                 WHERE unlinked_at_unix IS NULL AND kind != {host} \
+                 ORDER BY id LIMIT {limit}"
+            )
+            .fetch_all()
+            .await?
+        }
+    };
+
+    let has_more = rows.len() > MAX_ACCOUNTS_PER_SWEEP as usize;
+    let batch = rows
+        .iter()
+        .take(MAX_ACCOUNTS_PER_SWEEP as usize)
+        .collect::<Vec<_>>();
+
+    for row in &batch {
+        let outcome = async {
+            let due = read(kv, row.id)
+                .await?
+                .is_none_or(|document| document.is_stale(at_unix));
+            if due && ask_for_refresh(kv, queue, row.user_id, row.id).await? {
+                tracing::info!(account = %row.id, "asked for a scheduled catalog refresh");
+            }
+            Ok::<(), ApiError>(())
+        }
+        .await;
+        if let Err(error) = outcome {
+            tracing::warn!(
+                account = %row.id,
+                %error,
+                "a scheduled catalog refresh check failed"
+            );
         }
     }
+
+    let next_state = if has_more {
+        SweepState {
+            completed_at_unix: state.completed_at_unix,
+            after_account: batch.last().map(|row| row.id),
+        }
+    } else {
+        SweepState {
+            completed_at_unix: Some(at_unix),
+            after_account: None,
+        }
+    };
+    kv.put_json(SWEEP_STATE_KEY, &next_state).await?;
     Ok(())
 }
 

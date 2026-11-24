@@ -8,7 +8,7 @@
 //! so sub-microdollar fractions carry across windows without mutable rounding
 //! state.
 
-use flyco_core::{BudgetId, BudgetSignal, MachineId, MachineState, SpendKind, Usd};
+use flyco_core::{BudgetId, BudgetSignal, MachineId, MachineState, SessionState, SpendKind, Usd};
 use skyzen::sql;
 use skyzen_services::Db;
 
@@ -199,32 +199,115 @@ fn interval_cost(hourly: Usd, origin: u64, start: u64, end: u64) -> Usd {
     Usd::from_micros(u64::try_from(micros).expect("a metering interval fits in microdollars"))
 }
 
+/// Most live budget-signal room deliveries one scheduled tick attempts.
+///
+/// Already-terminal or deleted sessions are dropped in D1 without calling a
+/// room and do not count against this subrequest budget.
+pub const MAX_SIGNALS_PER_SWEEP: usize = 4;
+
 /// Delivers the durable budget-signal outbox to session rooms.
 ///
-/// A pause is written to the session table before the daemon sees it. If the
-/// room call fails, the outbox row remains pending and the next cron repeats
-/// the idempotent state transition and command.
+/// A pause is written to the session table before the daemon sees it. Signals
+/// for sessions that are already terminal (`archived` or `failed`) or gone
+/// are dropped so they never retry forever. Per-session errors are logged and
+/// skipped so one unreachable room or mismatched transition cannot block the
+/// remaining outbox rows or later cron legs.
 ///
 /// # Errors
 ///
-/// Returns [`ApiError`] if the outbox, session state, or room command fails.
+/// Returns [`ApiError`] only if reading the outbox itself fails.
 pub async fn deliver(db: &Db, rooms: &Rooms) -> Result<(), ApiError> {
+    let mut room_calls = 0_usize;
     for pending in budgets::pending_signals(db).await? {
-        if pending.signal == BudgetSignal::Pause {
-            sessions::pause_for_budget(db, pending.session_id).await?;
+        match sessions::state_by_id(db, pending.session_id).await {
+            Ok(None | Some(SessionState::Archived | SessionState::Failed)) => {
+                if let Err(error) = budgets::mark_delivered(db, pending.id).await {
+                    tracing::warn!(
+                        signal_id = %pending.id,
+                        session = %pending.session_id,
+                        %error,
+                        "a stale budget signal for an ended session could not be dropped"
+                    );
+                }
+                continue;
+            }
+            Ok(Some(_)) => {}
+            Err(error) => {
+                tracing::warn!(
+                    signal_id = %pending.id,
+                    session = %pending.session_id,
+                    %error,
+                    "a budget signal's session state could not be read"
+                );
+                continue;
+            }
         }
-        rooms
-            .command(
-                db,
-                pending.session_id,
-                &flyco_core::ControlToDaemon::Budget {
-                    signal: pending.signal,
-                },
-            )
-            .await?;
-        budgets::mark_delivered(db, pending.id).await?;
+
+        if room_calls >= MAX_SIGNALS_PER_SWEEP {
+            break;
+        }
+        room_calls += 1;
+
+        if let Err(error) = deliver_one(db, rooms, &pending).await {
+            tracing::warn!(
+                signal_id = %pending.id,
+                session = %pending.session_id,
+                %error,
+                "a budget signal could not be delivered"
+            );
+        }
     }
     Ok(())
+}
+
+async fn deliver_one(
+    db: &Db,
+    rooms: &Rooms,
+    pending: &budgets::PendingSignal,
+) -> Result<(), ApiError> {
+    if pending.signal == BudgetSignal::Pause {
+        sessions::pause_for_budget(db, pending.session_id).await?;
+    }
+    rooms
+        .command(
+            db,
+            pending.session_id,
+            &flyco_core::ControlToDaemon::Budget {
+                signal: pending.signal,
+            },
+        )
+        .await?;
+    budgets::mark_delivered(db, pending.id).await?;
+    Ok(())
+}
+
+/// Runs one scheduled sweep leg in isolation, recording any failure so later
+/// legs still execute within the same tick.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) async fn run_leg<E: core::fmt::Display>(
+    name: &'static str,
+    run: impl core::future::Future<Output = Result<(), E>>,
+    failures: &mut Vec<(&'static str, String)>,
+) {
+    tracing::debug!(leg = name, "scheduled sweep running");
+    if let Err(error) = run.await {
+        tracing::error!(leg = name, %error, "scheduled sweep leg failed");
+        failures.push((name, error.to_string()));
+    }
+}
+
+/// Formats any recorded leg failures into one summary sentence.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn summarize_failures(failures: &[(&'static str, String)]) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    let summary = failures
+        .iter()
+        .map(|(leg, error)| format!("{leg}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!("scheduled sweep legs failed: {summary}"))
 }
 
 #[cfg(test)]
@@ -252,7 +335,7 @@ mod worker {
 
     use skyzen::wasm_bindgen_futures;
 
-    use super::{accrue, deliver};
+    use super::{accrue, deliver, run_leg, summarize_failures};
     use crate::app;
     use crate::catalog;
     use crate::codespaces::{Codespaces, LiveCodespaces};
@@ -318,57 +401,49 @@ mod worker {
                 .map_err(|error| skyzen_cloudflare::CfEventError::Runtime(error.to_string()))?,
         );
 
-        // Each leg is named on the way in and on the way out: a leg that
-        // returns `Err` says so with its name attached, and a leg that dies
-        // on a runtime exception — which never reaches a `tracing` call —
-        // is still identifiable as the last "running" marker before the
-        // event ends.
-        async fn leg<E: core::fmt::Display>(
-            name: &'static str,
-            run: impl Future<Output = Result<(), E>>,
-        ) -> Result<(), skyzen_cloudflare::CfEventError> {
-            tracing::debug!(leg = name, "scheduled sweep running");
-            run.await.map_err(|error| {
-                tracing::error!(leg = name, %error, "scheduled sweep leg failed");
-                skyzen_cloudflare::CfEventError::Runtime(error.to_string())
-            })
-        }
-
         // One client for every leg that unseals a GitHub grant — the
         // codespaces reconcile, the machine releases — because a stored
         // grant near its end is renewed before it is used.
         let github = GithubClient::default();
 
-        leg("accrue", accrue(&db, at_unix)).await?;
-        leg("deliver", deliver(&db, &rooms)).await?;
+        // Every leg is isolated: one failing leg is logged and recorded, but
+        // never stops the remaining maintenance legs from running on this tick.
+        let mut failures = Vec::new();
+
+        run_leg("accrue", accrue(&db, at_unix), &mut failures).await;
+        run_leg("deliver", deliver(&db, &rooms), &mut failures).await;
         // The request ledger's housekeeping: one delete an hour, dropping
         // days nobody reads.
-        leg(
+        run_leg(
             "request_budgets",
             crate::request_budget::sweep(&db, at_unix),
+            &mut failures,
         )
-        .await?;
-        leg(
+        .await;
+        run_leg(
             "refresh_stale",
             catalog::refresh_stale(&db, &Kv::new(kv), &Queue::new(queue), at_unix),
+            &mut failures,
         )
-        .await?;
-        leg(
+        .await;
+        run_leg(
             "fail_stalled_provisions",
             app::fail_stalled_provisions(&db, &config, &github, &rooms, &hosts, at_unix),
+            &mut failures,
         )
-        .await?;
-        leg(
+        .await;
+        run_leg(
             "archive_idle",
             app::archive_idle(&db, &config, &github, &rooms, &hosts, at_unix),
+            &mut failures,
         )
-        .await?;
+        .await;
         // The clock behind issue #244: a session waiting out a spent harness
         // plan window is released, woken and continued from here. It rides
         // this cron rather than a delayed queue message because Cloudflare
         // Queues cap delivery delay at twelve hours and a weekly window
         // resets further out than that.
-        leg(
+        run_leg(
             "usage_limits",
             usage_limits::sweep(
                 &db,
@@ -379,13 +454,14 @@ mod worker {
                 &queue_for_waking,
                 at_unix,
             ),
+            &mut failures,
         )
-        .await?;
+        .await;
         // A codespace's state changes underneath flyco — GitHub stops it on
         // its own idle clock, a user deletes it from github.com — and the
         // only truth about either is asking, once a minute, of every
         // codespace the rows believe they hold.
-        leg(
+        run_leg(
             "codespaces_reconcile",
             crate::codespaces::reconcile(
                 &db,
@@ -394,24 +470,32 @@ mod worker {
                 &rooms,
                 &Codespaces::Live(LiveCodespaces::new()),
             ),
+            &mut failures,
         )
-        .await?;
+        .await;
         // What GitHub does for a codespace on its own clock, flyco does for
         // every other machine on this one: an active session that has said
         // nothing for thirty minutes has its compute released and its disk
         // kept, and the next message starts it again. After the reconcile,
         // so a codespace GitHub already suspended is classified by it
         // rather than asked about twice.
-        leg(
+        run_leg(
             "suspend_idle",
             app::suspend_idle(&db, &config, &github, &rooms, &hosts, at_unix),
+            &mut failures,
         )
-        .await?;
+        .await;
         // Last, so it sees what the sweeps above have just ended.
-        leg(
+        run_leg(
             "release_ended_machines",
             app::release_ended_machines(&db, &config, &github, &hosts),
+            &mut failures,
         )
-        .await
+        .await;
+
+        if let Some(summary) = summarize_failures(&failures) {
+            return Err(skyzen_cloudflare::CfEventError::Runtime(summary));
+        }
+        Ok(())
     }
 }

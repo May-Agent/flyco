@@ -302,8 +302,16 @@ pub fn public_routes() -> Vec<RouteNode> {
     Route::new(("/v1/providers/codespaces/bootstrap".post(bootstrap),)).into_route_nodes()
 }
 
-/// Reconciles every codespace flyco believes it holds against what GitHub
-/// reports, once per scheduled sweep.
+/// Most held codespaces one scheduled tick queries against GitHub.
+///
+/// Bounding each tick keeps the shared minute cron well under Cloudflare
+/// Workers' 50-subrequest ceiling. When more codespaces are held, the slice
+/// rotates cyclically across consecutive minutes so every codespace is
+/// reconciled without starvation.
+pub const MAX_RECONCILE_PER_SWEEP: usize = 6;
+
+/// Reconciles held codespaces flyco believes it holds against what GitHub
+/// reports, bounded to [`MAX_RECONCILE_PER_SWEEP`] per scheduled sweep.
 ///
 /// A codespace's state changes underneath flyco in ways nothing reports:
 /// GitHub stops it when its own idle timeout expires, a user deletes it
@@ -327,7 +335,14 @@ pub async fn reconcile(
     rooms: &Rooms,
     codespaces: &Codespaces,
 ) -> Result<(), ApiError> {
-    for held in machines::held_codespaces(db).await? {
+    let mut held = machines::held_codespaces(db).await?;
+    if held.len() > MAX_RECONCILE_PER_SWEEP {
+        let minute = usize::try_from(crate::clock::now_unix() / 60).unwrap_or(0);
+        let offset = minute.wrapping_mul(MAX_RECONCILE_PER_SWEEP) % held.len();
+        held.rotate_left(offset);
+        held.truncate(MAX_RECONCILE_PER_SWEEP);
+    }
+    for held in held {
         if let Err(error) = reconcile_one(db, config, github, rooms, codespaces, &held).await {
             tracing::warn!(machine = %held.machine, %error, "a codespace could not be reconciled");
         }

@@ -73,6 +73,9 @@ enum Answer {
     /// call's budget ran out: the build is handed back, and the next call
     /// finds it running.
     Slow,
+    /// The build stays `Pending` on every resume leg so tests can verify the
+    /// continuation stall clock, wall-clock deadline, and leg ceiling.
+    StuckPending,
     /// The provider no longer holds the machine at all — a codespace that
     /// was deleted between the reconcile that last saw it and the start the
     /// recovery asked for.
@@ -131,7 +134,7 @@ impl Provisioner for RecordedHost {
     ) -> impl Future<Output = Result<Provisioning, ProviderError>> {
         // Nothing here suspends: planning is pure, and where the deployed
         // provisioner posts the job to a room this one answers for it.
-        let slow = self.answer == Answer::Slow;
+        let slow = matches!(self.answer, Answer::Slow | Answer::StuckPending);
         core::future::ready(self.plan(account, request).map(|machine| {
             if slow {
                 Provisioning::Pending {
@@ -166,6 +169,12 @@ impl Provisioner for RecordedHost {
             machine.native_id, SLOW_JOB,
             "resumed on the pending machine"
         );
+        if self.answer == Answer::StuckPending {
+            return core::future::ready(Ok(Provisioning::Pending {
+                machine: machine.clone(),
+                continuation: continuation.clone(),
+            }));
+        }
         core::future::ready(Ok(Provisioning::Ready(Machine {
             native_id: format!("{SLOW_JOB}/run-1"),
             state: MachineState::Running,
@@ -239,7 +248,7 @@ impl RecordedHost {
         let job = planner.plan(&MachineOperation::Provision(Box::new(request.clone())))?;
 
         match self.answer {
-            Answer::Takes | Answer::Slow => Ok(Machine {
+            Answer::Takes | Answer::Slow | Answer::StuckPending => Ok(Machine {
                 id: request.machine,
                 native_id: job.container().to_owned(),
                 runtime: flyco_core::Runtime::Container,
@@ -906,6 +915,180 @@ async fn a_build_the_provider_hands_back_is_carried_on_in_its_own_leg(
         "a finished build asks for nothing more: the one continuation ever queued is the \
          leg this test took by hand"
     );
+}
+
+#[skyzen::test]
+async fn a_stuck_continuation_keeps_the_stall_clock_and_fails_at_deadline_and_leg_cap(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+) {
+    let backend = InMemoryQueue::new();
+    let queue = Queue::new(backend.clone());
+    let router = migrated_router_on(&db, queue.clone()).await;
+    let caller = sign_in(&kv, &db).await;
+    let client = ctx.client(router);
+
+    let session = open(&client, &caller).await.summary.id;
+    let mut host = RecordedHost::answering(Answer::StuckPending);
+    run_queue(&db, &kv, &queue, &mut host).await;
+
+    let pending = crate::machines::for_session(&db, session)
+        .await
+        .expect("read machine")
+        .expect("machine row");
+
+    // Backdate `last_active_unix` to verify `carry_on` does NOT reset it.
+    let old_active = crate::clock::now_unix().saturating_sub(300);
+    sql!(
+        db,
+        "UPDATE sessions SET last_active_unix = {old_active} WHERE id = {session}"
+    )
+    .execute()
+    .await
+    .expect("backdate last_active_unix");
+
+    let first_leg = queued(&backend).remove(0);
+    run_queue_watching(&db, &kv, &queue, &test_rooms(), &mut host, batch(first_leg)).await;
+    assert_eq!(host.resumes, 1);
+
+    let after_carry_on: u64 =
+        sql!(db, "SELECT last_active_unix FROM sessions WHERE id = {session}")
+            .fetch_scalar()
+            .await
+            .expect("read last_active_unix");
+    assert_eq!(
+        after_carry_on, old_active,
+        "carry_on must not refresh last_active_unix and defeat the stall sweep"
+    );
+
+    // 1. A Continue leg whose `started_at_unix` is past PROVISION_DEADLINE_SECS
+    // fails the session immediately without calling `resume`.
+    let expired = ProvisioningJob::continuing(
+        session,
+        pending.id,
+        Continuation::write(&SLOW_CONTINUATION).expect("continuation"),
+        crate::clock::now_unix().saturating_sub(flyco_core::PROVISION_DEADLINE_SECS + 1),
+        2,
+    );
+    let resumes_before = host.resumes;
+    run_queue_watching(&db, &kv, &queue, &test_rooms(), &mut host, batch(expired)).await;
+    assert_eq!(
+        host.resumes, resumes_before,
+        "an expired continuation must fail without calling the provider again"
+    );
+    assert_eq!(
+        read(&client, &caller, session).await.summary.state,
+        SessionState::Failed
+    );
+
+    // 2. A fresh session hitting MAX_CONTINUE_LEGS fails when the provider still
+    // answers Pending instead of enqueueing leg MAX_CONTINUE_LEGS + 1.
+    let second = open(&client, &caller).await.summary.id;
+    let mut second_host = RecordedHost::answering(Answer::StuckPending);
+    run_queue(&db, &kv, &queue, &mut second_host).await;
+    let second_machine = crate::machines::for_session(&db, second)
+        .await
+        .expect("read machine")
+        .expect("machine row");
+    let at_cap = ProvisioningJob::continuing(
+        second,
+        second_machine.id,
+        Continuation::write(&SLOW_CONTINUATION).expect("continuation"),
+        crate::clock::now_unix(),
+        provisioning_queue::MAX_CONTINUE_LEGS,
+    );
+    let before_cap_queue = queued(&backend).len();
+    run_queue_watching(
+        &db,
+        &kv,
+        &queue,
+        &test_rooms(),
+        &mut second_host,
+        batch(at_cap),
+    )
+    .await;
+    assert_eq!(
+        read(&client, &caller, second).await.summary.state,
+        SessionState::Failed
+    );
+    assert_eq!(
+        queued(&backend).len(),
+        before_cap_queue,
+        "hitting MAX_CONTINUE_LEGS must not enqueue another leg"
+    );
+}
+
+#[skyzen::test]
+async fn fail_stalled_provisions_bounds_work_per_tick(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+    queue: Queue,
+) {
+    let router = migrated_router_on(&db, queue.clone()).await;
+    let caller = sign_in(&kv, &db).await;
+    let client = ctx.client(router);
+    let rooms = test_rooms();
+
+    let count = sessions::MAX_STALLED_PER_SWEEP as usize + 2;
+    let now = crate::clock::now_unix();
+    let stalled = now.saturating_sub(flyco_core::PROVISION_DEADLINE_SECS + 1);
+    let mut ids = Vec::with_capacity(count);
+    for _ in 0..count {
+        let session = open(&client, &caller).await.summary.id;
+        sql!(
+            db,
+            "UPDATE sessions SET created_at_unix = {stalled}, last_active_unix = {stalled} \
+             WHERE id = {session}"
+        )
+        .execute()
+        .await
+        .expect("age session");
+        ids.push(session);
+    }
+
+    crate::app::fail_stalled_provisions(
+        &db,
+        &test_config(),
+        &TestGithub::default(),
+        &rooms,
+        &test_host_rooms(),
+        now,
+    )
+    .await
+    .expect("first stalled sweep");
+
+    let mut failed_after_first = 0_usize;
+    for id in &ids {
+        if read(&client, &caller, *id).await.summary.state == SessionState::Failed {
+            failed_after_first += 1;
+        }
+    }
+    assert_eq!(
+        failed_after_first,
+        sessions::MAX_STALLED_PER_SWEEP as usize,
+        "a single tick must fail at most MAX_STALLED_PER_SWEEP sessions"
+    );
+
+    // Next tick picks up the remainder.
+    crate::app::fail_stalled_provisions(
+        &db,
+        &test_config(),
+        &TestGithub::default(),
+        &rooms,
+        &test_host_rooms(),
+        now,
+    )
+    .await
+    .expect("second stalled sweep");
+
+    for id in &ids {
+        assert_eq!(
+            read(&client, &caller, *id).await.summary.state,
+            SessionState::Failed
+        );
+    }
 }
 
 #[skyzen::test]

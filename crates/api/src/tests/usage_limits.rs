@@ -709,3 +709,149 @@ async fn the_daemon_route_takes_a_limit_and_refuses_one_with_no_reset(
         Some(PausedReason::UsageLimit)
     );
 }
+
+#[skyzen::test]
+async fn raising_budget_does_not_unpause_a_usage_limit_paused_session(
+    _ctx: TestContext,
+    db: Db,
+) {
+    let waiting = live(&db).await;
+    usage_limits::pause(
+        &db,
+        &test_config(),
+        &waiting.rooms,
+        waiting.session,
+        &weekly(),
+        NOW,
+    )
+    .await
+    .expect("pause for usage limit");
+
+    let raise = sessions::set_budget_limit(
+        &db,
+        waiting.user,
+        waiting.session,
+        flyco_core::Usd::from_dollars(50),
+    )
+    .await
+    .expect("budget limit updates");
+
+    assert!(
+        !raise.resumed,
+        "raising the compute budget must not unpause a session paused on a harness usage limit"
+    );
+    assert_eq!(raise.session.summary.state, SessionState::Paused);
+    assert_eq!(
+        raise.session.summary.paused_reason,
+        Some(PausedReason::UsageLimit)
+    );
+    assert!(raise.session.usage_limit.is_some());
+}
+
+#[skyzen::test]
+async fn archiving_and_failing_clear_pause_metadata_and_exclude_terminal_sessions(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+) {
+    // 1. Transitioning to Archived clears paused_reason and usage_limit_* columns.
+    let waiting = live(&db).await;
+    usage_limits::pause(
+        &db,
+        &test_config(),
+        &waiting.rooms,
+        waiting.session,
+        &weekly(),
+        NOW,
+    )
+    .await
+    .expect("pause for usage limit");
+    sessions::transition(&db, waiting.user, waiting.session, SessionState::Archived)
+        .await
+        .expect("archive paused session");
+
+    let archived = detail(&db, &waiting).await;
+    assert_eq!(archived.summary.state, SessionState::Archived);
+    assert!(archived.summary.paused_reason.is_none());
+    assert!(archived.usage_limit.is_none());
+    assert!(
+        sessions::usage_limit_waits(&db)
+            .await
+            .expect("waits")
+            .is_empty(),
+        "an archived session must not remain in usage_limit_waits"
+    );
+
+    // Sending a message to the archived session must NOT be accepted as a queued usage-limit msg.
+    let client = ctx.client(crate::testing::test_router(
+        db.clone(),
+        Queue::new(InMemoryQueue::new()),
+    ));
+    let token = session::issue(&kv, waiting.user)
+        .await
+        .expect("issue a session");
+    let response = client
+        .post(&format!("/v1/sessions/{}/messages", waiting.session))
+        .bearer(&token)
+        .json(&flyco_core::SendMessage {
+            text: "should not queue".to_owned(),
+        })
+        .send()
+        .await;
+    assert_ne!(response.status(), 202);
+
+    // 2. Failing a waking usage-limit session (Paused -> Provisioning -> Failed)
+    // also clears paused_reason and usage_limit_* metadata.
+    let second = seed_session(&db, &crate::testing::seed_other_user(&db).await).await;
+    let active = SessionState::Active;
+    sql!(db, "UPDATE sessions SET state = {active} WHERE id = {second}")
+        .execute()
+        .await
+        .expect("activate");
+    usage_limits::pause(
+        &db,
+        &test_config(),
+        &waiting.rooms,
+        second,
+        &weekly(),
+        NOW,
+    )
+    .await
+    .expect("pause second session");
+    sessions::recovering(&db, second)
+        .await
+        .expect("wake second session into provisioning");
+    sessions::fail(&db, &waiting.rooms, second, "machine died")
+        .await
+        .expect("fail waking session");
+
+    let stale_waits = sessions::usage_limit_waits(&db).await.expect("waits");
+    assert!(stale_waits.is_empty());
+
+    // 3. Defense in depth: even if a legacy archived row still carries
+    // paused_reason = 'usage_limit', usage_limit_waits and queue_usage_limit_message ignore it.
+    let limit = PausedReason::UsageLimit;
+    let resets = NOW + DAYS;
+    sql!(
+        db,
+        "UPDATE sessions SET paused_reason = {limit}, usage_limit_window = 'Weekly', \
+         usage_limit_resets_at_unix = {resets} WHERE id = {waiting.session}"
+    )
+    .execute()
+    .await
+    .expect("inject legacy stale metadata on archived row");
+
+    assert!(
+        sessions::usage_limit_waits(&db)
+            .await
+            .expect("waits")
+            .is_empty(),
+        "usage_limit_waits must filter out terminal sessions even with stale columns"
+    );
+    assert!(
+        !sessions::queue_usage_limit_message(&db, waiting.user, waiting.session, "nope")
+            .await
+            .expect("queue check"),
+        "queue_usage_limit_message must reject terminal sessions even with stale columns"
+    );
+}

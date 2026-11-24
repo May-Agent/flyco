@@ -63,13 +63,16 @@
 //! cannot drift, only trail: a stale answer costs one storage read and is
 //! then true again.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use flyco_core::wire::{DaemonAttach, DaemonFrames, EventPage, StoredEvent};
 use flyco_core::workdir::WorkdirReply;
 use flyco_core::{
     CheckoutStatus, ClientEvent, ControlToDaemon, DaemonToControl, DesktopInputRequest,
-    DesktopTakeoverRequest, MessageOrigin, Problem, RepoStatus, ShellRunId, WorkdirRequestId,
+    DesktopTakeoverRequest, HarnessEvent, MessageOrigin, PROMPT_EXCERPT_CHARS, Problem, RepoStatus,
+    ShellRunId, TurnPage, TurnSummary, UsageReport, WorkdirRequestId, excerpt,
 };
 use serde::{Deserialize, Serialize};
 use skyzen::durable::{DurableObject, DurableObjectError};
@@ -103,6 +106,12 @@ pub const EVENT_PAGE_LIMIT: u32 = 500;
 
 /// Most queued commands one SSE step reads at a time.
 const COMMAND_BATCH_LIMIT: u64 = 256;
+
+/// Most frame rows written in one atomic multi-row `INSERT` statement.
+///
+/// Seven bound parameters per row keeps each statement at 84 bindings, safely
+/// inside Cloudflare Durable Object SQLite's 100-parameter limit.
+const MAX_FRAME_ROWS_PER_STATEMENT: usize = 12;
 
 /// How long a daemon's presence marker survives its last contact.
 ///
@@ -175,6 +184,80 @@ pub struct EventCursor {
     /// Return events strictly after this position. Omitted starts at the
     /// beginning of the room's history.
     pub after: Option<u64>,
+}
+
+/// Query of the room's projected turns route.
+#[derive(Debug, Default, Deserialize, skyzen::ToSchema)]
+pub struct TurnCursor {
+    /// Return turns strictly after this turn `seq`. Omitted starts at zero.
+    pub after: Option<u64>,
+    /// Maximum number of turns to return (clamped to [`crate::turns::MAX_TURNS_PER_PAGE`]).
+    pub limit: Option<u32>,
+}
+
+/// One projected turn row from the `turns` table.
+#[derive(Debug, skyzen::FromRow)]
+struct TurnRow {
+    seq: u64,
+    turn_id: String,
+    started_at_unix: u64,
+    completed_at_unix: Option<u64>,
+    prompt_excerpt: String,
+    usage_json: Option<String>,
+}
+
+/// The `turn_backfill` progress row for rooms upgraded from schema v3.
+#[derive(Debug, skyzen::FromRow)]
+struct TurnBackfillRow {
+    next_seq: u64,
+    end_seq: u64,
+}
+
+/// One `(frame_seq, event_seq)` pair read back after an atomic batch insert.
+#[derive(Debug, skyzen::FromRow)]
+struct FrameSeqRow {
+    frame_seq: u64,
+    event_seq: Option<u64>,
+}
+
+/// An activation-scoped async mutual exclusion gate shared by concurrent
+/// `fetch(&self)` requests under `skyzen 0.6`.
+///
+/// Serializes `accept_batch` calls so two overlapping frame retries on the
+/// same Durable Object activation never race across async storage awaits and
+/// read the same `through` cursor. Drop-safe: cancellation releases the gate
+/// and wakes the next waiter.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BatchGate {
+    held: Arc<AtomicBool>,
+    released: Signal,
+}
+
+impl BatchGate {
+    pub(crate) async fn lock(&self) -> BatchGuard {
+        loop {
+            let seen = self.released.version();
+            if self
+                .held
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return BatchGuard { gate: self.clone() };
+            }
+            self.released.changed(seen).await;
+        }
+    }
+}
+
+pub(crate) struct BatchGuard {
+    gate: BatchGate,
+}
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        self.gate.held.store(false, Ordering::Release);
+        self.gate.released.notify();
+    }
 }
 
 /// Query of the room's command stream.
@@ -254,6 +337,10 @@ pub struct SessionRoom {
     /// In-memory wakeup handles shared across concurrent `fetch(&self)` calls.
     #[serde(skip)]
     signals: RoomSignals,
+    /// Serializes concurrent `accept_frames` batches on this activation so
+    /// overlapping retries never read the same `through` cursor.
+    #[serde(skip)]
+    batch_gate: BatchGate,
 }
 
 #[cfg(test)]
@@ -279,6 +366,7 @@ impl DurableObject for SessionRoom {
             "/internal/command".post(run_command),
             "/internal/broadcast".post(run_broadcast),
             "/internal/events".at(read_events),
+            "/internal/turns".at(read_turns),
             "/internal/repo-status".at(read_repo_status),
             "/internal/workdir".post(ask_workdir),
             "/internal/desktop/watch".at(watch_desktop),
@@ -287,6 +375,7 @@ impl DurableObject for SessionRoom {
         ))
         .with(State(self.schema.clone()))
         .with(State(self.signals.clone()))
+        .with(State(self.batch_gate.clone()))
         .build()
     }
 }
@@ -352,6 +441,10 @@ async fn attach_inner(
     // again — the epoch check refuses it — so it is swept rather than
     // kept.
     sql!(db, "DELETE FROM daemon_frames WHERE epoch != {epoch}")
+        .execute()
+        .await
+        .map_err(|error| room_failed(&error))?;
+    sql!(db, "DELETE FROM daemon_frame_events WHERE epoch != {epoch}")
         .execute()
         .await
         .map_err(|error| room_failed(&error))?;
@@ -865,12 +958,150 @@ async fn accept_frames(
     Json(batch): Json<DaemonFrames>,
     State(cache): State<Cache>,
     State(signals): State<RoomSignals>,
+    State(batch_gate): State<BatchGate>,
     db: DurableDb,
     kv: DurableKv,
 ) -> Outcome<Json<Emitted>> {
-    accept_batch(&headers, batch, &db, &kv, &cache, &signals)
+    accept_batch(&headers, batch, &db, &kv, &cache, &signals, &batch_gate)
         .await
         .into()
+}
+
+/// Side effect a prepared daemon frame performs beside the atomic SQLite log.
+enum FrameSideEffect<'a> {
+    None,
+    WorkdirReply {
+        id: WorkdirRequestId,
+        reply: &'a WorkdirReply,
+    },
+    DesktopChunk {
+        keyframe: bool,
+        data: &'a [u8],
+    },
+    Started(&'a str),
+    Capabilities(&'a [String]),
+    RepoDirty {
+        dir: Option<&'a String>,
+        summary: &'a str,
+    },
+}
+
+/// Pre-validated, pre-serialized form of one daemon frame ready to commit.
+struct PreparedFrame<'a> {
+    frame_seq: u64,
+    event_json: Option<String>,
+    turn_op: Option<&'static str>,
+    turn_id: Option<String>,
+    turn_payload: Option<String>,
+    side_effect: FrameSideEffect<'a>,
+    emitted: Option<ClientEvent>,
+}
+
+/// Extracts the turn projection operation for a `ClientEvent`, if any.
+fn turn_op_of(
+    event: &ClientEvent,
+) -> Result<(Option<&'static str>, Option<String>, Option<String>), ApiError> {
+    match event {
+        ClientEvent::Harness {
+            event: HarnessEvent::TurnStarted { turn_id },
+        } => Ok((Some("start"), Some(turn_id.clone()), None)),
+        ClientEvent::Harness {
+            event: HarnessEvent::TurnCompleted { turn_id, usage },
+        } => {
+            let usage_json = serde_json::to_string(usage)
+                .map_err(|error| ApiError::Room(format!("usage did not serialize: {error}")))?;
+            Ok((Some("complete"), Some(turn_id.clone()), Some(usage_json)))
+        }
+        ClientEvent::Harness {
+            event: HarnessEvent::TurnFailed { turn_id, .. },
+        } => Ok((Some("fail"), Some(turn_id.clone()), None)),
+        _ => Ok((None, None, None)),
+    }
+}
+
+/// Validates and encodes one daemon frame in memory before touching storage.
+fn prepare_daemon_frame(
+    frame_seq: u64,
+    frame: &DaemonToControl,
+) -> Result<PreparedFrame<'_>, ApiError> {
+    if let DaemonToControl::WorkdirReply { id, reply } = frame {
+        return Ok(PreparedFrame {
+            frame_seq,
+            event_json: None,
+            turn_op: None,
+            turn_id: None,
+            turn_payload: None,
+            side_effect: FrameSideEffect::WorkdirReply { id: *id, reply },
+            emitted: None,
+        });
+    }
+    if let DaemonToControl::DesktopChunk { keyframe, data } = frame {
+        return Ok(PreparedFrame {
+            frame_seq,
+            event_json: None,
+            turn_op: None,
+            turn_id: None,
+            turn_payload: None,
+            side_effect: FrameSideEffect::DesktopChunk {
+                keyframe: *keyframe,
+                data,
+            },
+            emitted: None,
+        });
+    }
+
+    let Some(event) = ClientEvent::from_daemon(frame.clone()) else {
+        // Every post-attach frame has a client form; reaching this means
+        // the mapping grew a hole.
+        return Err(ApiError::Room(
+            "a daemon frame had no client form".to_owned(),
+        ));
+    };
+
+    let (recorded, side_effect) = match frame {
+        DaemonToControl::Started { harness_session_id } => {
+            (false, FrameSideEffect::Started(harness_session_id))
+        }
+        DaemonToControl::Capabilities { capabilities } => {
+            (false, FrameSideEffect::Capabilities(capabilities))
+        }
+        DaemonToControl::RepoDirty { dir, summary } => (
+            false,
+            FrameSideEffect::RepoDirty {
+                dir: dir.as_ref(),
+                summary,
+            },
+        ),
+        DaemonToControl::Harness { .. }
+        | DaemonToControl::Commands { .. }
+        | DaemonToControl::ShellOutput { .. }
+        | DaemonToControl::ShellExited { .. }
+        | DaemonToControl::ProvisioningStage { .. }
+        | DaemonToControl::DesktopState { .. }
+        | DaemonToControl::DesktopActive
+        | DaemonToControl::SpotNotice { .. }
+        | DaemonToControl::RepoAdded { .. } => (true, FrameSideEffect::None),
+        _ => (false, FrameSideEffect::None),
+    };
+
+    let (event_json, turn_op, turn_id, turn_payload) = if recorded {
+        let json = serde_json::to_string(&event)
+            .map_err(|error| ApiError::Room(format!("an event did not serialize: {error}")))?;
+        let (turn_op, turn_id, turn_payload) = turn_op_of(&event)?;
+        (Some(json), turn_op, turn_id, turn_payload)
+    } else {
+        (None, None, None, None)
+    };
+
+    Ok(PreparedFrame {
+        frame_seq,
+        event_json,
+        turn_op,
+        turn_id,
+        turn_payload,
+        side_effect,
+        emitted: Some(event),
+    })
 }
 
 async fn accept_batch(
@@ -880,8 +1111,10 @@ async fn accept_batch(
     kv: &DurableKv,
     cache: &Cache,
     signals: &RoomSignals,
+    batch_gate: &BatchGate,
 ) -> Result<Json<Emitted>, ApiError> {
     internal(headers)?;
+    let _guard = batch_gate.lock().await;
     ensure_schema(db, cache)
         .await
         .map_err(|error| room_failed(&error))?;
@@ -921,24 +1154,101 @@ async fn accept_batch(
     // `through` are already applied; only the rest is new.
     let skip = usize::try_from(next.saturating_sub(batch.from_seq)).unwrap_or(usize::MAX);
     let fresh = batch.frames.get(skip..).unwrap_or(&[]);
-    let mut emitted = Vec::with_capacity(fresh.len());
-    for frame in fresh {
-        emitted.extend(apply_daemon_frame(frame, db, kv, cache, signals).await?);
+    let first_fresh_seq = batch
+        .from_seq
+        .saturating_add(u64::try_from(skip).unwrap_or(0));
+
+    // Validate and encode every fresh frame up front so a bad frame fails
+    // before anything touches storage.
+    let mut prepared = Vec::with_capacity(fresh.len());
+    for (offset, frame) in fresh.iter().enumerate() {
+        let frame_seq = first_fresh_seq.saturating_add(u64::try_from(offset).unwrap_or(0));
+        prepared.push(prepare_daemon_frame(frame_seq, frame)?);
     }
-    if !batch.frames.is_empty() {
-        let new_through = batch
-            .from_seq
-            .saturating_add(u64::try_from(batch.frames.len()).unwrap_or(0))
-            .saturating_sub(1);
-        sql!(
+
+    let mut emitted = Vec::with_capacity(prepared.len());
+    let at_unix = now_unix();
+
+    // Commit each chunk atomically: `daemon_frame_events_apply` inserts
+    // recorded rows into `events`, projects `turns`, and advances
+    // `daemon_frames.through` inside one SQLite statement so a mid-batch
+    // storage failure can never duplicate events on retry.
+    for chunk in prepared.chunks_mut(MAX_FRAME_ROWS_PER_STATEMENT) {
+        for item in chunk.iter() {
+            match &item.side_effect {
+                FrameSideEffect::None => {}
+                FrameSideEffect::WorkdirReply { id, reply } => {
+                    store_workdir_reply(db, cache, *id, reply, &signals.workdir)
+                        .await
+                        .map_err(|error| room_failed(&error))?;
+                }
+                FrameSideEffect::DesktopChunk { keyframe, data } => {
+                    store_desktop_chunk(db, *keyframe, data, &signals.chunks)
+                        .await
+                        .map_err(|error| room_failed(&error))?;
+                }
+                FrameSideEffect::Started(harness_session_id) => {
+                    put_latest(kv, KEY_HARNESS_SESSION, harness_session_id)
+                        .await
+                        .map_err(|error| room_failed(&error))?;
+                }
+                FrameSideEffect::Capabilities(capabilities) => {
+                    put_latest(kv, KEY_CAPABILITIES, capabilities)
+                        .await
+                        .map_err(|error| room_failed(&error))?;
+                }
+                FrameSideEffect::RepoDirty { dir, summary } => {
+                    note_checkout(kv, *dir, summary)
+                        .await
+                        .map_err(|error| room_failed(&error))?;
+                }
+            }
+        }
+
+        let placeholders = vec!["(?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ");
+        let statement = format!(
+            "INSERT OR IGNORE INTO daemon_frame_events \
+             (epoch, frame_seq, json, at_unix, turn_op, turn_id, turn_payload) \
+             VALUES {placeholders}"
+        );
+        let mut query = db.query(&statement);
+        for item in chunk.iter() {
+            query = query
+                .bind(epoch)
+                .bind(item.frame_seq)
+                .bind(item.event_json.clone())
+                .bind(at_unix)
+                .bind(item.turn_op.map(str::to_owned))
+                .bind(item.turn_id.clone())
+                .bind(item.turn_payload.clone());
+        }
+        query
+            .execute()
+            .await
+            .map_err(|error| room_failed(&error))?;
+
+        let first_seq = chunk[0].frame_seq;
+        let last_seq = chunk[chunk.len() - 1].frame_seq;
+        let seqs: Vec<FrameSeqRow> = sql!(
             db,
-            "INSERT INTO daemon_frames (epoch, through) VALUES ({epoch}, {new_through}) \
-             ON CONFLICT (epoch) DO UPDATE SET \
-                 through = max(excluded.through, daemon_frames.through)"
+            "SELECT frame_seq, event_seq FROM daemon_frame_events \
+             WHERE epoch = {epoch} AND frame_seq >= {first_seq} AND frame_seq <= {last_seq} \
+             ORDER BY frame_seq"
         )
-        .execute()
+        .fetch_all()
         .await
         .map_err(|error| room_failed(&error))?;
+
+        for item in chunk.iter_mut() {
+            let Some(event) = item.emitted.take() else {
+                continue;
+            };
+            let seq = seqs
+                .iter()
+                .find(|row| row.frame_seq == item.frame_seq)
+                .and_then(|row| row.event_seq);
+            emitted.push(EmittedEvent { seq, event });
+        }
     }
 
     let ack_through = batch.ack_through;
@@ -963,48 +1273,6 @@ async fn accept_batch(
     .map_err(|error| room_failed(&error))?;
 
     Ok(Json(Emitted { events: emitted }))
-}
-
-/// Applies one daemon frame the way the relay did: recorded when it is
-/// something that happened, folded into the emitted list in its client
-/// form.
-async fn apply_daemon_frame(
-    frame: &DaemonToControl,
-    db: &DurableDb,
-    kv: &DurableKv,
-    cache: &Cache,
-    signals: &RoomSignals,
-) -> Result<Vec<EmittedEvent>, ApiError> {
-    // Addressed rather than fanned out: one browser is waiting on the
-    // HTTP request this answers, and nobody else has any use for it.
-    if let DaemonToControl::WorkdirReply { id, reply } = frame {
-        store_workdir_reply(db, cache, *id, reply, &signals.workdir)
-            .await
-            .map_err(|error| room_failed(&error))?;
-        return Ok(Vec::new());
-    }
-
-    // Stream bytes rather than an event: chunks land in the stream's own
-    // table, where watch streams read them, and never in `events` — a
-    // replayed transcript is not a screen recording.
-    if let DaemonToControl::DesktopChunk { keyframe, data } = frame {
-        store_desktop_chunk(db, *keyframe, data, &signals.chunks)
-            .await
-            .map_err(|error| room_failed(&error))?;
-        return Ok(Vec::new());
-    }
-
-    let seq = record(frame, db, kv, cache)
-        .await
-        .map_err(|error| room_failed(&error))?;
-    let Some(event) = ClientEvent::from_daemon(frame.clone()) else {
-        // Every post-attach frame has a client form; reaching this means
-        // the mapping grew a hole.
-        return Err(ApiError::Room(
-            "a daemon frame had no client form".to_owned(),
-        ));
-    };
-    Ok(vec![EmittedEvent { seq, event }])
 }
 
 // ── The room's command surface ──
@@ -1387,91 +1655,6 @@ async fn echo_of(
     Ok(vec![EmittedEvent { seq, event }])
 }
 
-/// Appends a frame to the room's durable stream and caches what the UI
-/// reads on connect.
-///
-/// Only what *happened* is appended — the harness stream and the
-/// provisioning timeline: a catch-up must replay events, and a usage
-/// meter or a capability set is a *current value*, so storing every one
-/// of them would grow the table without making the replay any more
-/// complete. Those go to KV, newest wins.
-async fn record(
-    frame: &DaemonToControl,
-    db: &DurableDb,
-    kv: &DurableKv,
-    cache: &Cache,
-) -> Result<Option<u64>, DurableObjectError> {
-    let event = match frame {
-        DaemonToControl::Harness { event } => ClientEvent::Harness {
-            event: event.clone(),
-        },
-        DaemonToControl::Started { harness_session_id } => {
-            return put_latest(kv, KEY_HARNESS_SESSION, harness_session_id)
-                .await
-                .map(|()| None);
-        }
-        DaemonToControl::Capabilities { capabilities } => {
-            return put_latest(kv, KEY_CAPABILITIES, capabilities)
-                .await
-                .map(|()| None);
-        }
-        // Appended rather than kept in KV beside the capability set, and
-        // for the reason the model list is appended too: the `/` palette is
-        // built from the room's replayed stream, so a browser that opens
-        // the session long after the daemon reported its commands has to
-        // find them there or open on flyco's own three.
-        DaemonToControl::Commands { commands } => ClientEvent::Commands {
-            commands: commands.clone(),
-        },
-        // Both halves of a `!` command's answer are appended: the command
-        // was recorded when it arrived, and a transcript row that replayed
-        // as a command with no output and no exit status would be worse
-        // than not replaying it at all. The web terminal's output is live
-        // only for the opposite reason — it has no row to belong to.
-        DaemonToControl::ShellOutput { run, stream, data } => ClientEvent::ShellOutput {
-            run: *run,
-            stream: *stream,
-            data: data.clone(),
-        },
-        DaemonToControl::ShellExited {
-            run,
-            outcome,
-            truncated,
-        } => ClientEvent::ShellExited {
-            run: *run,
-            outcome: outcome.clone(),
-            truncated: *truncated,
-        },
-        DaemonToControl::ProvisioningStage { stage, at_unix } => ClientEvent::ProvisioningStage {
-            stage: *stage,
-            at_unix: *at_unix,
-        },
-        DaemonToControl::DesktopState { status, detail } => ClientEvent::DesktopState {
-            status: *status,
-            detail: detail.clone(),
-        },
-        DaemonToControl::DesktopActive => ClientEvent::DesktopActive,
-        // Appended rather than only forwarded: a reclamation is something
-        // that *happened* to the session, and the browser most likely to
-        // want it is one opened after the machine was already gone.
-        DaemonToControl::SpotNotice { seconds_remaining } => ClientEvent::SpotNotice {
-            seconds_remaining: *seconds_remaining,
-        },
-        DaemonToControl::RepoDirty { dir, summary } => {
-            return note_checkout(kv, dir.as_ref(), summary)
-                .await
-                .map(|()| None);
-        }
-        DaemonToControl::RepoAdded { slug, branch, dir } => ClientEvent::RepoAdded {
-            slug: slug.clone(),
-            branch: branch.clone(),
-            dir: dir.clone(),
-        },
-        _ => return Ok(None),
-    };
-    append(db, cache, &event).await.map(Some)
-}
-
 /// Records one checkout's last-reported `git status` in the room's KV.
 ///
 /// The daemon is the only thing that can see the working trees, and it
@@ -1519,11 +1702,12 @@ async fn append(
 ) -> Result<u64, DurableObjectError> {
     let json = serde_json::to_string(event)
         .map_err(|error| DurableObjectError::Serialization(error.to_string()))?;
+    let at_unix = now_unix();
 
     ensure_schema(db, cache).await?;
     sql!(
         db,
-        "INSERT INTO events (json, at_unix) VALUES ({json}, {now_unix()})"
+        "INSERT INTO events (json, at_unix) VALUES ({json}, {at_unix})"
     )
     .execute()
     .await
@@ -1531,11 +1715,96 @@ async fn append(
 
     // Single-threaded per room: nothing else can have appended between
     // the insert above and this read.
-    sql!(db, "SELECT seq FROM events ORDER BY seq DESC LIMIT 1")
+    let seq: u64 = sql!(db, "SELECT seq FROM events ORDER BY seq DESC LIMIT 1")
         .fetch_scalar_optional()
         .await
         .map_err(|error| stored(&error))?
-        .ok_or_else(|| DurableObjectError::Runtime("an appended event had no position".to_owned()))
+        .ok_or_else(|| {
+            DurableObjectError::Runtime("an appended event had no position".to_owned())
+        })?;
+    project_turn_event(db, seq, at_unix, event).await?;
+    Ok(seq)
+}
+
+/// Projects one event into `turns` / `turn_pending_prompt` when it is a
+/// turn boundary or user prompt. Non-turn events cost zero SQL statements.
+async fn project_turn_event(
+    db: &DurableDb,
+    seq: u64,
+    at_unix: u64,
+    event: &ClientEvent,
+) -> Result<(), DurableObjectError> {
+    match event {
+        ClientEvent::UserMessage { text, .. } => {
+            let prompt = excerpt(text, PROMPT_EXCERPT_CHARS);
+            sql!(
+                db,
+                "INSERT INTO turn_pending_prompt (id, excerpt) VALUES (0, {prompt}) \
+                 ON CONFLICT (id) DO UPDATE SET excerpt = excluded.excerpt"
+            )
+            .execute()
+            .await
+            .map_err(|error| stored(&error))?;
+        }
+        ClientEvent::Harness {
+            event: HarnessEvent::TurnStarted { turn_id },
+        } => {
+            let turn_id = turn_id.as_str();
+            let prompt: String = sql!(
+                db,
+                "SELECT excerpt FROM turn_pending_prompt WHERE id = 0"
+            )
+            .fetch_scalar_optional()
+            .await
+            .map_err(|error| stored(&error))?
+            .unwrap_or_default();
+            sql!(
+                db,
+                "INSERT OR IGNORE INTO turns \
+                 (seq, turn_id, started_at_unix, completed_at_unix, prompt_excerpt, usage_json) \
+                 VALUES ({seq}, {turn_id}, {at_unix}, NULL, {prompt}, NULL)"
+            )
+            .execute()
+            .await
+            .map_err(|error| stored(&error))?;
+            sql!(db, "DELETE FROM turn_pending_prompt WHERE id = 0")
+                .execute()
+                .await
+                .map_err(|error| stored(&error))?;
+        }
+        ClientEvent::Harness {
+            event: HarnessEvent::TurnCompleted { turn_id, usage },
+        } => {
+            let turn_id = turn_id.as_str();
+            let usage_json = serde_json::to_string(usage)
+                .map_err(|error| DurableObjectError::Serialization(error.to_string()))?;
+            sql!(
+                db,
+                "UPDATE turns SET completed_at_unix = {at_unix}, usage_json = {usage_json} \
+                 WHERE seq = (SELECT seq FROM turns ORDER BY seq DESC LIMIT 1) \
+                 AND turn_id = {turn_id} AND completed_at_unix IS NULL"
+            )
+            .execute()
+            .await
+            .map_err(|error| stored(&error))?;
+        }
+        ClientEvent::Harness {
+            event: HarnessEvent::TurnFailed { turn_id, .. },
+        } => {
+            let turn_id = turn_id.as_str();
+            sql!(
+                db,
+                "UPDATE turns SET completed_at_unix = {at_unix} \
+                 WHERE seq = (SELECT seq FROM turns ORDER BY seq DESC LIMIT 1) \
+                 AND turn_id = {turn_id} AND completed_at_unix IS NULL"
+            )
+            .execute()
+            .await
+            .map_err(|error| stored(&error))?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The browser's terminal pane, as it was last fitted.
@@ -1592,7 +1861,7 @@ async fn put_latest<T: Serialize + Sync>(
 /// append, each page read, each attach — need the answer to cost. Bump it
 /// when the DDL below changes so a room built by an older build upgrades
 /// once, on its next call.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Creates the room's tables if this is its first write.
 ///
@@ -1691,6 +1960,80 @@ async fn ensure_schema(db: &DurableDb, cache: &Cache) -> Result<(), DurableObjec
             // The row the conditional updates CAS against; absent it, a
             // first flip would have nothing to flip from.
             "INSERT OR IGNORE INTO desktop_state (id, watching, takeover) VALUES (0, 0, 0)",
+            // Lightweight turn projection maintained beside `events` so
+            // `GET /v1/sessions/{id}/turns` reads O(turns) rows instead of
+            // scanning thousands of streaming deltas, and never stalls when
+            // one turn spans >500 events.
+            "CREATE TABLE IF NOT EXISTS turns (\
+             seq               INTEGER PRIMARY KEY, \
+             turn_id           TEXT    NOT NULL, \
+             started_at_unix   INTEGER NOT NULL, \
+             completed_at_unix INTEGER, \
+             prompt_excerpt    TEXT    NOT NULL, \
+             usage_json        TEXT)",
+            // Pending user prompt waiting for the next `TurnStarted` event.
+            "CREATE TABLE IF NOT EXISTS turn_pending_prompt (\
+             id      INTEGER PRIMARY KEY CHECK (id = 0), \
+             excerpt TEXT    NOT NULL)",
+            // One-shot backfill cursor for rooms upgraded from schema v3 that
+            // already hold pre-projection rows in `events`. Brand-new rooms
+            // start with `end_seq = 0` and never scan `events`.
+            "CREATE TABLE IF NOT EXISTS turn_backfill (\
+             id       INTEGER PRIMARY KEY CHECK (id = 0), \
+             next_seq INTEGER NOT NULL, \
+             end_seq  INTEGER NOT NULL)",
+            "INSERT OR IGNORE INTO turn_backfill (id, next_seq, end_seq) \
+             VALUES (0, 0, COALESCE((SELECT MAX(seq) FROM events), 0))",
+            // Per-frame receipt log for atomic, idempotent `accept_batch`
+            // writes. Inserting rows here fires `daemon_frame_events_apply`
+            // in the same implicit SQLite transaction, appending recorded
+            // events, projecting turn boundaries, and advancing
+            // `daemon_frames.through` atomically without BEGIN/COMMIT.
+            "CREATE TABLE IF NOT EXISTS daemon_frame_events (\
+             epoch        INTEGER NOT NULL, \
+             frame_seq    INTEGER NOT NULL, \
+             json         TEXT, \
+             at_unix      INTEGER NOT NULL, \
+             turn_op      TEXT, \
+             turn_id      TEXT, \
+             turn_payload TEXT, \
+             event_seq    INTEGER, \
+             PRIMARY KEY (epoch, frame_seq))",
+            "CREATE TRIGGER IF NOT EXISTS daemon_frame_events_apply \
+             AFTER INSERT ON daemon_frame_events \
+             BEGIN \
+                 INSERT INTO events (json, at_unix) \
+                 SELECT NEW.json, NEW.at_unix WHERE NEW.json IS NOT NULL; \
+                 UPDATE daemon_frame_events \
+                 SET event_seq = last_insert_rowid() \
+                 WHERE epoch = NEW.epoch AND frame_seq = NEW.frame_seq AND NEW.json IS NOT NULL; \
+                 INSERT OR IGNORE INTO turns \
+                     (seq, turn_id, started_at_unix, completed_at_unix, prompt_excerpt, usage_json) \
+                 SELECT (SELECT event_seq FROM daemon_frame_events \
+                         WHERE epoch = NEW.epoch AND frame_seq = NEW.frame_seq), \
+                        NEW.turn_id, \
+                        NEW.at_unix, \
+                        NULL, \
+                        COALESCE((SELECT excerpt FROM turn_pending_prompt WHERE id = 0), ''), \
+                        NULL \
+                 WHERE NEW.turn_op = 'start'; \
+                 DELETE FROM turn_pending_prompt WHERE id = 0 AND NEW.turn_op = 'start'; \
+                 UPDATE turns \
+                 SET completed_at_unix = NEW.at_unix, usage_json = NEW.turn_payload \
+                 WHERE NEW.turn_op = 'complete' \
+                   AND seq = (SELECT seq FROM turns ORDER BY seq DESC LIMIT 1) \
+                   AND turn_id = NEW.turn_id \
+                   AND completed_at_unix IS NULL; \
+                 UPDATE turns \
+                 SET completed_at_unix = NEW.at_unix \
+                 WHERE NEW.turn_op = 'fail' \
+                   AND seq = (SELECT seq FROM turns ORDER BY seq DESC LIMIT 1) \
+                   AND turn_id = NEW.turn_id \
+                   AND completed_at_unix IS NULL; \
+                 INSERT INTO daemon_frames (epoch, through) VALUES (NEW.epoch, NEW.frame_seq) \
+                 ON CONFLICT (epoch) DO UPDATE SET \
+                     through = max(excluded.through, daemon_frames.through); \
+             END",
         ],
     )
     .await
@@ -1803,6 +2146,135 @@ async fn page(
         .collect();
 
     Ok(Json(EventPage { events, more }))
+}
+
+/// Serves one page of the room's projected turn summaries.
+async fn read_turns(
+    headers: Headers,
+    Query(cursor): Query<TurnCursor>,
+    State(cache): State<Cache>,
+    db: DurableDb,
+) -> Outcome<Json<TurnPage>> {
+    turns_page(
+        &headers,
+        cursor.after.unwrap_or(0),
+        cursor.limit.unwrap_or(crate::turns::MAX_TURNS_PER_PAGE),
+        &db,
+        &cache,
+    )
+    .await
+    .into()
+}
+
+/// Backfills `turns` from pre-schema-v4 `events` rows, bounded by `row_budget`.
+///
+/// Brand-new rooms start with `end_seq = 0`, so this is a single keyed lookup
+/// and zero event scans. Upgraded rooms catch up once in `EVENT_PAGE_LIMIT`
+/// chunks under the daily row-read budget.
+async fn backfill_turns(db: &DurableDb) -> Result<(), ApiError> {
+    let Some(mut progress): Option<TurnBackfillRow> =
+        sql!(db, "SELECT next_seq, end_seq FROM turn_backfill WHERE id = 0")
+            .fetch_optional()
+            .await
+            .map_err(|error| ApiError::Room(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    while progress.next_seq < progress.end_seq {
+        crate::row_budget::check_budget(db).await?;
+        let next_seq = progress.next_seq;
+        let end_seq = progress.end_seq;
+        let limit = EVENT_PAGE_LIMIT;
+        let rows: Vec<EventRow> = sql!(
+            db,
+            "SELECT seq, json, at_unix FROM events \
+             WHERE seq > {next_seq} AND seq <= {end_seq} ORDER BY seq LIMIT {limit}"
+        )
+        .fetch_all()
+        .await
+        .map_err(|error| ApiError::Room(error.to_string()))?;
+        crate::row_budget::debit_reads(db, rows.len() as u64).await?;
+        if rows.is_empty() {
+            sql!(
+                db,
+                "UPDATE turn_backfill SET next_seq = {end_seq} WHERE id = 0"
+            )
+            .execute()
+            .await
+            .map_err(|error| ApiError::Room(error.to_string()))?;
+            break;
+        }
+        let mut last_seq = next_seq;
+        for row in rows {
+            last_seq = row.seq;
+            let event: ClientEvent = serde_json::from_value(row.json)
+                .map_err(|_| ApiError::CorruptRecord("a room recorded a non-client event"))?;
+            project_turn_event(db, row.seq, row.at_unix, &event)
+                .await
+                .map_err(|error| room_failed(&error))?;
+        }
+        progress.next_seq = last_seq;
+        sql!(
+            db,
+            "UPDATE turn_backfill SET next_seq = {last_seq} WHERE id = 0"
+        )
+        .execute()
+        .await
+        .map_err(|error| ApiError::Room(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn turns_page(
+    headers: &Headers,
+    after: u64,
+    limit: u32,
+    db: &DurableDb,
+    cache: &Cache,
+) -> Result<Json<TurnPage>, ApiError> {
+    internal(headers)?;
+    ensure_schema(db, cache)
+        .await
+        .map_err(|error| room_failed(&error))?;
+    backfill_turns(db).await?;
+
+    let page_limit = limit.clamp(1, crate::turns::MAX_TURNS_PER_PAGE);
+    let fetch_limit = page_limit + 1;
+    crate::row_budget::check_budget(db).await?;
+    let rows: Vec<TurnRow> = sql!(
+        db,
+        "SELECT seq, turn_id, started_at_unix, completed_at_unix, prompt_excerpt, usage_json \
+         FROM turns WHERE seq > {after} ORDER BY seq LIMIT {fetch_limit}"
+    )
+    .fetch_all()
+    .await
+    .map_err(|error| ApiError::Room(error.to_string()))?;
+    crate::row_budget::debit_reads(db, rows.len() as u64).await?;
+
+    let more = rows.len() > page_limit as usize;
+    let mut turns = Vec::with_capacity(rows.len().min(page_limit as usize));
+    let mut last_seq = after;
+    for row in rows.into_iter().take(page_limit as usize) {
+        last_seq = row.seq;
+        let usage: Option<UsageReport> = match row.usage_json {
+            Some(json) => Some(serde_json::from_str(&json).map_err(|_| {
+                ApiError::CorruptRecord("a room recorded an unreadable turn usage report")
+            })?),
+            None => None,
+        };
+        turns.push(TurnSummary {
+            turn_id: row.turn_id,
+            started_at_unix: row.started_at_unix,
+            completed_at_unix: row.completed_at_unix,
+            prompt_excerpt: row.prompt_excerpt,
+            usage,
+        });
+    }
+
+    Ok(Json(TurnPage {
+        turns,
+        next_cursor: more.then(|| last_seq.to_string()),
+    }))
 }
 
 /// Serves the working tree the daemon last reported.

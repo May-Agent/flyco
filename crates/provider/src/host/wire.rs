@@ -65,6 +65,14 @@ pub enum HostToControl {
         job_id: MachineId,
         /// What came of it.
         outcome: JobOutcome,
+        /// The room command sequence this result answers.
+        ///
+        /// Optional on the wire so older daemons that do not send it still
+        /// deserialize; the host room retires `WHERE seq = command_seq` when
+        /// present and falls back to the oldest row for the container only
+        /// when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_seq: Option<u64>,
     },
 }
 
@@ -173,12 +181,14 @@ mod tests {
                     container: "flyco-9d0f".to_owned(),
                     volume: "flyco-9d0f-work".to_owned(),
                 },
+                command_seq: Some(42),
             },
             HostToControl::JobResult {
                 job_id: MachineId::generate(),
                 outcome: JobOutcome::Failed {
                     message: "podman: no space left on device".to_owned(),
                 },
+                command_seq: None,
             },
         ]
     }
