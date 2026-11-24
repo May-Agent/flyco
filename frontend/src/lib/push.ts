@@ -12,6 +12,7 @@
  * same pattern `src/lib/session.ts` uses for the session token.
  */
 import { getVapidPublicKey, subscribePush, unsubscribePush } from "../api/client";
+import { ApiProblem } from "../api/problem";
 
 const SUBSCRIPTION_ID_KEY = "flyco.push_subscription_id";
 
@@ -41,8 +42,8 @@ export async function getPushSubscription(): Promise<PushSubscription | null> {
 
 /**
  * Requests notification permission, subscribes to push, and registers the
- * result with the control plane. Throws if push isn't supported or permission
- * is denied — never returns a half-subscribed state.
+ * result with the control plane. Rolls back the browser subscription if
+ * registration fails so no orphaned subscription is left behind.
  */
 export async function subscribeToPush(): Promise<PushSubscription> {
   if (!isPushSupported()) {
@@ -59,17 +60,38 @@ export async function subscribeToPush(): Promise<PushSubscription> {
     applicationServerKey: urlBase64ToUint8Array(vapid.key),
   });
 
-  const json = subscription.toJSON();
-  if (json.endpoint === undefined || json.keys?.p256dh === undefined || json.keys.auth === undefined) {
-    throw new Error("Browser push subscription is missing its endpoint or keys.");
+  try {
+    const json = subscription.toJSON();
+    if (
+      json.endpoint === undefined ||
+      json.keys?.p256dh === undefined ||
+      json.keys.auth === undefined
+    ) {
+      throw new Error("Browser push subscription is missing its endpoint or keys.");
+    }
+    const registered = await subscribePush({
+      endpoint: json.endpoint,
+      keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
+      expirationTime: subscription.expirationTime,
+    });
+    localStorage.setItem(SUBSCRIPTION_ID_KEY, registered.id);
+    return subscription;
+  } catch (error) {
+    await subscription.unsubscribe().catch(() => {});
+    throw error;
   }
-  const registered = await subscribePush({
-    endpoint: json.endpoint,
-    keys: { p256dh: json.keys.p256dh, auth: json.keys.auth },
-    expirationTime: subscription.expirationTime,
-  });
-  localStorage.setItem(SUBSCRIPTION_ID_KEY, registered.id);
-  return subscription;
+}
+
+/** Unregisters `id` on the control plane, treating 404 as already removed. */
+async function deleteRemoteSubscription(id: string): Promise<void> {
+  try {
+    await unsubscribePush(id);
+  } catch (error) {
+    if (error instanceof ApiProblem && error.status === 404) {
+      return;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -78,13 +100,37 @@ export async function subscribeToPush(): Promise<PushSubscription> {
  */
 export async function unsubscribeFromPush(): Promise<boolean> {
   const subscription = await getPushSubscription();
+  const id = localStorage.getItem(SUBSCRIPTION_ID_KEY);
   if (subscription === null) {
+    if (id !== null) {
+      await deleteRemoteSubscription(id);
+      localStorage.removeItem(SUBSCRIPTION_ID_KEY);
+    }
     return false;
   }
-  const id = localStorage.getItem(SUBSCRIPTION_ID_KEY);
   if (id !== null) {
-    await unsubscribePush(id);
+    await deleteRemoteSubscription(id);
     localStorage.removeItem(SUBSCRIPTION_ID_KEY);
   }
   return subscription.unsubscribe();
+}
+
+/**
+ * Best-effort cleanup invoked on sign-out before the session token is cleared.
+ *
+ * Fires `DELETE /v1/push/subscriptions/{id}` synchronously so the outgoing
+ * user's Bearer header is captured before `clearSessionToken()`, and drops the
+ * browser's `PushSubscription` without blocking navigation.
+ */
+export function unregisterPushOnSignOut(): void {
+  const id = localStorage.getItem(SUBSCRIPTION_ID_KEY);
+  if (id !== null) {
+    localStorage.removeItem(SUBSCRIPTION_ID_KEY);
+    void deleteRemoteSubscription(id).catch(() => {});
+  }
+  if (isPushSupported()) {
+    void getPushSubscription()
+      .then((subscription) => subscription?.unsubscribe())
+      .catch(() => {});
+  }
 }

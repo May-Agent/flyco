@@ -26,6 +26,7 @@
  */
 import { createParser, type EventSourceParser } from "eventsource-parser";
 import { createSignal, type Accessor } from "solid-js";
+import { getSessionToken, onSessionChanged } from "../lib/session";
 import { openUserStream } from "./client";
 import { ApiProblem, NotImplementedError } from "./problem";
 import { parseSessionEvent, type SessionEvent } from "./wire";
@@ -154,6 +155,16 @@ export interface UserStreamOptions {
  * {@link userStream}; tests build their own with an injected `open`.
  */
 export function createUserStream(options: UserStreamOptions = {}): UserStream {
+  return createManagedUserStream(options);
+}
+
+interface ManagedUserStream extends UserStream {
+  reset(): void;
+}
+
+function createManagedUserStream(
+  options: UserStreamOptions = {},
+): ManagedUserStream {
   const open = options.open ?? openUserStream;
   const silenceLimitMs = options.silenceLimitMs ?? SILENCE_LIMIT_MS;
   const [state, setState] = createSignal<ConnectionState>("closed");
@@ -403,18 +414,47 @@ export function createUserStream(options: UserStreamOptions = {}): UserStream {
     };
   }
 
-  return { state, failure, subscribe };
+  function reset(): void {
+    stop();
+    lastId = undefined;
+    attempt = 0;
+    setFailure(null);
+    listeners.clear();
+  }
+
+  return { state, failure, subscribe, reset };
 }
 
 /** The stream the app shares. */
-let shared: UserStream | null = null;
+let shared: ManagedUserStream | null = null;
+let lastObservedToken: string | null =
+  typeof window !== "undefined" ? getSessionToken() : null;
+
+/**
+ * Stops the shared event stream and drops its reconnect cursor (`lastId`) so a
+ * subsequent sign-in never resumes from the previous user's buffer offset.
+ */
+export function resetUserStream(): void {
+  shared?.reset();
+  shared = null;
+}
+
+if (typeof window !== "undefined") {
+  onSessionChanged(() => {
+    const current = getSessionToken();
+    if (current !== lastObservedToken) {
+      lastObservedToken = current;
+      resetUserStream();
+    }
+  });
+}
 
 /**
  * The one stream for this page's user — created on first use, kept for
- * the app's lifetime. Session views subscribe through their relay rather
- * than touching this directly.
+ * the current session's lifetime. Session views subscribe through their relay
+ * rather than touching this directly.
  */
 export function userStream(): UserStream {
-  shared ??= createUserStream();
+  shared ??= createManagedUserStream();
   return shared;
 }

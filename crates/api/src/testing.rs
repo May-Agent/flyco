@@ -1269,12 +1269,17 @@ impl MicrosoftOauth for TestMicrosoft {
         client: microsoft::OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> impl Future<Output = Result<microsoft::SignIn, MicrosoftError>> + Send {
         assert_eq!(client.id, AZURE_CLIENT_ID);
         assert_eq!(client.secret, AZURE_CLIENT_SECRET);
         assert!(
             redirect_uri.ends_with("/v1/providers/azure/oauth/callback"),
             "the exchange is bound to flyco's own callback: {redirect_uri}"
+        );
+        assert!(
+            !code_verifier.is_empty(),
+            "the exchange carries the attempt's PKCE verifier"
         );
         ready(
             if self.behaviour == CloudBehaviour::Succeeds && code == CLOUD_CODE {
@@ -1355,12 +1360,17 @@ impl GoogleOauth for TestGoogle {
         client: google::OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> impl Future<Output = Result<google::SignIn, GoogleError>> + Send {
         assert_eq!(client.id, GOOGLE_CLIENT_ID);
         assert_eq!(client.secret, GOOGLE_CLIENT_SECRET);
         assert!(
             redirect_uri.ends_with("/v1/providers/gcp/oauth/callback"),
             "the exchange is bound to flyco's own callback: {redirect_uri}"
+        );
+        assert!(
+            !code_verifier.is_empty(),
+            "the exchange carries the attempt's PKCE verifier"
         );
         ready(
             if self.behaviour == CloudBehaviour::Succeeds && code == CLOUD_CODE {

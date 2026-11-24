@@ -9,7 +9,16 @@ describe("post-login destination", () => {
     expect(consumePostLoginPath()).toBe("/");
   });
 
-  it.each(["settings", "//outside.test/path"])("rejects a non-local path: %s", (path) => {
+  it.each([
+    "settings",
+    "//outside.test/path",
+    "/\\evil.com",
+    "/\t/evil.com",
+    "/\n/evil.com",
+    "/path\r\ninjected",
+    "/path\u0000null",
+    "https://outside.test/path",
+  ])("rejects a non-local or malformed path: %s", (path) => {
     expect(() => rememberPostLoginPath(path)).toThrow(/absolute path/);
   });
 

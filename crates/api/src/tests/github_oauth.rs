@@ -57,9 +57,13 @@ async fn a_sign_in_stores_the_renewal_halves_sealed(ctx: TestContext, _kv: Kv, d
         TestGithub::expiring(),
     ));
 
+    let pair = crate::crypto::pkce().expect("mint PKCE");
     let response = client
         .post("/v1/auth/github/start")
-        .json(&serde_json::json!({"turnstile_token": "test-token"}))
+        .json(&serde_json::json!({
+            "turnstile_token": "test-token",
+            "code_challenge": pair.challenge,
+        }))
         .send()
         .await;
     response.assert_status(200);
@@ -75,6 +79,17 @@ async fn a_sign_in_stores_the_renewal_halves_sealed(ctx: TestContext, _kv: Kv, d
         .send()
         .await
         .assert_status(303);
+
+    client
+        .post("/v1/auth/github/exchange")
+        .json(&serde_json::json!({
+            "code": "abc",
+            "state": state,
+            "code_verifier": pair.verifier,
+        }))
+        .send()
+        .await
+        .assert_status(200);
 
     let row: GrantRow = db
         .query(&format!("SELECT {GRANT_COLUMNS} FROM users"))

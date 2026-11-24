@@ -4,6 +4,7 @@ import { MemoryRouter, Route, createMemoryHistory } from "@solidjs/router";
 import Login from "./Login";
 import { json, postedTo, route } from "../components/flow/testSupport";
 import type { RenderOptions, TurnstileApi } from "../lib/turnstile";
+import { consumePendingGithubLogin } from "../api/auth";
 import { clearSessionToken } from "../lib/session";
 
 /**
@@ -43,13 +44,13 @@ describe("Login", () => {
     vi.unstubAllGlobals();
   });
 
-  it("renders the human check, then signs in with its token", async () => {
+  it("renders the human check, then signs in with its token and PKCE challenge", async () => {
     const { api, rendered } = stubTurnstile();
     route(
       (path, method) => method === "POST" && path === "/v1/auth/github/start",
       () =>
         json({
-          authorize_url: "https://github.com/login/oauth/authorize?state=x",
+          authorize_url: "https://github.com/login/oauth/authorize?state=gh_state1",
         }),
     );
     const { findByRole } = mount();
@@ -69,8 +70,23 @@ describe("Login", () => {
     await vi.waitFor(() =>
       expect(postedTo("/v1/auth/github/start")).toEqual({
         turnstile_token: "the-proof",
+        code_challenge: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
       }),
     );
+
+    const pending = consumePendingGithubLogin();
+    expect(pending?.state).toBe("gh_state1");
+    expect(pending?.codeVerifier).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+
+  it("still initializes Turnstile when returnTo is malformed", async () => {
+    const { api, rendered } = stubTurnstile();
+    const { findByRole } = mount("/login?returnTo=%2F%5Cevil.com");
+    const button = await findByRole("button", { name: "Sign in with GitHub" });
+
+    await vi.waitFor(() => expect(api.render).toHaveBeenCalled());
+    rendered.options?.callback?.("the-proof");
+    expect(button).toBeEnabled();
   });
 
   it("drops a spent proof and re-arms the widget when sign-in is refused", async () => {

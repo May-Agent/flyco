@@ -241,7 +241,12 @@ impl MicrosoftError {
 /// Panics if [`AUTHORIZE_URL`] is not an absolute URL, which would mean this
 /// module's own constant was edited into something that is not one.
 #[must_use]
-pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> Url {
+pub fn authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+) -> Url {
     let mut url = Url::parse(AUTHORIZE_URL).expect("the Microsoft authorize URL is absolute");
     url.query_pairs_mut()
         .append_pair("client_id", client_id)
@@ -249,6 +254,8 @@ pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> Url {
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("response_mode", "query")
         .append_pair("state", state)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256")
         .append_pair("prompt", "select_account")
         .append_pair("scope", SCOPE);
     url
@@ -475,6 +482,7 @@ async fn exchange_over<T: HttpTransport>(
     client: OauthClient<'_>,
     code: &str,
     redirect_uri: &str,
+    code_verifier: &str,
 ) -> Result<CodeGrant, MicrosoftError> {
     let response = transport
         .send(token_request(&[
@@ -483,6 +491,7 @@ async fn exchange_over<T: HttpTransport>(
             ("client_secret", client.secret),
             ("code", code),
             ("redirect_uri", redirect_uri),
+            ("code_verifier", code_verifier),
             ("scope", ARM_SCOPE),
         ]))
         .await?;
@@ -566,8 +575,9 @@ pub async fn sign_in_over<T: HttpTransport>(
     client: OauthClient<'_>,
     code: &str,
     redirect_uri: &str,
+    code_verifier: &str,
 ) -> Result<SignIn, MicrosoftError> {
-    let grant = exchange_over(transport, client, code, redirect_uri).await?;
+    let grant = exchange_over(transport, client, code, redirect_uri, code_verifier).await?;
     let graph_token = graph_token_over(transport, client, &grant.refresh_token).await?;
 
     let claims: IdClaims =
@@ -728,6 +738,7 @@ pub trait MicrosoftOauth: Send + Sync + Clone + 'static {
         client: OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> impl Future<Output = Result<SignIn, MicrosoftError>> + Send;
 
     /// Creates the service principal flyco provisions with.
@@ -767,8 +778,9 @@ impl MicrosoftOauth for ZenwaveMicrosoft {
         client: OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> Result<SignIn, MicrosoftError> {
-        sign_in_over(&self.transport, client, code, redirect_uri).await
+        sign_in_over(&self.transport, client, code, redirect_uri, code_verifier).await
     }
 
     async fn create_identity(
@@ -808,11 +820,18 @@ impl MicrosoftOauth for MicrosoftClient {
         client: OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> Result<SignIn, MicrosoftError> {
         match self {
-            Self::Live(live) => live.sign_in(client, code, redirect_uri).await,
+            Self::Live(live) => {
+                live.sign_in(client, code, redirect_uri, code_verifier)
+                    .await
+            }
             #[cfg(test)]
-            Self::Fake(fake) => fake.sign_in(client, code, redirect_uri).await,
+            Self::Fake(fake) => {
+                fake.sign_in(client, code, redirect_uri, code_verifier)
+                    .await
+            }
         }
     }
 
@@ -888,7 +907,7 @@ mod tests {
 
     #[test]
     fn the_authorize_url_asks_for_both_resources_at_once() {
-        let url = authorize_url("the-client-id", REDIRECT_URI, "the-state");
+        let url = authorize_url("the-client-id", REDIRECT_URI, "the-state", "the-challenge");
 
         assert_eq!(url.host_str(), Some("login.microsoftonline.com"));
         assert_eq!(url.path(), "/organizations/oauth2/v2.0/authorize");
@@ -897,6 +916,8 @@ mod tests {
         assert_eq!(query(&url, "redirect_uri"), REDIRECT_URI);
         assert_eq!(query(&url, "response_mode"), "query");
         assert_eq!(query(&url, "state"), "the-state");
+        assert_eq!(query(&url, "code_challenge"), "the-challenge");
+        assert_eq!(query(&url, "code_challenge_method"), "S256");
         assert_eq!(query(&url, "prompt"), "select_account");
 
         let scope = query(&url, "scope");
@@ -914,7 +935,7 @@ mod tests {
             HttpResponse::new(200, SUBSCRIPTIONS_BODY),
         ]);
 
-        let signed_in = sign_in_over(&transport, CLIENT, "the-code", REDIRECT_URI)
+        let signed_in = sign_in_over(&transport, CLIENT, "the-code", REDIRECT_URI, "the-verifier")
             .await
             .expect("the sign-in completes");
 
@@ -930,6 +951,7 @@ mod tests {
         assert_eq!(field(body, "client_id"), CLIENT.id);
         assert_eq!(field(body, "client_secret"), CLIENT.secret);
         assert_eq!(field(body, "redirect_uri"), REDIRECT_URI);
+        assert_eq!(field(body, "code_verifier"), "the-verifier");
         assert!(field(body, "scope").contains("management.azure.com"));
 
         let refresh = transport.request(1);
@@ -1098,7 +1120,7 @@ mod tests {
     #[skyzen::test]
     async fn a_refused_code_keeps_microsofts_own_reason() {
         let transport = RecordedTransport::new(vec![HttpResponse::new(400, INVALID_GRANT_BODY)]);
-        let error = sign_in_over(&transport, CLIENT, "stale", REDIRECT_URI)
+        let error = sign_in_over(&transport, CLIENT, "stale", REDIRECT_URI, "the-verifier")
             .await
             .expect_err("a refused code");
 

@@ -1,33 +1,31 @@
 //! Linking a cloud account by signing in with it.
 //!
-//! Four routes per vendor, and between them the user does one thing: approve
-//! a consent screen. [`azure_start`] mints an attempt and hands back an
-//! authorize URL; the vendor returns the browser to [`azure_callback`],
-//! which redeems the code and records who signed in and what they may link;
-//! the page [`azure_poll`]s until that lands; and [`azure_finish`] creates
-//! the credential inside the account the user chose and links it. Google is
-//! the same four with different nouns.
+//! Five routes per vendor, and between them the user does one thing: approve
+//! a consent screen. [`azure_start`] mints a user-bound attempt (and a PKCE
+//! verifier where the vendor supports PKCE) and hands back an authorize URL;
+//! the vendor returns the browser to [`azure_callback`], which performs no
+//! exchange and sets no cookies — it forwards `provider`, `code`, and `state`
+//! in the URL fragment to `/connect/return`; the authenticated SPA then posts
+//! `{attempt_id, code, state}` to [`azure_exchange`] carrying its Bearer
+//! credential, proving the signed-in user owns the attempt before any code is
+//! redeemed; the flow tab [`azure_poll`]s until the attempt is authorized; and
+//! [`azure_finish`] creates the credential inside the account the user chose
+//! and links it. Google and Codespaces follow the same contract.
 //!
-//! **Why an attempt rather than a cookie.** The callback is a browser
-//! navigation from `login.microsoftonline.com`, so it carries no flyco
-//! credential at all — it is as public as
-//! [`crate::oauth::callback`]. The `state` is therefore the only thing
-//! tying the returning browser to the sign-in that started, and it is kept
-//! in the key-value store beside the attempt: `state → attempt_id` written
-//! at the start and *taken* at the callback, so a state redeems exactly
-//! once, and the attempt itself keyed by its own opaque id, which is what
-//! the signed-in page polls with. The attempt is bound to the user who
-//! started it, so one signed-in user cannot finish another's sign-in.
+//! **Why callbacks never exchange codes.** A browser navigation arriving from
+//! `login.microsoftonline.com`, `accounts.google.com`, or `github.com` carries
+//! no flyco credential (flyco sets no cookies). Redeeming a code on that `GET`
+//! would let an attacker feed their own `authorize_url` to a victim and store
+//! the victim's grant on the attacker's attempt. Forwarding `code` and `state`
+//! in the fragment to `/connect/return` requires the signed-in SPA to present
+//! `Authorization: Bearer` to [`azure_exchange`]/[`gcp_exchange`]/[`codespaces_exchange`],
+//! which verifies `attempt.user == current_user`, `attempt.provider == provider`,
+//! and `attempt.state == state` before redeeming the code (with PKCE for Azure
+//! and GCP).
 //!
-//! **Why the callback always redirects.** Its caller is a browser mid-
-//! navigation, and a problem document rendered into a tab is a dead end. So
-//! every outcome — including every failure — is a `303` to the SPA's return
-//! page, carrying the provider and, when something went wrong, the problem
-//! slug the page explains.
-//!
-//! The vendor tokens the callback obtained live in the attempt until the
-//! finish spends them. They are secrets: nothing here returns them, and the
-//! attempt's `Debug` shows neither.
+//! The vendor tokens an authorized attempt obtained live in the attempt until
+//! the finish spends them. They are secrets: nothing here returns them, and
+//! the attempt's `Debug` shows neither.
 #![expect(
     clippy::too_many_arguments,
     reason = "a finish handler takes four injected services, the path, the body and two \
@@ -45,12 +43,11 @@ use skyzen::extract::Query;
 use skyzen::routing::{CreateRouteNode, Params, Route, RouteNode, Routes as _};
 use skyzen::utils::{Json, State};
 use skyzen_services::{Db, Kv, Queue};
-use url::Url;
 
 use crate::clouds::Clouds;
 use crate::codespaces::{Codespaces, CodespacesLink as _};
 use crate::config::ApiConfig;
-use crate::crypto::random_token;
+use crate::crypto::{pkce, prefixed_token, random_token};
 use crate::error::ApiError;
 use crate::expiring;
 use crate::extract::path_id;
@@ -59,6 +56,7 @@ use crate::github::{
 };
 use crate::google::{self, GoogleClient, GoogleOauth as _};
 use crate::microsoft::{self, AzureTokens, MicrosoftClient, MicrosoftOauth as _};
+use crate::oauth::constant_time_eq;
 use crate::problem::Outcome;
 use crate::provider_accounts;
 use crate::respond::{Created, SeeOther};
@@ -80,11 +78,9 @@ const RETURN_PATH: &str = "/connect/return";
 /// Names the vendor on the return page.
 const PROVIDER_PARAM: &str = "provider";
 
-/// Names what went wrong on the return page, when something did.
-const PROBLEM_PARAM: &str = "problem";
-
-/// Carries the vendor's own words about it, when there are any.
-const REASON_PARAM: &str = "reason";
+/// Prefix that distinguishes Codespaces link states from GitHub sign-in states
+/// on the shared `/v1/auth/github/callback` route without a KV read.
+const CODESPACES_STATE_PREFIX: &str = "cs_";
 
 /// How long a browser has to complete the round trip.
 ///
@@ -92,20 +88,18 @@ const REASON_PARAM: &str = "reason";
 /// vendor routinely runs through a password, a second factor, an account
 /// picker and a consent screen, and the first live run expired at exactly
 /// ten minutes with the user still on the vendor's pages. Before the
-/// callback the attempt holds nothing but a state; after it, the vendor
-/// tokens sit in the store only until the finish spends them.
+/// exchange the attempt holds nothing but a state and optional PKCE verifier;
+/// after it, the vendor tokens sit in the store only until the finish spends
+/// them.
 const ATTEMPT_TTL_SECONDS: u64 = 30 * 60;
 
 /// Prefix every attempt is stored under.
 const ATTEMPT_KEY_PREFIX: &str = "auth:provider-oauth:";
 
-/// Prefix the `state → attempt` pointer is stored under.
-const STATE_KEY_PREFIX: &str = "auth:provider-oauth-state:";
-
 /// Which vendor one sign-in belongs to.
 ///
-/// Carried in the attempt as well as in the path so a Google callback cannot
-/// complete an Azure sign-in that happens to share a state.
+/// Carried in the attempt as well as in the path so a Google exchange cannot
+/// complete an Azure sign-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Provider {
@@ -137,6 +131,12 @@ impl Provider {
     }
 }
 
+/// Whether `state` was minted for a Codespaces provider link rather than a
+/// GitHub sign-in.
+pub(crate) fn is_codespaces_state(state: &str) -> bool {
+    state.starts_with(CODESPACES_STATE_PREFIX)
+}
+
 /// The vendor tokens one authorized attempt holds.
 ///
 /// Secrets by construction: they act as the user inside their own cloud
@@ -163,7 +163,7 @@ enum Secrets {
         /// link so a renamed login cannot slip a credential onto the wrong
         /// account.
         owner_id: i64,
-        /// The plan's included core-hours, read at the callback rather
+        /// The plan's included core-hours, read at the exchange rather
         /// than at the finish so the stored grant is the one the user was
         /// told they had.
         included_core_hours: u32,
@@ -183,7 +183,7 @@ impl core::fmt::Debug for Secrets {
 /// How far one sign-in has got.
 #[derive(Debug, Serialize, Deserialize)]
 enum Stage {
-    /// The browser has not come back from the vendor yet.
+    /// The browser has not exchanged the authorization code yet.
     Started,
     /// The vendor said who signed in and what they may link.
     Authorized {
@@ -194,9 +194,8 @@ enum Stage {
         /// What the finish will act with.
         secrets: Secrets,
     },
-    /// The browser came back without a sign-in. Kept so the page polling
-    /// this attempt learns it is over, with the same problem the return
-    /// page was sent.
+    /// The sign-in ended without a grant. Kept so the page polling this
+    /// attempt learns it is over, with the same problem the return page saw.
     Failed {
         /// The problem slug.
         problem: String,
@@ -208,13 +207,16 @@ enum Stage {
 /// One cloud sign-in in flight, as the key-value store holds it.
 #[derive(Serialize, Deserialize)]
 struct Attempt {
-    /// Who started it. An attempt polled or finished by anybody else is not
-    /// this attempt.
+    /// Who started it. An attempt exchanged, polled or finished by anybody
+    /// else is not this attempt.
     user: UserId,
     /// Which vendor it is with.
     provider: Provider,
     /// The `state` published in the authorize URL.
     state: String,
+    /// Server-held PKCE verifier for vendors that support PKCE (Azure, GCP).
+    #[serde(default)]
+    pkce_verifier: Option<String>,
     /// How far it has got.
     stage: Stage,
 }
@@ -237,28 +239,18 @@ fn attempt_key(id: ProviderOauthAttemptId) -> String {
     key
 }
 
-/// Where the pointer from a published `state` to its attempt lives.
-fn state_key(state: &str) -> String {
-    let mut key = String::with_capacity(STATE_KEY_PREFIX.len() + state.len());
-    key.push_str(STATE_KEY_PREFIX);
-    key.push_str(state);
-    key
-}
-
 /// The query string a vendor appends when it returns the browser.
 ///
 /// Every field but `state` is optional because a refusal is a redirect too:
 /// a user who closes the consent screen comes back with `error` and no
-/// `code`, and that has to reach the return page as a problem rather than
-/// as an extractor failure.
+/// `code`, and that has to reach the return page cleanly rather than as an
+/// extractor failure.
 #[derive(Debug, Deserialize, skyzen::ToSchema)]
 pub struct ProviderCallback {
     /// The single-use authorization code.
     #[serde(default)]
     code: Option<String>,
     /// The `state` this control plane minted in the matching `start`.
-    // `pub(crate)` because `crate::oauth::complete` reads it for the
-    // sign-in half of the shared GitHub callback.
     pub(crate) state: String,
     /// The vendor's machine-readable refusal, when it refused.
     #[serde(default)]
@@ -269,71 +261,108 @@ pub struct ProviderCallback {
 }
 
 impl ProviderCallback {
-    /// The code, or the vendor's own reason there is none.
-    fn code(&self, provider: Provider) -> Result<&str, ApiError> {
-        if let Some(refusal) = self.error.as_deref() {
-            let reason = self.error_description.as_deref().map_or_else(
-                || refusal.to_owned(),
-                |description| {
-                    let mut reason = String::with_capacity(refusal.len() + description.len() + 2);
-                    reason.push_str(refusal);
-                    reason.push_str(": ");
-                    reason.push_str(description);
-                    reason
-                },
-            );
-            return Err(provider.rejected(reason));
-        }
-        self.code.as_deref().ok_or_else(|| {
-            provider.rejected("the sign-in came back with neither a code nor a reason".to_owned())
-        })
+    /// Raw authorization code, if present.
+    pub(crate) fn code_raw(&self) -> Option<&str> {
+        self.code.as_deref().filter(|code| !code.is_empty())
     }
 
-    /// The code, or GitHub's own reason there is none.
-    ///
-    /// [`code`](Self::code) without naming a provider, for the one caller
-    /// that is not a link road: the shared GitHub callback's sign-in half,
-    /// whose refusal is the same `GithubRejected`.
-    pub(crate) fn github_code(&self) -> Result<&str, ApiError> {
-        self.code(Provider::Codespaces)
+    /// Raw vendor refusal slug, if present.
+    pub(crate) fn error_raw(&self) -> Option<&str> {
+        self.error.as_deref().filter(|error| !error.is_empty())
+    }
+
+    /// Raw vendor refusal description, if present.
+    pub(crate) fn error_description_raw(&self) -> Option<&str> {
+        self.error_description
+            .as_deref()
+            .filter(|description| !description.is_empty())
     }
 }
 
-/// Where the browser is sent once the vendor is done with it.
-///
-/// The SPA's return route on the callback's own origin, naming the provider
-/// and — when something went wrong — the problem to explain.
-fn return_url(config: &ApiConfig, provider: Provider, problem: Option<&ApiError>) -> Url {
+/// Request body of `POST /v1/providers/{azure,gcp,codespaces}/oauth/exchange`.
+#[derive(Debug, Deserialize, skyzen::ToSchema)]
+pub struct ExchangeProviderOauth {
+    /// The attempt id returned by the matching `POST .../oauth/start`.
+    pub attempt_id: ProviderOauthAttemptId,
+    /// The `state` echoed back by the vendor to `/connect/return`.
+    pub state: String,
+    /// The single-use authorization code, when consent was granted.
+    #[serde(default)]
+    pub code: Option<String>,
+    /// The vendor's machine-readable refusal, when consent was declined.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The vendor's explanation of the refusal, when stated.
+    #[serde(default)]
+    pub error_description: Option<String>,
+}
+
+impl ExchangeProviderOauth {
+    /// The code, or the vendor's own reason there is none.
+    fn code(&self, provider: Provider) -> Result<&str, ApiError> {
+        if let Some(refusal) = self.error.as_deref().filter(|value| !value.is_empty()) {
+            let reason = self
+                .error_description
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map_or_else(
+                    || refusal.to_owned(),
+                    |description| {
+                        let mut reason =
+                            String::with_capacity(refusal.len() + description.len() + 2);
+                        reason.push_str(refusal);
+                        reason.push_str(": ");
+                        reason.push_str(description);
+                        reason
+                    },
+                );
+            return Err(provider.rejected(reason));
+        }
+        self.code
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                provider
+                    .rejected("the sign-in came back with neither a code nor a reason".to_owned())
+            })
+    }
+}
+
+/// Forwards a public vendor callback to the SPA's `/connect/return` page with
+/// the callback parameters in the URL fragment.
+fn forward_callback(
+    config: &ApiConfig,
+    provider: Provider,
+    callback: &ProviderCallback,
+) -> SeeOther {
     let mut url = config
         .redirect_uri()
         .join(RETURN_PATH)
         .expect("a rooted path always resolves against an absolute redirect URI");
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair(PROVIDER_PARAM, provider.slug());
-        if let Some(problem) = problem {
-            query.append_pair(PROBLEM_PARAM, problem.slug());
-            query.append_pair(REASON_PARAM, &problem.to_string());
+    let mut fragment = url::form_urlencoded::Serializer::new(String::new());
+    fragment.append_pair(PROVIDER_PARAM, provider.slug());
+    if let Some(error) = callback.error_raw() {
+        fragment.append_pair("error", error);
+        if let Some(description) = callback.error_description_raw() {
+            fragment.append_pair("error_description", description);
         }
+    } else if let Some(code) = callback.code_raw() {
+        fragment.append_pair("code", code);
+    } else {
+        fragment.append_pair("error", "missing_code");
     }
-    url
+    fragment.append_pair("state", &callback.state);
+    url.set_fragment(Some(&fragment.finish()));
+    SeeOther(url)
 }
 
-/// Turns whatever the callback did into the one answer a browser can use.
-fn returned(config: &ApiConfig, provider: Provider, outcome: Result<(), ApiError>) -> SeeOther {
-    match outcome {
-        Ok(()) => {
-            tracing::info!(
-                provider = provider.slug(),
-                "a cloud sign-in came back authorized"
-            );
-            SeeOther(return_url(config, provider, None))
-        }
-        Err(error) => {
-            tracing::warn!(%error, provider = provider.slug(), "a cloud sign-in did not complete");
-            SeeOther(return_url(config, provider, Some(&error)))
-        }
-    }
+/// Forwards a Codespaces callback arriving on `/v1/auth/github/callback` to
+/// `/connect/return#provider=codespaces&...`.
+pub(crate) fn forward_codespaces_callback(
+    config: &ApiConfig,
+    callback: &ProviderCallback,
+) -> SeeOther {
+    forward_callback(config, Provider::Codespaces, callback)
 }
 
 /// Mints an attempt and the authorize URL that belongs to it.
@@ -343,29 +372,43 @@ async fn begin(
     user: UserId,
     provider: Provider,
 ) -> Result<ProviderOauthStart, ApiError> {
-    let state = random_token()?;
     let attempt_id = ProviderOauthAttemptId::generate();
-
-    let authorize_url = match provider {
-        Provider::Azure => microsoft::authorize_url(
-            config.azure_oauth_client_id(),
-            config.azure_oauth_redirect_uri().as_str(),
-            &state,
-        ),
-        Provider::Gcp => google::authorize_url(
-            config.google_oauth_client_id(),
-            config.gcp_oauth_redirect_uri().as_str(),
-            &state,
-        ),
-        Provider::Codespaces => crate::oauth::authorize_url(
-            config.github_client_id(),
-            // The sign-in's own callback: the OAuth app registers one URI
-            // per hostname, and which flow a return belongs to is a
-            // question the `state` answers, not the path it lands on.
-            config.redirect_uri(),
-            SCOPE,
-            &state,
-        ),
+    let (state, pkce_verifier, authorize_url) = match provider {
+        Provider::Azure => {
+            let state = random_token()?;
+            let pair = pkce()?;
+            let url = microsoft::authorize_url(
+                config.azure_oauth_client_id(),
+                config.azure_oauth_redirect_uri().as_str(),
+                &state,
+                &pair.challenge,
+            );
+            (state, Some(pair.verifier), url)
+        }
+        Provider::Gcp => {
+            let state = random_token()?;
+            let pair = pkce()?;
+            let url = google::authorize_url(
+                config.google_oauth_client_id(),
+                config.gcp_oauth_redirect_uri().as_str(),
+                &state,
+                &pair.challenge,
+            );
+            (state, Some(pair.verifier), url)
+        }
+        Provider::Codespaces => {
+            let state = prefixed_token(CODESPACES_STATE_PREFIX)?;
+            let url = crate::oauth::authorize_url(
+                config.github_client_id(),
+                // The sign-in's own callback: the OAuth app registers one URI
+                // per hostname, and the `cs_` state prefix routes Codespaces
+                // returns to `/connect/return` without touching KV.
+                config.redirect_uri(),
+                SCOPE,
+                &state,
+            );
+            (state, None, url)
+        }
     };
 
     expiring::put(
@@ -374,38 +417,19 @@ async fn begin(
         &Attempt {
             user,
             provider,
-            state: state.clone(),
+            state,
+            pkce_verifier,
             stage: Stage::Started,
         },
         ATTEMPT_TTL_SECONDS,
     )
     .await?;
-    // The pointer the public callback resolves: it has no user, no attempt
-    // id and nothing but the state the vendor echoed back.
-    expiring::put(kv, &state_key(&state), &attempt_id, ATTEMPT_TTL_SECONDS).await?;
 
     tracing::debug!(provider = provider.slug(), "issued a cloud authorize URL");
     Ok(ProviderOauthStart {
         attempt_id,
         authorize_url: authorize_url.into(),
     })
-}
-
-/// Resolves the state a callback carries to the attempt that minted it.
-///
-/// The pointer is *taken*, so a state redeems exactly once however many
-/// times the browser reloads.
-async fn by_state(kv: &Kv, provider: Provider, state: &str) -> Result<(String, Attempt), ApiError> {
-    let attempt_id = expiring::take::<ProviderOauthAttemptId>(kv, &state_key(state))
-        .await?
-        .ok_or(ApiError::UnknownOauthState)?;
-
-    let key = attempt_key(attempt_id);
-    let attempt = expiring::get::<Attempt>(kv, &key)
-        .await?
-        .filter(|attempt| attempt.provider == provider && attempt.state == state)
-        .ok_or(ApiError::UnknownOauthState)?;
-    Ok((key, attempt))
 }
 
 /// Reads the caller's own attempt, whatever stage it is at.
@@ -425,6 +449,24 @@ async fn mine(
         .await?
         .filter(|attempt| attempt.user == user && attempt.provider == provider)
         .ok_or(ApiError::ProviderOauthAttemptExpired)?;
+    Ok((key, attempt))
+}
+
+/// Reads the caller's attempt and insists it is still in `Stage::Started` and
+/// carries `state`.
+async fn claim_started(
+    kv: &Kv,
+    user: UserId,
+    provider: Provider,
+    attempt_id: ProviderOauthAttemptId,
+    state: &str,
+) -> Result<(String, Attempt), ApiError> {
+    let (key, attempt) = mine(kv, user, provider, attempt_id).await?;
+    if !matches!(attempt.stage, Stage::Started)
+        || !constant_time_eq(attempt.state.as_bytes(), state.as_bytes())
+    {
+        return Err(ApiError::UnknownOauthState);
+    }
     Ok((key, attempt))
 }
 
@@ -476,7 +518,7 @@ struct Authorized {
     secrets: Secrets,
 }
 
-/// Reads the caller's attempt, insisting the callback has already been.
+/// Reads the caller's attempt, insisting the exchange has already succeeded.
 async fn authorized(
     kv: &Kv,
     user: UserId,
@@ -515,6 +557,9 @@ fn chosen_label(choices: &[ProviderOauthChoice], id: &str) -> String {
 // ── Azure ──
 
 /// `POST /v1/providers/azure/oauth/start` — begins a Microsoft sign-in.
+///
+/// Per-call cost: 0 D1 statements, 1 KV write (`auth:provider-oauth:{attempt_id}`),
+/// 0 Durable Object calls, 0 R2 operations, 0 subrequests.
 #[skyzen::openapi]
 pub async fn azure_start(
     State(user): State<CurrentUser>,
@@ -527,26 +572,47 @@ pub async fn azure_start(
         .into()
 }
 
-/// `GET /v1/providers/azure/oauth/callback` — records what Microsoft said.
+/// `GET /v1/providers/azure/oauth/callback` — forwards Microsoft's redirect to
+/// `/connect/return#provider=azure&...` without exchanging the code or setting
+/// cookies.
 ///
-/// Public, because the browser arrives from `login.microsoftonline.com` with
-/// no flyco credential. It authenticates itself with the `state` it carries.
+/// Per-call cost: 0 D1 statements, 0 KV operations, 0 Durable Object calls,
+/// 0 R2 operations, 0 subrequests.
 #[skyzen::openapi]
 pub async fn azure_callback(
     Query(callback): Query<ProviderCallback>,
     State(config): State<ApiConfig>,
+) -> Outcome<SeeOther> {
+    Ok(forward_callback(&config, Provider::Azure, &callback)).into()
+}
+
+/// `POST /v1/providers/azure/oauth/exchange` — verifies the caller owns the
+/// attempt and `state`, then redeems Microsoft's code using the attempt's PKCE
+/// verifier.
+///
+/// Per-call cost: 0 D1 statements, 1 KV read + 1 KV write, 0 Durable Object
+/// calls, 0 R2 operations, 3 external subrequests to Microsoft (code exchange,
+/// Graph token refresh, list subscriptions) on success.
+#[skyzen::openapi]
+pub async fn azure_exchange(
+    State(user): State<CurrentUser>,
+    State(config): State<ApiConfig>,
     State(microsoft): State<MicrosoftClient>,
     kv: Kv,
-) -> Outcome<SeeOther> {
-    let outcome = record_azure(&config, &microsoft, &kv, &callback).await;
-    Ok(returned(&config, Provider::Azure, outcome)).into()
+    Json(request): Json<ExchangeProviderOauth>,
+) -> Outcome<Json<ProviderOauthProgress>> {
+    redeem_azure(&config, &microsoft, &kv, user.id, &request)
+        .await
+        .map(Json)
+        .into()
 }
 
 /// Redeems what Microsoft sent back, or says why it cannot.
 async fn sign_in_azure(
     config: &ApiConfig,
     microsoft: &MicrosoftClient,
-    callback: &ProviderCallback,
+    request: &ExchangeProviderOauth,
+    code_verifier: &str,
 ) -> Result<microsoft::SignIn, ApiError> {
     Ok(microsoft
         .sign_in(
@@ -554,20 +620,34 @@ async fn sign_in_azure(
                 id: config.azure_oauth_client_id(),
                 secret: config.azure_oauth_client_secret(),
             },
-            callback.code(Provider::Azure)?,
+            request.code(Provider::Azure)?,
             config.azure_oauth_redirect_uri().as_str(),
+            code_verifier,
         )
         .await?)
 }
 
-async fn record_azure(
+async fn redeem_azure(
     config: &ApiConfig,
     microsoft: &MicrosoftClient,
     kv: &Kv,
-    callback: &ProviderCallback,
-) -> Result<(), ApiError> {
-    let (key, mut attempt) = by_state(kv, Provider::Azure, &callback.state).await?;
-    let signed_in = match sign_in_azure(config, microsoft, callback).await {
+    user: UserId,
+    request: &ExchangeProviderOauth,
+) -> Result<ProviderOauthProgress, ApiError> {
+    let (key, mut attempt) = claim_started(
+        kv,
+        user,
+        Provider::Azure,
+        request.attempt_id,
+        &request.state,
+    )
+    .await?;
+    let Some(code_verifier) = attempt.pkce_verifier.as_deref() else {
+        return Err(ApiError::CorruptRecord(
+            "an Azure attempt is missing its PKCE verifier",
+        ));
+    };
+    let signed_in = match sign_in_azure(config, microsoft, request, code_verifier).await {
         Ok(signed_in) => signed_in,
         Err(error) => {
             record_failure(kv, &key, attempt, &error).await?;
@@ -575,13 +655,18 @@ async fn record_azure(
         }
     };
 
+    let progress = ProviderOauthProgress::Authorized {
+        account: signed_in.account.clone(),
+        choices: signed_in.choices.clone(),
+    };
     attempt.stage = Stage::Authorized {
         account: signed_in.account,
         choices: signed_in.choices,
         secrets: Secrets::Azure(signed_in.tokens),
     };
     expiring::put(kv, &key, &attempt, ATTEMPT_TTL_SECONDS).await?;
-    Ok(())
+    tracing::info!(provider = "azure", "a cloud sign-in was authorized");
+    Ok(progress)
 }
 
 /// `GET /v1/providers/azure/oauth/{attempt_id}` — polls it once.
@@ -686,6 +771,9 @@ async fn finish_azure(
 // ── GCP ──
 
 /// `POST /v1/providers/gcp/oauth/start` — begins a Google sign-in.
+///
+/// Per-call cost: 0 D1 statements, 1 KV write (`auth:provider-oauth:{attempt_id}`),
+/// 0 Durable Object calls, 0 R2 operations, 0 subrequests.
 #[skyzen::openapi]
 pub async fn gcp_start(
     State(user): State<CurrentUser>,
@@ -698,25 +786,47 @@ pub async fn gcp_start(
         .into()
 }
 
-/// `GET /v1/providers/gcp/oauth/callback` — records what Google said.
+/// `GET /v1/providers/gcp/oauth/callback` — forwards Google's redirect to
+/// `/connect/return#provider=gcp&...` without exchanging the code or setting
+/// cookies.
 ///
-/// Public, for the reason [`azure_callback`] is.
+/// Per-call cost: 0 D1 statements, 0 KV operations, 0 Durable Object calls,
+/// 0 R2 operations, 0 subrequests.
 #[skyzen::openapi]
 pub async fn gcp_callback(
     Query(callback): Query<ProviderCallback>,
     State(config): State<ApiConfig>,
+) -> Outcome<SeeOther> {
+    Ok(forward_callback(&config, Provider::Gcp, &callback)).into()
+}
+
+/// `POST /v1/providers/gcp/oauth/exchange` — verifies the caller owns the
+/// attempt and `state`, then redeems Google's code using the attempt's PKCE
+/// verifier.
+///
+/// Per-call cost: 0 D1 statements, 1 KV read + 1 KV write, 0 Durable Object
+/// calls, 0 R2 operations, 2 external subrequests to Google (code exchange,
+/// list projects) on success.
+#[skyzen::openapi]
+pub async fn gcp_exchange(
+    State(user): State<CurrentUser>,
+    State(config): State<ApiConfig>,
     State(google): State<GoogleClient>,
     kv: Kv,
-) -> Outcome<SeeOther> {
-    let outcome = record_gcp(&config, &google, &kv, &callback).await;
-    Ok(returned(&config, Provider::Gcp, outcome)).into()
+    Json(request): Json<ExchangeProviderOauth>,
+) -> Outcome<Json<ProviderOauthProgress>> {
+    redeem_gcp(&config, &google, &kv, user.id, &request)
+        .await
+        .map(Json)
+        .into()
 }
 
 /// Redeems what Google sent back, or says why it cannot.
 async fn sign_in_gcp(
     config: &ApiConfig,
     google: &GoogleClient,
-    callback: &ProviderCallback,
+    request: &ExchangeProviderOauth,
+    code_verifier: &str,
 ) -> Result<google::SignIn, ApiError> {
     Ok(google
         .sign_in(
@@ -724,20 +834,28 @@ async fn sign_in_gcp(
                 id: config.google_oauth_client_id(),
                 secret: config.google_oauth_client_secret(),
             },
-            callback.code(Provider::Gcp)?,
+            request.code(Provider::Gcp)?,
             config.gcp_oauth_redirect_uri().as_str(),
+            code_verifier,
         )
         .await?)
 }
 
-async fn record_gcp(
+async fn redeem_gcp(
     config: &ApiConfig,
     google: &GoogleClient,
     kv: &Kv,
-    callback: &ProviderCallback,
-) -> Result<(), ApiError> {
-    let (key, mut attempt) = by_state(kv, Provider::Gcp, &callback.state).await?;
-    let signed_in = match sign_in_gcp(config, google, callback).await {
+    user: UserId,
+    request: &ExchangeProviderOauth,
+) -> Result<ProviderOauthProgress, ApiError> {
+    let (key, mut attempt) =
+        claim_started(kv, user, Provider::Gcp, request.attempt_id, &request.state).await?;
+    let Some(code_verifier) = attempt.pkce_verifier.as_deref() else {
+        return Err(ApiError::CorruptRecord(
+            "a GCP attempt is missing its PKCE verifier",
+        ));
+    };
+    let signed_in = match sign_in_gcp(config, google, request, code_verifier).await {
         Ok(signed_in) => signed_in,
         Err(error) => {
             record_failure(kv, &key, attempt, &error).await?;
@@ -745,13 +863,18 @@ async fn record_gcp(
         }
     };
 
+    let progress = ProviderOauthProgress::Authorized {
+        account: signed_in.account.clone(),
+        choices: signed_in.choices.clone(),
+    };
     attempt.stage = Stage::Authorized {
         account: signed_in.account,
         choices: signed_in.choices,
         secrets: Secrets::Gcp(signed_in.access_token),
     };
     expiring::put(kv, &key, &attempt, ATTEMPT_TTL_SECONDS).await?;
-    Ok(())
+    tracing::info!(provider = "gcp", "a cloud sign-in was authorized");
+    Ok(progress)
 }
 
 /// `GET /v1/providers/gcp/oauth/{attempt_id}` — polls it once.
@@ -850,6 +973,9 @@ async fn finish_gcp(
 
 /// `POST /v1/providers/codespaces/oauth/start` — begins a GitHub sign-in
 /// for the `codespace` scope.
+///
+/// Per-call cost: 0 D1 statements, 1 KV write (`auth:provider-oauth:{attempt_id}`),
+/// 0 Durable Object calls, 0 R2 operations, 0 subrequests.
 #[skyzen::openapi]
 pub async fn codespaces_start(
     State(user): State<CurrentUser>,
@@ -862,47 +988,39 @@ pub async fn codespaces_start(
         .into()
 }
 
-/// Redeems a Codespaces return out of the shared GitHub callback.
+/// `POST /v1/providers/codespaces/oauth/exchange` — verifies the caller owns
+/// the attempt and `state`, then redeems GitHub's code and checks the
+/// `codespace` and `repo` scopes.
 ///
-/// The OAuth app registers one callback URI per hostname, so a Codespaces
-/// consent comes back on the sign-in's own path and
-/// [`crate::oauth::callback`] asks this first: `Some` — the redirect the
-/// return page needs — when the `state` named a codespaces attempt, `None`
-/// when it did not, leaving the sign-in to claim it. A miss is
-/// `UnknownOauthState` from [`by_state`] and nothing else: the pointer is
-/// *taken* on a hit, so the state still redeems exactly once.
-pub(crate) async fn redeem_codespaces(
-    config: &ApiConfig,
-    github: &GithubClient,
-    kv: &Kv,
-    callback: &ProviderCallback,
-) -> Result<Option<SeeOther>, ApiError> {
-    let (key, attempt) = match by_state(kv, Provider::Codespaces, &callback.state).await {
-        Ok(found) => found,
-        Err(ApiError::UnknownOauthState) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let outcome = record_codespaces(config, github, kv, callback, &key, attempt).await;
-    Ok(Some(returned(config, Provider::Codespaces, outcome)))
+/// Per-call cost: 0 D1 statements, 1 KV read + 1 KV write, 0 Durable Object
+/// calls, 0 R2 operations, 2 external subrequests to GitHub (`access_token` +
+/// `GET /user`) on success.
+#[skyzen::openapi]
+pub async fn codespaces_exchange(
+    State(user): State<CurrentUser>,
+    State(config): State<ApiConfig>,
+    State(github): State<GithubClient>,
+    kv: Kv,
+    Json(request): Json<ExchangeProviderOauth>,
+) -> Outcome<Json<ProviderOauthProgress>> {
+    redeem_codespaces(&config, &github, &kv, user.id, &request)
+        .await
+        .map(Json)
+        .into()
 }
 
 /// Redeems what GitHub sent back: the token, the account it acts as, and
 /// the proof it carries the scopes a codespace needs.
-///
-/// The scope check happens here rather than at the finish because here is
-/// where the answer can still change something — a refusal fails the
-/// attempt, and the page polling it learns the sign-in is over instead of
-/// discovering it one click later.
 async fn sign_in_codespaces(
     config: &ApiConfig,
     github: &GithubClient,
-    callback: &ProviderCallback,
+    request: &ExchangeProviderOauth,
 ) -> Result<CodespacesSignIn, ApiError> {
     let grant = github
         .exchange_code(
             config.github_client_id(),
             config.github_client_secret(),
-            callback.code(Provider::Codespaces)?,
+            request.code(Provider::Codespaces)?,
             config.redirect_uri().as_str(),
         )
         .await?;
@@ -930,11 +1048,11 @@ async fn sign_in_codespaces(
     })
 }
 
-/// What the callback keeps of a GitHub sign-in until the finish spends it.
+/// What the exchange keeps of a GitHub sign-in until the finish spends it.
 struct CodespacesSignIn {
     /// The grant in full — the token is the credential, and the refresh
     /// half is what renews it once the grant nears its end.
-    grant: crate::github::GithubGrant,
+    grant: GithubGrant,
     /// Who it acts as.
     login: String,
     /// The account's immutable id.
@@ -943,23 +1061,33 @@ struct CodespacesSignIn {
     included_core_hours: u32,
 }
 
-/// Writes what a returned consent proved onto the attempt it belongs to.
-async fn record_codespaces(
+async fn redeem_codespaces(
     config: &ApiConfig,
     github: &GithubClient,
     kv: &Kv,
-    callback: &ProviderCallback,
-    key: &str,
-    mut attempt: Attempt,
-) -> Result<(), ApiError> {
-    let signed_in = match sign_in_codespaces(config, github, callback).await {
+    user: UserId,
+    request: &ExchangeProviderOauth,
+) -> Result<ProviderOauthProgress, ApiError> {
+    let (key, mut attempt) = claim_started(
+        kv,
+        user,
+        Provider::Codespaces,
+        request.attempt_id,
+        &request.state,
+    )
+    .await?;
+    let signed_in = match sign_in_codespaces(config, github, request).await {
         Ok(signed_in) => signed_in,
         Err(error) => {
-            record_failure(kv, key, attempt, &error).await?;
+            record_failure(kv, &key, attempt, &error).await?;
             return Err(error);
         }
     };
 
+    let progress = ProviderOauthProgress::Authorized {
+        account: signed_in.login.clone(),
+        choices: Vec::new(),
+    };
     // No choices — there is nothing a GitHub account has many of that a
     // codespace provisions into; flyco creates the one repository it needs.
     attempt.stage = Stage::Authorized {
@@ -973,8 +1101,9 @@ async fn record_codespaces(
             included_core_hours: signed_in.included_core_hours,
         },
     };
-    expiring::put(kv, key, &attempt, ATTEMPT_TTL_SECONDS).await?;
-    Ok(())
+    expiring::put(kv, &key, &attempt, ATTEMPT_TTL_SECONDS).await?;
+    tracing::info!(provider = "codespaces", "a cloud sign-in was authorized");
+    Ok(progress)
 }
 
 /// `GET /v1/providers/codespaces/oauth/{attempt_id}` — polls it once.
@@ -1205,11 +1334,10 @@ async fn link_codespaces_account(
 
 /// The two public callbacks.
 ///
-/// Public because they cannot be anything else: a browser returning from a
-/// cloud vendor carries no flyco credential. Each authenticates itself with
-/// the single-use `state` it was minted. GitHub's Codespaces return is the
-/// exception: it shares the sign-in callback in [`crate::oauth`], which
-/// routes it back here by `state`.
+/// Public because a browser returning from a cloud vendor carries no flyco
+/// credential. Neither performs any exchange or storage access — each
+/// redirects straight to `/connect/return` with the callback parameters in
+/// the fragment so the signed-in SPA performs the authenticated exchange.
 pub fn public_routes() -> Vec<RouteNode> {
     Route::new((
         AZURE_CALLBACK_PATH.at(azure_callback),
@@ -1218,17 +1346,20 @@ pub fn public_routes() -> Vec<RouteNode> {
     .into_route_nodes()
 }
 
-/// The ten authenticated routes of the three cloud sign-ins.
+/// The thirteen authenticated routes of the three cloud sign-ins.
 pub fn routes() -> Vec<RouteNode> {
     Route::new((
         "/v1/providers/azure/oauth/start".post(azure_start),
+        "/v1/providers/azure/oauth/exchange".post(azure_exchange),
         "/v1/providers/azure/oauth/{attempt_id}".at(azure_poll),
         "/v1/providers/azure/oauth/{attempt_id}/finish".post(azure_finish),
         "/v1/providers/gcp/oauth/start".post(gcp_start),
+        "/v1/providers/gcp/oauth/exchange".post(gcp_exchange),
         "/v1/providers/gcp/oauth/{attempt_id}".at(gcp_poll),
         "/v1/providers/gcp/oauth/{attempt_id}/finish".post(gcp_finish),
         "/v1/providers/codespaces/link".post(codespaces_link),
         "/v1/providers/codespaces/oauth/start".post(codespaces_start),
+        "/v1/providers/codespaces/oauth/exchange".post(codespaces_exchange),
         "/v1/providers/codespaces/oauth/{attempt_id}".at(codespaces_poll),
         "/v1/providers/codespaces/oauth/{attempt_id}/finish".post(codespaces_finish),
     ))

@@ -1,8 +1,25 @@
 /** The protected route to restore after GitHub OAuth returns to this tab. */
 const STORAGE_KEY = "flyco.post_login_path";
+const BASE_ORIGIN = "https://flyco.invalid";
+// eslint-disable-next-line no-control-regex
+const ASCII_CONTROL_RE = /[\u0000-\u001f\u007f]/;
 
 function assertInternalPath(path: string): void {
-  if (!path.startsWith("/") || path.startsWith("//")) {
+  if (
+    !path.startsWith("/") ||
+    path.startsWith("//") ||
+    path.includes("\\") ||
+    ASCII_CONTROL_RE.test(path)
+  ) {
+    throw new Error("Post-login destination must be an absolute path on this Flyco origin");
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(path, BASE_ORIGIN);
+  } catch {
+    throw new Error("Post-login destination must be an absolute path on this Flyco origin");
+  }
+  if (parsed.origin !== BASE_ORIGIN || !parsed.pathname.startsWith("/")) {
     throw new Error("Post-login destination must be an absolute path on this Flyco origin");
   }
 }
