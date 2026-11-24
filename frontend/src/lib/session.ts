@@ -25,6 +25,24 @@ function looksLikeSessionToken(token: string): boolean {
   return token.startsWith("fs_");
 }
 
+if (typeof window !== "undefined") {
+  // Keep `memoryToken` aligned when another tab signs out or switches user.
+  window.addEventListener("storage", (event) => {
+    if (event.key !== null && event.key !== STORAGE_KEY) {
+      return;
+    }
+    const next =
+      event.newValue !== null && looksLikeSessionToken(event.newValue)
+        ? event.newValue
+        : null;
+    if (memoryToken === next) {
+      return;
+    }
+    memoryToken = next;
+    notifySessionChanged();
+  });
+}
+
 /**
  * Rejects a token this code should never have produced.
  *

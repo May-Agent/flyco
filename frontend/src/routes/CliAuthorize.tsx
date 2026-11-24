@@ -17,6 +17,9 @@ import styles from "./CliAuthorize.module.css";
 /** The answers this page can be in; each maps to what the card says. */
 type Outcome = "asking" | "approved" | "denied";
 
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export default function CliAuthorize() {
   const [params] = useSearchParams<{ id?: string }>();
   const [outcome, setOutcome] = createSignal<Outcome>("asking");
@@ -25,7 +28,7 @@ export default function CliAuthorize() {
 
   const id = () => {
     const value = params.id;
-    return value !== undefined && value !== "" ? value : null;
+    return value !== undefined && UUID_RE.test(value) ? value : null;
   };
 
   async function decide(approve: boolean): Promise<void> {

@@ -47,6 +47,7 @@ async fn live_google_recognises_this_deployments_client() {
         },
         "a-code-google-never-issued",
         redirect_uri.as_str(),
+        "a-pkce-verifier-for-the-live-client-check-0123456789",
     )
     .await
     .expect_err("a code that was never issued cannot be redeemed");

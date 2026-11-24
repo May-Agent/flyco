@@ -14,7 +14,7 @@ import { useReadiness } from "../../Readiness";
 import { completeDevinOauth, startDevinOauth } from "../../../api/client";
 import { pastedDevinCode } from "../../../lib/devinOauth";
 import type { PageComponent, Primary } from "../page";
-import { QuietLink, openInNewTab } from "./shared";
+import { ExternalLink, QuietLink, openInNewTab } from "./shared";
 import styles from "./pages.module.css";
 
 export const DevinSignIn: PageComponent<{ id: "devin-sign-in" }> = (props) => {
@@ -72,6 +72,7 @@ export const DevinPaste: PageComponent<{ id: "devin-paste" }> = (props) => {
   };
   const [pasted, setPasted] = createSignal("");
   const [refusal, setRefusal] = createSignal<unknown>(null);
+  const [restarting, setRestarting] = createSignal(false);
 
   const code = () => pastedDevinCode(pasted());
 
@@ -82,11 +83,21 @@ export const DevinPaste: PageComponent<{ id: "devin-paste" }> = (props) => {
    * been used. The page stays; the attempt under it changes.
    */
   async function restart(): Promise<void> {
-    const started = await startDevinOauth();
-    setPasted("");
+    if (restarting()) {
+      return;
+    }
+    setRestarting(true);
     setRefusal(null);
-    props.record({ devinAttempt: started });
-    openInNewTab(started.authorize_url);
+    try {
+      const started = await startDevinOauth();
+      setPasted("");
+      props.record({ devinAttempt: started });
+      openInNewTab(started.authorize_url);
+    } catch (error) {
+      setRefusal(error);
+    } finally {
+      setRestarting(false);
+    }
   }
 
   const primary = (): Primary => {
@@ -139,7 +150,10 @@ export const DevinPaste: PageComponent<{ id: "devin-paste" }> = (props) => {
             <ProblemNotice error={refusal()} />
           </Show>
         </div>
-        <QuietLink onClick={() => void restart()}>
+        <ExternalLink href={attempt().authorize_url}>
+          Open Devin sign-in
+        </ExternalLink>
+        <QuietLink disabled={restarting()} onClick={() => void restart()}>
           Start the sign-in again
         </QuietLink>
       </>

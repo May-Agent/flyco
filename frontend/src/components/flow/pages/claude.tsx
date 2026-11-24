@@ -16,7 +16,7 @@ import {
   pastedCodeForExchange,
 } from "../../../lib/claudeCode";
 import type { PageComponent, Primary } from "../page";
-import { QuietLink, openInNewTab } from "./shared";
+import { ExternalLink, QuietLink, openInNewTab } from "./shared";
 import styles from "./pages.module.css";
 
 export const ClaudeSignIn: PageComponent<{ id: "claude-sign-in" }> = (
@@ -76,6 +76,7 @@ export const ClaudePaste: PageComponent<{ id: "claude-paste" }> = (props) => {
   };
   const [pasted, setPasted] = createSignal("");
   const [refusal, setRefusal] = createSignal<unknown>(null);
+  const [restarting, setRestarting] = createSignal(false);
 
   const code = () => parsePastedCode(pasted());
 
@@ -86,11 +87,21 @@ export const ClaudePaste: PageComponent<{ id: "claude-paste" }> = (props) => {
    * been used. The page stays; the attempt under it changes.
    */
   async function restart(): Promise<void> {
-    const started = await startClaudeOauth();
-    setPasted("");
+    if (restarting()) {
+      return;
+    }
+    setRestarting(true);
     setRefusal(null);
-    props.record({ claudeAttempt: started });
-    openInNewTab(started.authorize_url);
+    try {
+      const started = await startClaudeOauth();
+      setPasted("");
+      props.record({ claudeAttempt: started });
+      openInNewTab(started.authorize_url);
+    } catch (error) {
+      setRefusal(error);
+    } finally {
+      setRestarting(false);
+    }
   }
 
   const primary = (): Primary => {
@@ -145,7 +156,10 @@ export const ClaudePaste: PageComponent<{ id: "claude-paste" }> = (props) => {
             <ProblemNotice error={refusal()} />
           </Show>
         </div>
-        <QuietLink onClick={() => void restart()}>
+        <ExternalLink href={attempt().authorize_url}>
+          Open Anthropic sign-in
+        </ExternalLink>
+        <QuietLink disabled={restarting()} onClick={() => void restart()}>
           Start the sign-in again
         </QuietLink>
       </>

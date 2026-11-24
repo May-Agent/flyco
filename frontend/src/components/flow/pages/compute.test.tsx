@@ -885,4 +885,55 @@ describe("the consent road", () => {
       vi.useRealTimers();
     }
   });
+
+  it("renders fallback external link plus Cancel and Retry controls while waiting", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    noProgrammes();
+    let starts = 0;
+    route(
+      (path, method) =>
+        (method === "POST" && path === "/v1/providers/azure/oauth/start") ||
+        (method === "GET" && /^\/v1\/providers\/azure\/oauth\/attempt-\d+$/.test(path)),
+      (init) => {
+        if (init?.method === "POST") {
+          starts += 1;
+          return json({
+            attempt_id: `attempt-${starts}`,
+            authorize_url: `https://consent.azure.invalid/authorize?state=az_${starts}`,
+          });
+        }
+        return json({ state: "pending" });
+      },
+    );
+    const flow = await choosePlace(/Azure/);
+    const { container, findByRole, getByRole, queryByRole } = flow;
+    await answerBonus(flow, "Azure", { newcomer: false, student: false });
+    await findByRole("heading", { level: 1, name: "Sign in with Microsoft" });
+
+    fireEvent.click(primary(container));
+    expect(
+      await findByRole("link", { name: /Open Microsoft sign-in/ }),
+    ).toHaveAttribute(
+      "href",
+      "https://consent.azure.invalid/authorize?state=az_1",
+    );
+
+    // Retry mints a fresh attempt and updates the fallback link.
+    fireEvent.click(getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(getByRole("link", { name: /Open Microsoft sign-in/ })).toHaveAttribute(
+        "href",
+        "https://consent.azure.invalid/authorize?state=az_2",
+      ),
+    );
+    expect(starts).toBe(2);
+
+    // Cancel exits waiting state and re-enables the primary button.
+    fireEvent.click(getByRole("button", { name: "Cancel" }));
+    expect(
+      queryByRole("link", { name: /Open Microsoft sign-in/ }),
+    ).not.toBeInTheDocument();
+    expect(primary(container)).toBeEnabled();
+    expect(primary(container)).toHaveTextContent("Sign in with Microsoft");
+  });
 });

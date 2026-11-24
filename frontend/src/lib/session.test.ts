@@ -1,8 +1,9 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   clearSessionToken,
   getSessionToken,
   isSignedIn,
+  onSessionChanged,
   resetSessionTokenCacheForTests,
   setSessionToken,
 } from "./session";
@@ -38,6 +39,40 @@ describe("session token storage", () => {
     clearSessionToken();
     resetSessionTokenCacheForTests();
     expect(getSessionToken()).toBeNull();
+  });
+
+  it("synchronizes memoryToken across tabs via storage events", () => {
+    const listener = vi.fn();
+    const stop = onSessionChanged(listener);
+    try {
+      setSessionToken("fs_user_a");
+      listener.mockClear();
+
+      // Another tab signs in as user B.
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: "flyco.session_token",
+          oldValue: "fs_user_a",
+          newValue: "fs_user_b",
+        }),
+      );
+      expect(getSessionToken()).toBe("fs_user_b");
+      expect(listener).toHaveBeenCalledTimes(1);
+
+      // Another tab signs out.
+      localStorage.removeItem("flyco.session_token");
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: "flyco.session_token",
+          oldValue: "fs_user_b",
+          newValue: null,
+        }),
+      );
+      expect(getSessionToken()).toBeNull();
+      expect(listener).toHaveBeenCalledTimes(2);
+    } finally {
+      stop();
+    }
   });
 });
 

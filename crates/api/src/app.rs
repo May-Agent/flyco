@@ -3611,7 +3611,11 @@ fn public_routes() -> Vec<RouteNode> {
         "/v1/healthz".at(healthz),
         "/v1/config".at(public_config),
         "/install/{artifact}".at(get_release_artifact),
-        "/v1/auth/github".route(("/start".post(oauth::start), "/callback".at(oauth::callback))),
+        "/v1/auth/github".route((
+            "/start".post(oauth::start),
+            "/callback".at(oauth::callback),
+            "/exchange".post(oauth::exchange),
+        )),
     ))
     .into_route_nodes();
     nodes.extend(push::public_routes());

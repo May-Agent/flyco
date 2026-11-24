@@ -136,6 +136,32 @@ export function apiUrl(path: string): URL {
   return new URL(path, resolveBase());
 }
 
+/**
+ * Encodes one dynamic URL path segment so untrusted input cannot inject path
+ * separators, query/fragment delimiters, or dot-segment traversal (`..`).
+ */
+export function encodePathSegment(segment: string): string {
+  if (segment === "" || segment === "." || segment === "..") {
+    throw new Error("Invalid API path segment");
+  }
+  return encodeURIComponent(segment);
+}
+
+/**
+ * Tagged template for API paths: every interpolated value is encoded as a
+ * single path segment via {@link encodePathSegment}.
+ */
+export function apiPath(
+  strings: TemplateStringsArray,
+  ...segments: readonly string[]
+): string {
+  let out = strings[0] ?? "";
+  for (let i = 0; i < segments.length; i += 1) {
+    out += encodePathSegment(segments[i]!) + (strings[i + 1] ?? "");
+  }
+  return out;
+}
+
 interface SendOptions {
   query?: Query;
   json?: unknown;
@@ -194,7 +220,7 @@ async function send(
   }
 
   if (!response.ok) {
-    if (response.status === 401 && token !== null) {
+    if (response.status === 401 && token !== null && getSessionToken() === token) {
       clearSessionToken();
     }
     throw await problemFromResponse(response);
@@ -257,7 +283,7 @@ export function createSession(
 export function getSession(
   id: string,
 ): Promise<JsonResponse<"flyco_api::app::get_session", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}`);
+  return requestJson("GET", apiPath`/v1/sessions/${id}`);
 }
 
 /**
@@ -290,7 +316,7 @@ export function updateSession(
       ? {}
       : { permission_mode: changes.permissionMode }),
   };
-  return requestJson("PATCH", `/v1/sessions/${id}`, { json: body });
+  return requestJson("PATCH", apiPath`/v1/sessions/${id}`, { json: body });
 }
 
 /**
@@ -304,7 +330,7 @@ export function updateSession(
 export function resumeSession(
   id: string,
 ): Promise<JsonResponse<"flyco_api::app::resume_session", 200>> {
-  return requestJson("POST", `/v1/sessions/${id}/resume`);
+  return requestJson("POST", apiPath`/v1/sessions/${id}/resume`);
 }
 
 /**
@@ -319,7 +345,7 @@ export function keepSessionAwake(
   id: string,
   minutes: number | null,
 ): Promise<JsonResponse<"flyco_api::app::keep_session_awake", 200>> {
-  return requestJson("PUT", `/v1/sessions/${id}/awake`, {
+  return requestJson("PUT", apiPath`/v1/sessions/${id}/awake`, {
     json: minutes === null ? {} : { minutes },
   });
 }
@@ -328,7 +354,7 @@ export function archiveSession(
   id: string,
   options: { discardUncommitted?: boolean } = {},
 ): Promise<JsonResponse<"flyco_api::app::archive_session", 200>> {
-  return requestJson("POST", `/v1/sessions/${id}/archive`, {
+  return requestJson("POST", apiPath`/v1/sessions/${id}/archive`, {
     query: {
       discard_uncommitted: options.discardUncommitted === true ? true : null,
     },
@@ -338,14 +364,14 @@ export function archiveSession(
 export function getSessionBudget(
   id: string,
 ): Promise<JsonResponse<"flyco_api::app::get_session_budget", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}/budget`);
+  return requestJson("GET", apiPath`/v1/sessions/${id}/budget`);
 }
 
 export function getSessionEvents(
   id: string,
   after?: number,
 ): Promise<JsonResponse<"flyco_api::app::get_session_events", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}/events`, {
+  return requestJson("GET", apiPath`/v1/sessions/${id}/events`, {
     query: { after: after ?? null },
   });
 }
@@ -376,7 +402,7 @@ export function openUserStream(
 export function getSessionEnv(
   id: string,
 ): Promise<JsonResponse<"flyco_api::app::get_session_env", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}/env`);
+  return requestJson("GET", apiPath`/v1/sessions/${id}/env`);
 }
 
 export function putSessionEnv(
@@ -384,13 +410,13 @@ export function putSessionEnv(
   entries: EnvEntry[],
 ): Promise<JsonResponse<"flyco_api::app::put_session_env", 200>> {
   const body: JsonBody<"flyco_api::app::put_session_env"> = { entries };
-  return requestJson("PUT", `/v1/sessions/${id}/env`, { json: body });
+  return requestJson("PUT", apiPath`/v1/sessions/${id}/env`, { json: body });
 }
 
 export function getRepoStatus(
   id: string,
 ): Promise<JsonResponse<"flyco_api::app::get_repo_status", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}/repo-status`);
+  return requestJson("GET", apiPath`/v1/sessions/${id}/repo-status`);
 }
 
 /**
@@ -403,7 +429,7 @@ export function listSessionFiles(
   id: string,
   path: string,
 ): Promise<JsonResponse<"flyco_api::app::list_session_files", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}/files`, { query: { path } });
+  return requestJson("GET", apiPath`/v1/sessions/${id}/files`, { query: { path } });
 }
 
 /** Reads one text file out of a session's checkout. */
@@ -411,7 +437,7 @@ export function readSessionFile(
   id: string,
   path: string,
 ): Promise<JsonResponse<"flyco_api::app::read_session_file", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}/files/content`, {
+  return requestJson("GET", apiPath`/v1/sessions/${id}/files/content`, {
     query: { path },
   });
 }
@@ -428,7 +454,7 @@ export function getSessionDiff(
   id: string,
   repo?: string,
 ): Promise<JsonResponse<"flyco_api::app::get_session_diff", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}/diff`, { query: { repo } });
+  return requestJson("GET", apiPath`/v1/sessions/${id}/diff`, { query: { repo } });
 }
 
 /**
@@ -442,25 +468,25 @@ export function addSessionRepo(
   id: string,
   selection: JsonBody<"flyco_api::app::add_session_repo">,
 ): Promise<JsonResponse<"flyco_api::app::add_session_repo", 201>> {
-  return requestJson("POST", `/v1/sessions/${id}/repos`, { json: selection });
+  return requestJson("POST", apiPath`/v1/sessions/${id}/repos`, { json: selection });
 }
 
 /** Sends a message to a session's agent; see the module doc comment above. */
 export function sendMessage(id: string, text: string): Promise<void> {
   const body: JsonBody<"flyco_api::app::send_message"> = { text };
-  return requestVoid("POST", `/v1/sessions/${id}/messages`, { json: body });
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/messages`, { json: body });
 }
 
 /** Runs a `!` shell command on a session's machine. */
 export function runShellCommand(id: string, command: string): Promise<void> {
   const body: JsonBody<"flyco_api::app::run_shell"> = { command };
-  return requestVoid("POST", `/v1/sessions/${id}/shell`, { json: body });
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/shell`, { json: body });
 }
 
 /** Writes raw input to a session's web terminal. */
 export function sendTerminalInput(id: string, data: string): Promise<void> {
   const body: JsonBody<"flyco_api::app::terminal_input"> = { data };
-  return requestVoid("POST", `/v1/sessions/${id}/terminal/input`, {
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/terminal/input`, {
     json: body,
   });
 }
@@ -472,23 +498,23 @@ export function resizeSessionTerminal(
   rows: number,
 ): Promise<void> {
   const body: JsonBody<"flyco_api::app::terminal_resize"> = { cols, rows };
-  return requestVoid("POST", `/v1/sessions/${id}/terminal/resize`, {
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/terminal/resize`, {
     json: body,
   });
 }
 
 /** Interrupts a session's current turn; see the module doc comment above. */
 export function interruptSession(id: string): Promise<void> {
-  return requestVoid("POST", `/v1/sessions/${id}/interrupt`);
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/interrupt`);
 }
 
 /** Compacts session context; see the module doc comment above. */
 export function compactSession(id: string): Promise<void> {
-  return requestVoid("POST", `/v1/sessions/${id}/compact`);
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/compact`);
 }
 
 export function contextSession(id: string): Promise<void> {
-  return requestVoid("POST", `/v1/sessions/${id}/context`);
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/context`);
 }
 
 // --- /v1/sessions/{id}/desktop ------------------------------------------------
@@ -504,7 +530,7 @@ export type DesktopInputRequest = Schemas["DesktopInputRequest"];
  * stream; `signal` is what a closed panel aborts it with.
  */
 export function openDesktopStream(id: string, signal?: AbortSignal): Promise<Response> {
-  return send("GET", `/v1/sessions/${id}/desktop/stream`, { signal });
+  return send("GET", apiPath`/v1/sessions/${id}/desktop/stream`, { signal });
 }
 
 /** Takes the session's screen, or hands it back, for one watcher lease. */
@@ -512,19 +538,19 @@ export function desktopTakeover(
   id: string,
   request: DesktopTakeoverRequest,
 ): Promise<void> {
-  return requestVoid("POST", `/v1/sessions/${id}/desktop/takeover`, { json: request });
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/desktop/takeover`, { json: request });
 }
 
 /** Sends one batch of a driving watcher's desktop input. */
 export function desktopInput(id: string, request: DesktopInputRequest): Promise<void> {
-  return requestVoid("POST", `/v1/sessions/${id}/desktop/input`, { json: request });
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/desktop/input`, { json: request });
 }
 
 export function listTurns(
   id: string,
   page?: { cursor?: string; limit?: number },
 ): Promise<JsonResponse<"flyco_api::app::list_turns", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}/turns`, {
+  return requestJson("GET", apiPath`/v1/sessions/${id}/turns`, {
     query: { cursor: page?.cursor, limit: page?.limit },
   });
 }
@@ -534,17 +560,17 @@ export function listTurns(
 export function getSessionMachine(
   id: string,
 ): Promise<JsonResponse<"flyco_api::machines::get_session_machine", 200>> {
-  return requestJson("GET", `/v1/sessions/${id}/machine`);
+  return requestJson("GET", apiPath`/v1/sessions/${id}/machine`);
 }
 
 /** Starts a stopped machine. The outcome arrives on the session relay, not in this response. */
 export function startSessionMachine(id: string): Promise<void> {
-  return requestVoid("POST", `/v1/sessions/${id}/machine/start`);
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/machine/start`);
 }
 
 /** Stops (deallocates) a running machine. The outcome arrives on the session relay. */
 export function stopSessionMachine(id: string): Promise<void> {
-  return requestVoid("POST", `/v1/sessions/${id}/machine/stop`);
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/machine/stop`);
 }
 
 /** Moves compute to a different catalog machine type; the disk survives. */
@@ -555,7 +581,7 @@ export function resizeSessionMachine(
   const body: JsonBody<"flyco_api::machines::resize_session_machine"> = {
     machine_type: machineType,
   };
-  return requestVoid("POST", `/v1/sessions/${id}/machine/resize`, {
+  return requestVoid("POST", apiPath`/v1/sessions/${id}/machine/resize`, {
     json: body,
   });
 }
@@ -607,7 +633,7 @@ export function decideApproval(
   decision: Schemas["ApprovalDecision"],
 ): Promise<JsonResponse<"flyco_api::app::decide_approval", 200>> {
   const body: JsonBody<"flyco_api::app::decide_approval"> = { decision };
-  return requestJson("POST", `/v1/approvals/${id}/decision`, { json: body });
+  return requestJson("POST", apiPath`/v1/approvals/${id}/decision`, { json: body });
 }
 
 // --- /v1/usage ---------------------------------------------------------------
@@ -662,11 +688,11 @@ export function updateMcpServer(
   id: string,
   input: JsonBody<"flyco_api::mcp::update_mcp_server">,
 ): Promise<JsonResponse<"flyco_api::mcp::update_mcp_server", 200>> {
-  return requestJson("PATCH", `/v1/mcp-servers/${id}`, { json: input });
+  return requestJson("PATCH", apiPath`/v1/mcp-servers/${id}`, { json: input });
 }
 
 export function deleteMcpServer(id: string): Promise<void> {
-  return requestVoid("DELETE", `/v1/mcp-servers/${id}`);
+  return requestVoid("DELETE", apiPath`/v1/mcp-servers/${id}`);
 }
 
 // --- /v1/catalog/mcp-servers ----------------------------------------------------
@@ -703,7 +729,7 @@ export function uploadSkill(
 }
 
 export function deleteSkill(id: string): Promise<void> {
-  return requestVoid("DELETE", `/v1/skills/${id}`);
+  return requestVoid("DELETE", apiPath`/v1/skills/${id}`);
 }
 
 // --- /v1/marketplaces, /v1/catalog/skills -------------------------------------
@@ -721,7 +747,7 @@ export function addMarketplace(
 }
 
 export function deleteMarketplace(id: string): Promise<void> {
-  return requestVoid("DELETE", `/v1/marketplaces/${id}`);
+  return requestVoid("DELETE", apiPath`/v1/marketplaces/${id}`);
 }
 
 export function listCatalogSkills(): Promise<
@@ -751,7 +777,7 @@ export function linkProvider(
 }
 
 export function unlinkProvider(id: string): Promise<void> {
-  return requestVoid("DELETE", `/v1/providers/${id}`);
+  return requestVoid("DELETE", apiPath`/v1/providers/${id}`);
 }
 
 export function providerQuickstart(
@@ -800,7 +826,7 @@ export function mintEnrollmentToken(): Promise<
 export function getEnrollment(
   id: EnrollmentToken["id"],
 ): Promise<JsonResponse<"flyco_api::hosts::get_enrollment", 200>> {
-  return requestJson("GET", `/v1/hosts/enrollment-tokens/${id}`);
+  return requestJson("GET", apiPath`/v1/hosts/enrollment-tokens/${id}`);
 }
 
 /** The caller's enrolled machines, each refreshed from its own room. */
@@ -814,7 +840,7 @@ export function listHosts(): Promise<
 export function getHost(
   id: HostView["id"],
 ): Promise<JsonResponse<"flyco_api::hosts::get_host", 200>> {
-  return requestJson("GET", `/v1/hosts/${id}`);
+  return requestJson("GET", apiPath`/v1/hosts/${id}`);
 }
 
 /** Renames a machine. It opens as the hostname it enrolled with. */
@@ -823,7 +849,7 @@ export function renameHost(
   label: string,
 ): Promise<JsonResponse<"flyco_api::hosts::update_host", 200>> {
   const body: JsonBody<"flyco_api::hosts::update_host"> = { label };
-  return requestJson("PATCH", `/v1/hosts/${id}`, { json: body });
+  return requestJson("PATCH", apiPath`/v1/hosts/${id}`, { json: body });
 }
 
 /**
@@ -837,7 +863,7 @@ export function removeHost(
   id: HostView["id"],
   options: { force?: boolean } = {},
 ): Promise<void> {
-  return requestVoid("DELETE", `/v1/hosts/${id}`, {
+  return requestVoid("DELETE", apiPath`/v1/hosts/${id}`, {
     query: { force: options.force === true ? true : null },
   });
 }
@@ -858,7 +884,7 @@ export function createApiKey(
 }
 
 export function revokeApiKey(id: string): Promise<void> {
-  return requestVoid("DELETE", `/v1/api-keys/${id}`);
+  return requestVoid("DELETE", apiPath`/v1/api-keys/${id}`);
 }
 
 // --- /v1/cli-sessions ---------------------------------------------------------------
@@ -869,12 +895,12 @@ export function revokeApiKey(id: string): Promise<void> {
  * collects it, so approval here is the whole browser-side job.
  */
 export function approveCliSession(id: string): Promise<void> {
-  return requestVoid("POST", `/v1/cli-sessions/${id}/approve`);
+  return requestVoid("POST", apiPath`/v1/cli-sessions/${id}/approve`);
 }
 
 /** Denies a `flyco login` attempt; the CLI's poll then stops waiting. */
 export function denyCliSession(id: string): Promise<void> {
-  return requestVoid("POST", `/v1/cli-sessions/${id}/deny`);
+  return requestVoid("POST", apiPath`/v1/cli-sessions/${id}/deny`);
 }
 
 // --- /v1/harness-accounts -----------------------------------------------------
@@ -896,7 +922,7 @@ export function linkHarnessAccount(
 export function unlinkHarnessAccount(
   id: HarnessAccountView["id"],
 ): Promise<void> {
-  return requestVoid("DELETE", `/v1/harness-accounts/${id}`);
+  return requestVoid("DELETE", apiPath`/v1/harness-accounts/${id}`);
 }
 
 /**
@@ -950,7 +976,7 @@ export async function pollCodexOauth(
 ): Promise<CodexOauthProgress> {
   const response = await send(
     "GET",
-    `/v1/harness-accounts/codex/oauth/${attemptId}`,
+    apiPath`/v1/harness-accounts/codex/oauth/${attemptId}`,
   );
   if (response.status === 201) {
     const account = (await response.json()) as JsonResponse<
@@ -1003,14 +1029,24 @@ export type ProviderOauthProgress = Schemas["ProviderOauthProgress"];
 export async function startProviderOauth(
   cloud: ConsentCloudKind,
 ): Promise<ProviderOauthStart> {
-  return requestJson("POST", `/v1/providers/${cloud}/oauth/start`);
+  return requestJson("POST", apiPath`/v1/providers/${cloud}/oauth/start`);
+}
+
+/** Exchanges a provider callback under the signed-in user's Bearer session. */
+export async function exchangeProviderOauth(
+  cloud: ConsentCloudKind,
+  body: Schemas["ExchangeProviderOauth"],
+): Promise<ProviderOauthProgress> {
+  return requestJson("POST", apiPath`/v1/providers/${cloud}/oauth/exchange`, {
+    json: body,
+  });
 }
 
 export async function pollProviderOauth(
   cloud: ConsentCloudKind,
   attemptId: string,
 ): Promise<ProviderOauthProgress> {
-  return requestJson("GET", `/v1/providers/${cloud}/oauth/${attemptId}`);
+  return requestJson("GET", apiPath`/v1/providers/${cloud}/oauth/${attemptId}`);
 }
 
 /** Creates flyco's own identity in the chosen subscription and links it. */
@@ -1018,7 +1054,7 @@ export async function finishAzureOauth(
   attemptId: string,
   body: Schemas["FinishAzureOauth"],
 ): Promise<ProviderAccountView> {
-  return requestJson("POST", `/v1/providers/azure/oauth/${attemptId}/finish`, {
+  return requestJson("POST", apiPath`/v1/providers/azure/oauth/${attemptId}/finish`, {
     json: body,
   });
 }
@@ -1028,7 +1064,7 @@ export async function finishGcpOauth(
   attemptId: string,
   body: Schemas["FinishGcpOauth"],
 ): Promise<ProviderAccountView> {
-  return requestJson("POST", `/v1/providers/gcp/oauth/${attemptId}/finish`, {
+  return requestJson("POST", apiPath`/v1/providers/gcp/oauth/${attemptId}/finish`, {
     json: body,
   });
 }
@@ -1043,7 +1079,7 @@ export async function finishCodespacesOauth(
 ): Promise<ProviderAccountView> {
   return requestJson(
     "POST",
-    `/v1/providers/codespaces/oauth/${attemptId}/finish`,
+    apiPath`/v1/providers/codespaces/oauth/${attemptId}/finish`,
     { json: {} },
   );
 }
@@ -1080,11 +1116,11 @@ export function updateMemoryNode(
   id: string,
   patch: JsonBody<"flyco_api::memory::update_memory_node">,
 ): Promise<JsonResponse<"flyco_api::memory::update_memory_node", 200>> {
-  return requestJson("PATCH", `/v1/memory/${id}`, { json: patch });
+  return requestJson("PATCH", apiPath`/v1/memory/${id}`, { json: patch });
 }
 
 export function deleteMemoryNode(id: string): Promise<void> {
-  return requestVoid("DELETE", `/v1/memory/${id}`);
+  return requestVoid("DELETE", apiPath`/v1/memory/${id}`);
 }
 
 // --- /v1/agents-md ---------------------------------------------------------------
@@ -1117,7 +1153,7 @@ export function subscribePush(
 }
 
 export function unsubscribePush(id: string): Promise<void> {
-  return requestVoid("DELETE", `/v1/push/subscriptions/${id}`);
+  return requestVoid("DELETE", apiPath`/v1/push/subscriptions/${id}`);
 }
 
 // --- Auth and repo picker ---------------------------------------------------------
@@ -1135,16 +1171,28 @@ export function getPublicConfig(): Promise<
 
 /**
  * Begins a GitHub sign-in. `turnstileToken` is the widget's proof a human
- * asked — the control plane verifies it with `siteverify` before minting
- * any OAuth state, so a missing or stale token is refused.
+ * asked, and `codeChallenge` binds the server-minted `state` to the verifier
+ * held in this browser tab's `sessionStorage`.
  */
 export function startGithubLogin(
   turnstileToken: string,
+  codeChallenge: string,
 ): Promise<JsonResponse<"flyco_api::oauth::start", 200>> {
   const body: JsonBody<"flyco_api::oauth::start"> = {
     turnstile_token: turnstileToken,
+    code_challenge: codeChallenge,
   };
   return requestJson("POST", "/v1/auth/github/start", { json: body });
+}
+
+/**
+ * Completes a GitHub sign-in by proving ownership of the `sessionStorage`
+ * PKCE verifier matching the `state` that started the flow.
+ */
+export function exchangeGithubLogin(
+  input: JsonBody<"flyco_api::oauth::exchange">,
+): Promise<JsonResponse<"flyco_api::oauth::exchange", 200>> {
+  return requestJson("POST", "/v1/auth/github/exchange", { json: input });
 }
 
 export function listRepos(
@@ -1157,17 +1205,20 @@ export function listRepos(
  * One page of a repository's branches, the default branch first.
  *
  * `slug` is `owner/name`; both halves are path segments, so they are
- * encoded rather than interpolated raw.
+ * validated and encoded rather than interpolated raw.
  */
 export function listBranches(
   slug: string,
   cursor?: string,
 ): Promise<JsonResponse<"flyco_api::repos::list_branches", 200>> {
-  const path = slug
-    .split("/")
-    .map((segment) => encodeURIComponent(segment))
-    .join("/");
-  return requestJson("GET", `/v1/github/repos/${path}/branches`, {
-    query: { cursor },
-  });
+  const parts = slug.split("/");
+  if (parts.length !== 2) {
+    throw new Error("Invalid repository slug");
+  }
+  const [owner, repo] = parts;
+  return requestJson(
+    "GET",
+    apiPath`/v1/github/repos/${owner!}/${repo!}/branches`,
+    { query: { cursor } },
+  );
 }

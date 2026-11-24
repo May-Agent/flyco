@@ -93,10 +93,16 @@ export function ExternalLink(props: { href: string; children: JSX.Element }) {
 /** A quiet link that leads to another page of the flow, or swaps this one. */
 export function QuietLink(props: {
   onClick: () => void;
+  disabled?: boolean | undefined;
   children: JSX.Element;
 }) {
   return (
-    <button type="button" class={styles.link} onClick={() => props.onClick()}>
+    <button
+      type="button"
+      class={styles.link}
+      disabled={props.disabled}
+      onClick={() => props.onClick()}
+    >
       {props.children}
     </button>
   );
@@ -122,7 +128,7 @@ export function Waiting(props: { children: JSX.Element }) {
   );
 }
 
-/** Opens a vendor's page in a new tab, from a click the browser will allow. */
-export function openInNewTab(url: string): void {
-  window.open(url, "_blank", "noopener,noreferrer");
+/** Opens a vendor's page in a new tab; returns whether a tab opened. */
+export function openInNewTab(url: string): boolean {
+  return window.open(url, "_blank", "noopener,noreferrer") !== null;
 }
