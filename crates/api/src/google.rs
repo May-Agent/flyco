@@ -137,7 +137,12 @@ impl From<HttpError> for GoogleError {
 /// Panics if [`AUTHORIZE_URL`] is not an absolute URL, which would mean this
 /// module's own constant was edited into something that is not one.
 #[must_use]
-pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> Url {
+pub fn authorize_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+) -> Url {
     let mut url = Url::parse(AUTHORIZE_URL).expect("the Google authorize URL is absolute");
     url.query_pairs_mut()
         .append_pair("client_id", client_id)
@@ -146,7 +151,9 @@ pub fn authorize_url(client_id: &str, redirect_uri: &str, state: &str) -> Url {
         .append_pair("scope", SCOPE)
         .append_pair("access_type", "online")
         .append_pair("prompt", "select_account")
-        .append_pair("state", state);
+        .append_pair("state", state)
+        .append_pair("code_challenge", code_challenge)
+        .append_pair("code_challenge_method", "S256");
     url
 }
 
@@ -360,6 +367,7 @@ async fn exchange_over<T: HttpTransport>(
     client: OauthClient<'_>,
     code: &str,
     redirect_uri: &str,
+    code_verifier: &str,
 ) -> Result<(String, String), GoogleError> {
     let response = transport
         .send(
@@ -370,6 +378,7 @@ async fn exchange_over<T: HttpTransport>(
                     ("client_id", client.id),
                     ("client_secret", client.secret),
                     ("redirect_uri", redirect_uri),
+                    ("code_verifier", code_verifier),
                     ("grant_type", "authorization_code"),
                 ]),
         )
@@ -425,8 +434,10 @@ pub async fn sign_in_over<T: HttpTransport>(
     client: OauthClient<'_>,
     code: &str,
     redirect_uri: &str,
+    code_verifier: &str,
 ) -> Result<SignIn, GoogleError> {
-    let (access_token, id_token) = exchange_over(transport, client, code, redirect_uri).await?;
+    let (access_token, id_token) =
+        exchange_over(transport, client, code, redirect_uri, code_verifier).await?;
 
     let claims: IdClaims =
         jwt::claims(&id_token).map_err(|error| GoogleError::Malformed(error.detail()))?;
@@ -601,6 +612,7 @@ pub trait GoogleOauth: Send + Sync + Clone + 'static {
         client: OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> impl Future<Output = Result<SignIn, GoogleError>> + Send;
 
     /// Creates the service account flyco provisions with, and mints its key.
@@ -638,8 +650,9 @@ impl GoogleOauth for ZenwaveGoogle {
         client: OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> Result<SignIn, GoogleError> {
-        sign_in_over(&self.transport, client, code, redirect_uri).await
+        sign_in_over(&self.transport, client, code, redirect_uri, code_verifier).await
     }
 
     async fn create_identity(&self, token: &str, project_id: &str) -> Result<String, GoogleError> {
@@ -674,11 +687,18 @@ impl GoogleOauth for GoogleClient {
         client: OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> Result<SignIn, GoogleError> {
         match self {
-            Self::Live(live) => live.sign_in(client, code, redirect_uri).await,
+            Self::Live(live) => {
+                live.sign_in(client, code, redirect_uri, code_verifier)
+                    .await
+            }
             #[cfg(test)]
-            Self::Fake(fake) => fake.sign_in(client, code, redirect_uri).await,
+            Self::Fake(fake) => {
+                fake.sign_in(client, code, redirect_uri, code_verifier)
+                    .await
+            }
         }
     }
 
@@ -749,7 +769,7 @@ mod tests {
 
     #[test]
     fn the_authorize_url_asks_for_the_console_scope_and_no_refresh_token() {
-        let url = authorize_url(CLIENT.id, REDIRECT_URI, "the-state");
+        let url = authorize_url(CLIENT.id, REDIRECT_URI, "the-state", "the-challenge");
 
         assert_eq!(url.host_str(), Some("accounts.google.com"));
         assert_eq!(url.path(), "/o/oauth2/v2/auth");
@@ -759,6 +779,8 @@ mod tests {
         assert_eq!(query(&url, "scope"), SCOPE);
         assert_eq!(query(&url, "prompt"), "select_account");
         assert_eq!(query(&url, "state"), "the-state");
+        assert_eq!(query(&url, "code_challenge"), "the-challenge");
+        assert_eq!(query(&url, "code_challenge_method"), "S256");
         assert_eq!(
             query(&url, "access_type"),
             "online",
@@ -773,7 +795,7 @@ mod tests {
             HttpResponse::new(200, PROJECTS_BODY),
         ]);
 
-        let signed_in = sign_in_over(&transport, CLIENT, "the-code", REDIRECT_URI)
+        let signed_in = sign_in_over(&transport, CLIENT, "the-code", REDIRECT_URI, "the-verifier")
             .await
             .expect("the sign-in completes");
 
@@ -786,6 +808,7 @@ mod tests {
         assert_eq!(field(body, "client_id"), CLIENT.id);
         assert_eq!(field(body, "client_secret"), CLIENT.secret);
         assert_eq!(field(body, "redirect_uri"), REDIRECT_URI);
+        assert_eq!(field(body, "code_verifier"), "the-verifier");
 
         assert_eq!(signed_in.account, "me@lexo.cool");
         assert_eq!(signed_in.access_token, "the-google-access-token");

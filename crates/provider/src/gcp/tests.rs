@@ -786,25 +786,33 @@ async fn resizing_stops_sets_the_machine_type_and_starts_again() {
     let machine = provisioned(MachineId::generate());
     let mut gcp = provider(vec![
         token(),
+        json(INSTANCE_RUNNING),
         json(REGION_INFO),
         json(MACHINE_TYPES),
         json(OPERATION_DONE), // stop
         json(OPERATION_DONE), // setMachineType
         json(OPERATION_DONE), // start
+        json(INSTANCE_RESTARTED),
     ]);
 
-    gcp.resize(&machine, "e2-medium")
+    let resized = gcp
+        .resize(&machine, "e2-medium")
         .await
         .expect("resize preserves the disk");
+    assert_eq!(
+        resized.address.as_deref(),
+        Some("35.184.22.91"),
+        "resize refreshes the newly assigned ephemeral IP after restart"
+    );
 
     let transport = gcp.transport();
     let instance = format!(
         "{BASE}/projects/{PROJECT}/zones/{ZONE}/instances/{}",
         names::machine(machine.id)
     );
-    assert_eq!(transport.request(3).url, format!("{instance}/stop"));
+    assert_eq!(transport.request(4).url, format!("{instance}/stop"));
 
-    let set = transport.request(4);
+    let set = transport.request(5);
     assert_eq!(set.url, format!("{instance}/setMachineType"));
     assert_eq!(
         body_of(&set),
@@ -815,7 +823,8 @@ async fn resizing_stops_sets_the_machine_type_and_starts_again() {
         "the new type is a zonal URL, and a bare name is refused"
     );
 
-    assert_eq!(transport.request(5).url, format!("{instance}/start"));
+    assert_eq!(transport.request(6).url, format!("{instance}/start"));
+    assert_eq!(transport.request(7).url, instance);
     // Nothing touches the disk: it survives because it was never being
     // deleted.
     assert!(
@@ -827,14 +836,19 @@ async fn resizing_stops_sets_the_machine_type_and_starts_again() {
 #[tokio::test]
 async fn a_resize_to_a_type_with_no_quota_never_stops_the_machine() {
     let machine = provisioned(MachineId::generate());
-    let mut gcp = provider(vec![token(), json(REGION_INFO), json(MACHINE_TYPES)]);
+    let mut gcp = provider(vec![
+        token(),
+        json(INSTANCE_RUNNING),
+        json(REGION_INFO),
+        json(MACHINE_TYPES),
+    ]);
 
     gcp.resize(&machine, LARGE_TYPE)
         .await
         .expect_err("a resize into a machine the quota cannot fund is refused");
     assert_eq!(
         gcp.transport().request_count(),
-        3,
+        4,
         "nothing was stopped, so the session is still running"
     );
 }
@@ -844,6 +858,7 @@ async fn a_failed_resize_operation_is_a_failure_whatever_the_instance_reports() 
     let machine = provisioned(MachineId::generate());
     let mut gcp = provider(vec![
         token(),
+        json(INSTANCE_RUNNING),
         json(REGION_INFO),
         json(MACHINE_TYPES),
         json(OPERATION_DONE),
@@ -1529,6 +1544,169 @@ async fn the_catalog_publishes_cloud_run_once_per_region_beside_the_machine_type
             .any(|entry| entry.runtime == Runtime::Vm && entry.region == ZONE),
         "the machine types are still published beside them"
     );
+}
+
+#[tokio::test]
+async fn zone_report_retries_billing_on_401_with_a_fresh_token() {
+    let mut gcp = provider_over(
+        one_zone(),
+        vec![
+            token(),
+            json(REGION_INFO),
+            json(MACHINE_TYPES),
+            refused(401, r#"{"error":{"code":401,"message":"token expired"}}"#),
+            token(),
+            json(SKUS),
+        ],
+    );
+
+    let report = gcp
+        .zone_report(ZONE)
+        .await
+        .expect("401 on Cloud Billing refreshes token and succeeds");
+    assert_ne!(report.offered, [] as [flyco_core::MachineCatalogEntry; 0]);
+    assert_eq!(gcp.transport().request_count(), 6);
+}
+
+#[tokio::test]
+async fn destroying_an_already_deleted_instance_still_deletes_the_boot_disk() {
+    let machine = provisioned(MachineId::generate());
+    let mut gcp = provider(vec![
+        token(),
+        refused(404, r#"{"error":{"code":404,"message":"not found"}}"#),
+        json(OPERATION_DONE),
+    ]);
+
+    gcp.destroy(&machine)
+        .await
+        .expect("404 instance still deletes surviving boot disk");
+    let transport = gcp.transport();
+    assert_eq!(transport.request_count(), 3);
+    assert!(transport.request(2).url.contains("/disks/"));
+}
+
+#[tokio::test]
+async fn destroying_a_job_tolerates_404_on_execution_and_job() {
+    let machine = Machine {
+        id: MachineId::generate(),
+        native_id: format!(
+            "projects/{PROJECT}/locations/{REGION}/jobs/flyco-job/executions/exec-1"
+        ),
+        runtime: Runtime::Container,
+        region: REGION.to_owned(),
+        state: MachineState::Running,
+        capacity_mode: CapacityMode::OnDemand,
+        address: None,
+    };
+    let mut gcp = provider(vec![
+        token(),
+        refused(404, r#"{"error":{"code":404,"message":"gone"}}"#), // GET executions
+        refused(404, r#"{"error":{"code":404,"message":"gone"}}"#), // DELETE job
+    ]);
+
+    gcp.destroy(&machine)
+        .await
+        .expect("404 on Cloud Run destroy is idempotent");
+}
+
+#[tokio::test]
+async fn resizing_across_cpu_architectures_is_refused_before_stopping() {
+    let machine = provisioned(MachineId::generate());
+    let mut machine_types: Value = serde_json::from_str(MACHINE_TYPES).expect("parse");
+    machine_types["items"]
+        .as_array_mut()
+        .expect("items array")
+        .push(serde_json::json!({
+            "name": "t2a-standard-2",
+            "guestCpus": 2,
+            "memoryMb": 8192,
+            "architecture": "ARM64"
+        }));
+    let mut gcp = provider(vec![
+        token(),
+        json(INSTANCE_RUNNING), // e2-standard-2 (x86_64)
+        json(REGION_INFO),
+        json(&machine_types.to_string()),
+    ]);
+
+    let error = gcp
+        .resize(&machine, "t2a-standard-2")
+        .await
+        .expect_err("cross-architecture resize is unsupported");
+    assert!(matches!(error, ProviderError::Unsupported { .. }));
+    assert!(
+        !(0..gcp.transport().request_count()).any(|i| gcp
+            .transport()
+            .request(i)
+            .url
+            .ends_with("/stop")),
+        "instance must not be stopped before architecture check"
+    );
+}
+
+#[tokio::test]
+async fn resizing_subtracts_running_vm_vcpus_from_quota() {
+    // Region has CPUS usage=2, limit=2 (100% full). Because `INSTANCE_RUNNING`
+    // is a running 2-vCPU `e2-standard-2`, releasing its 2 vCPUs lets an
+    // in-place resize to 2-vCPU `e2-medium` proceed.
+    let tight_region = serde_json::json!({
+        "name": REGION,
+        "status": "UP",
+        "quotas": [
+            { "metric": "CPUS", "limit": 2.0, "usage": 2.0 },
+            { "metric": "PREEMPTIBLE_CPUS", "limit": 4.0, "usage": 0.0 }
+        ]
+    })
+    .to_string();
+    let machine = provisioned(MachineId::generate());
+    let mut gcp = provider(vec![
+        token(),
+        json(INSTANCE_RUNNING),
+        json(&tight_region),
+        json(MACHINE_TYPES),
+        json(OPERATION_DONE), // stop
+        json(OPERATION_DONE), // setMachineType
+        json(OPERATION_DONE), // start
+        json(INSTANCE_RESTARTED),
+    ]);
+
+    gcp.resize(&machine, "e2-medium")
+        .await
+        .expect("subtracting running VM vCPUs allows in-place resize at tight quota");
+}
+
+#[tokio::test]
+async fn a_vm_provision_yields_a_continuation_and_resumes() {
+    let mut script = vec![
+        token(),
+        json(REGION_INFO),
+        json(MACHINE_TYPES),
+        json(OPERATION_RUNNING), // insert instance
+    ];
+    script.extend((0..crate::polling::POLLS_PER_INVOCATION).map(|_| json(OPERATION_RUNNING)));
+    let mut gcp = provider(script);
+
+    let outcome = gcp
+        .provision(&request(MachineId::generate(), MACHINE_TYPE, false))
+        .await
+        .expect("provision yields Pending");
+    let Provisioning::Pending {
+        machine,
+        continuation,
+    } = outcome
+    else {
+        panic!("expected Pending after POLLS_PER_INVOCATION operation polls");
+    };
+    assert_eq!(machine.state, MachineState::Provisioning);
+
+    let mut resumed = provider(vec![token(), json(OPERATION_DONE), json(INSTANCE_RUNNING)]);
+    let ready = resumed
+        .resume(&machine, &continuation)
+        .await
+        .and_then(Provisioning::ready)
+        .expect("resume finishes GCP VM provision");
+    assert_eq!(ready.state, MachineState::Running);
+    assert_eq!(ready.address.as_deref(), Some(ADDRESS));
 }
 
 /// The one test that touches a real project.

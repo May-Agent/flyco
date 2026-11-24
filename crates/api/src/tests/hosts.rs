@@ -78,6 +78,20 @@ async fn a_minted_token_carries_the_command_that_spends_it(ctx: TestContext, kv:
         "{}",
         minted.command
     );
+    assert!(
+        minted
+            .command
+            .contains("--control-plane https://flyco.test/"),
+        "{}",
+        minted.command
+    );
+
+    let custom_provisioner =
+        CloudProvisioner::new(test_host_rooms()).with_flycod_installer_url("https://flyco.dev/");
+    assert_eq!(
+        custom_provisioner.flycod_installer_url(),
+        "https://flyco.dev/install/flycod.sh"
+    );
     assert!(minted.command.contains(&minted.token));
     assert!(minted.command.contains("host enroll"));
 

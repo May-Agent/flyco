@@ -188,7 +188,12 @@ describe("Claude Code, opened for it alone", () => {
       level: 1,
       name: "Paste the code Anthropic shows you",
     });
-    expect(getByText("CODE#STATE")).toBeInTheDocument();
+    expect(
+      getByText("CODE#STATE"),
+    ).toBeInTheDocument();
+    expect(
+      container.querySelector(`a[href="${AUTHORIZE_URL}"]`),
+    ).toBeInTheDocument();
 
     expect(primary(container)).toHaveTextContent("Link Claude Code");
     expect(primary(container)).toBeDisabled();
@@ -296,6 +301,33 @@ describe("Claude Code, opened for it alone", () => {
     ).toBeInTheDocument();
   });
 
+  it("surfaces a failed restart instead of throwing an unhandled rejection", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    let starts = 0;
+    route(
+      (path, method) =>
+        method === "POST" && path === "/v1/harness-accounts/claude/oauth/start",
+      () => {
+        starts += 1;
+        return starts === 1
+          ? json({ attempt_id: ATTEMPT, authorize_url: AUTHORIZE_URL })
+          : problem(502, "claude-unavailable", "Anthropic could not be reached.");
+      },
+    );
+    const { container, findByRole, findByLabelText, getByRole } = renderFlow(
+      ["agent"],
+      { agents: ["claude_code"] },
+    );
+    await findByRole("heading", { level: 1, name: "Link Claude Code" });
+    fireEvent.click(primary(container));
+    await findByLabelText("Code from Anthropic");
+
+    fireEvent.click(getByRole("button", { name: "Start the sign-in again" }));
+    expect(await findByRole("alert")).toHaveTextContent(
+      "Anthropic could not be reached.",
+    );
+  });
+
   it("leads by link to the API-key page, which links with an Anthropic key", async () => {
     const { container, findByRole, findByLabelText, getByRole, onDone } =
       renderFlow(["agent"], { agents: ["claude_code"] });
@@ -395,6 +427,9 @@ describe("Devin, opened for it alone", () => {
       level: 1,
       name: "Paste the code Devin shows you",
     });
+    expect(
+      container.querySelector(`a[href="${DEVIN_AUTHORIZE_URL}"]`),
+    ).toBeInTheDocument();
     // No localhost address anywhere: the page shows a code, and that is
     // all the user is asked for.
     expect(getAllByText(/Devin shows a code/).length).toBeGreaterThan(0);
@@ -501,6 +536,33 @@ describe("Devin, opened for it alone", () => {
         name: "Paste the code Devin shows you",
       }),
     ).toBeInTheDocument();
+  });
+
+  it("surfaces a failed Devin restart instead of throwing an unhandled rejection", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null);
+    let starts = 0;
+    route(
+      (path, method) =>
+        method === "POST" && path === "/v1/harness-accounts/devin/oauth/start",
+      () => {
+        starts += 1;
+        return starts === 1
+          ? json({ attempt_id: DEVIN_ATTEMPT, authorize_url: DEVIN_AUTHORIZE_URL })
+          : problem(502, "devin-unavailable", "Devin could not be reached.");
+      },
+    );
+    const { container, findByRole, findByLabelText, getByRole } = renderFlow(
+      ["agent"],
+      { agents: ["devin"] },
+    );
+    await findByRole("heading", { level: 1, name: "Link Devin" });
+    fireEvent.click(primary(container));
+    await findByLabelText("Code from Devin");
+
+    fireEvent.click(getByRole("button", { name: "Start the sign-in again" }));
+    expect(await findByRole("alert")).toHaveTextContent(
+      "Devin could not be reached.",
+    );
   });
 
   it("leads by link to the API-key page, which links with a Devin token", async () => {

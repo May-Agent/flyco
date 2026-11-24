@@ -140,24 +140,46 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * `GET /v1/auth/github/callback` — completes whichever GitHub flow is returning: a Codespaces link when the `state` names a provider attempt, a sign-in when it names one of this module's own.
-         * @description `GET /v1/auth/github/callback` — completes whichever GitHub flow is
-         *     returning: a Codespaces link when the `state` names a provider attempt,
-         *     a sign-in when it names one of this module's own.
+         * `GET /v1/auth/github/callback` — forwards the returning browser to the SPA with the OAuth parameters in the URL fragment.
+         * @description `GET /v1/auth/github/callback` — forwards the returning browser to the SPA
+         *     with the OAuth parameters in the URL fragment.
          *
-         *     For a sign-in: consumes the `state`, exchanges the code, upserts the
-         *     account, and sends the browser to the SPA with the session token in the
-         *     URL fragment.
+         *     Never exchanges the code, never consumes state, never mints a session
+         *     token, and sets no cookies: the SPA validates `state` against the
+         *     initiating browser's storage and redeems the code via an explicit `POST`.
          *
-         *     Deliberately not annotated with `#[skyzen::openapi]`: the macro emits
-         *     module-level items that mention every argument type, and this handler is
-         *     generic over [`GithubOauth`], whose parameter does not exist at module
-         *     scope. The route still appears in the exported document, without its
-         *     parameter schemas.
+         *     Per-call cost: 0 D1 statements, 0 KV operations, 0 Durable Object calls,
+         *     0 R2 operations, 0 subrequests.
          */
         get: operations["flyco_api::oauth::callback"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/github/exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /v1/auth/github/exchange` — validates the browser's `state` and PKCE verifier, exchanges the GitHub code, upserts the account, and mints an `fs_` session token.
+         * @description `POST /v1/auth/github/exchange` — validates the browser's `state` and PKCE
+         *     verifier, exchanges the GitHub code, upserts the account, and mints an
+         *     `fs_` session token.
+         *
+         *     Per-call cost: 1 KV read + 2 KV writes (`take` state + `session::issue`),
+         *     1 D1 upsert (`users::upsert_from_github`), 0 Durable Object calls, 0 R2
+         *     operations, 2 external subrequests to GitHub (`access_token` + `GET /user`).
+         */
+        post: operations["flyco_api::oauth::exchange"];
         delete?: never;
         options?: never;
         head?: never;
@@ -177,9 +199,13 @@ export interface paths {
          * Begins a GitHub sign-in, returning the URL to send the browser to.
          * @description Begins a GitHub sign-in, returning the URL to send the browser to.
          *
-         *     The Turnstile token is verified *before* any state is minted: a bot that
-         *     cannot produce one gets no OAuth `state`, no KV write, and no path to
-         *     the callback at all.
+         *     The `code_challenge` shape and the Turnstile token are verified *before*
+         *     any state is minted: a bot or malformed caller gets no OAuth `state`, no KV
+         *     write, and no path to the exchange.
+         *
+         *     Per-call cost: 0 D1 statements, 1 KV write (`auth:oauth-state:{state}`),
+         *     0 Durable Object calls, 0 R2 operations, 1 external subrequest (Turnstile
+         *     siteverify).
          */
         post: operations["flyco_api::oauth::start"];
         delete?: never;
@@ -1139,15 +1165,43 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * `GET /v1/providers/azure/oauth/callback` — records what Microsoft said.
-         * @description `GET /v1/providers/azure/oauth/callback` — records what Microsoft said.
+         * `GET /v1/providers/azure/oauth/callback` — forwards Microsoft's redirect to `/connect/return#provider=azure&...` without exchanging the code or setting cookies.
+         * @description `GET /v1/providers/azure/oauth/callback` — forwards Microsoft's redirect to
+         *     `/connect/return#provider=azure&...` without exchanging the code or setting
+         *     cookies.
          *
-         *     Public, because the browser arrives from `login.microsoftonline.com` with
-         *     no flyco credential. It authenticates itself with the `state` it carries.
+         *     Per-call cost: 0 D1 statements, 0 KV operations, 0 Durable Object calls,
+         *     0 R2 operations, 0 subrequests.
          */
         get: operations["flyco_api::provider_oauth::azure_callback"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/azure/oauth/exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /v1/providers/azure/oauth/exchange` — verifies the caller owns the attempt and `state`, then redeems Microsoft's code using the attempt's PKCE verifier.
+         * @description `POST /v1/providers/azure/oauth/exchange` — verifies the caller owns the
+         *     attempt and `state`, then redeems Microsoft's code using the attempt's PKCE
+         *     verifier.
+         *
+         *     Per-call cost: 0 D1 statements, 1 KV read + 1 KV write, 0 Durable Object
+         *     calls, 0 R2 operations, 3 external subrequests to Microsoft (code exchange,
+         *     Graph token refresh, list subscriptions) on success.
+         */
+        post: operations["flyco_api::provider_oauth::azure_exchange"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1166,6 +1220,9 @@ export interface paths {
         /**
          * `POST /v1/providers/azure/oauth/start` — begins a Microsoft sign-in.
          * @description `POST /v1/providers/azure/oauth/start` — begins a Microsoft sign-in.
+         *
+         *     Per-call cost: 0 D1 statements, 1 KV write (`auth:provider-oauth:{attempt_id}`),
+         *     0 Durable Object calls, 0 R2 operations, 0 subrequests.
          */
         post: operations["flyco_api::provider_oauth::azure_start"];
         delete?: never;
@@ -1272,6 +1329,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/providers/codespaces/oauth/exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /v1/providers/codespaces/oauth/exchange` — verifies the caller owns the attempt and `state`, then redeems GitHub's code and checks the `codespace` and `repo` scopes.
+         * @description `POST /v1/providers/codespaces/oauth/exchange` — verifies the caller owns
+         *     the attempt and `state`, then redeems GitHub's code and checks the
+         *     `codespace` and `repo` scopes.
+         *
+         *     Per-call cost: 0 D1 statements, 1 KV read + 1 KV write, 0 Durable Object
+         *     calls, 0 R2 operations, 2 external subrequests to GitHub (`access_token` +
+         *     `GET /user`) on success.
+         */
+        post: operations["flyco_api::provider_oauth::codespaces_exchange"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/providers/codespaces/oauth/start": {
         parameters: {
             query?: never;
@@ -1285,6 +1368,9 @@ export interface paths {
          * `POST /v1/providers/codespaces/oauth/start` — begins a GitHub sign-in for the `codespace` scope.
          * @description `POST /v1/providers/codespaces/oauth/start` — begins a GitHub sign-in
          *     for the `codespace` scope.
+         *
+         *     Per-call cost: 0 D1 statements, 1 KV write (`auth:provider-oauth:{attempt_id}`),
+         *     0 Durable Object calls, 0 R2 operations, 0 subrequests.
          */
         post: operations["flyco_api::provider_oauth::codespaces_start"];
         delete?: never;
@@ -1342,14 +1428,43 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * `GET /v1/providers/gcp/oauth/callback` — records what Google said.
-         * @description `GET /v1/providers/gcp/oauth/callback` — records what Google said.
+         * `GET /v1/providers/gcp/oauth/callback` — forwards Google's redirect to `/connect/return#provider=gcp&...` without exchanging the code or setting cookies.
+         * @description `GET /v1/providers/gcp/oauth/callback` — forwards Google's redirect to
+         *     `/connect/return#provider=gcp&...` without exchanging the code or setting
+         *     cookies.
          *
-         *     Public, for the reason [`azure_callback`] is.
+         *     Per-call cost: 0 D1 statements, 0 KV operations, 0 Durable Object calls,
+         *     0 R2 operations, 0 subrequests.
          */
         get: operations["flyco_api::provider_oauth::gcp_callback"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/providers/gcp/oauth/exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * `POST /v1/providers/gcp/oauth/exchange` — verifies the caller owns the attempt and `state`, then redeems Google's code using the attempt's PKCE verifier.
+         * @description `POST /v1/providers/gcp/oauth/exchange` — verifies the caller owns the
+         *     attempt and `state`, then redeems Google's code using the attempt's PKCE
+         *     verifier.
+         *
+         *     Per-call cost: 0 D1 statements, 1 KV read + 1 KV write, 0 Durable Object
+         *     calls, 0 R2 operations, 2 external subrequests to Google (code exchange,
+         *     list projects) on success.
+         */
+        post: operations["flyco_api::provider_oauth::gcp_exchange"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1368,6 +1483,9 @@ export interface paths {
         /**
          * `POST /v1/providers/gcp/oauth/start` — begins a Google sign-in.
          * @description `POST /v1/providers/gcp/oauth/start` — begins a Google sign-in.
+         *
+         *     Per-call cost: 0 D1 statements, 1 KV write (`auth:provider-oauth:{attempt_id}`),
+         *     0 Durable Object calls, 0 R2 operations, 0 subrequests.
          */
         post: operations["flyco_api::provider_oauth::gcp_start"];
         delete?: never;
@@ -4369,6 +4487,31 @@ export interface components {
             /** @description Whether more events exist past the last one returned. */
             more: boolean;
         };
+        /** @description What `POST /v1/auth/github/exchange` must carry. */
+        ExchangeGithubLogin: {
+            /** @description The single-use authorization code GitHub returned to the callback. */
+            code: string;
+            /**
+             * @description The `sessionStorage`-held PKCE verifier matching the `code_challenge`
+             *     sent to [`start`].
+             */
+            code_verifier: string;
+            /** @description The `state` minted by [`start`] and echoed back by GitHub. */
+            state: string;
+        };
+        /** @description Request body of `POST /v1/providers/{azure,gcp,codespaces}/oauth/exchange`. */
+        ExchangeProviderOauth: {
+            /** @description The attempt id returned by the matching `POST .../oauth/start`. */
+            attempt_id: components["schemas"]["Uuid"];
+            /** @description The single-use authorization code, when consent was granted. */
+            code?: string | null;
+            /** @description The vendor's machine-readable refusal, when consent was declined. */
+            error?: string | null;
+            /** @description The vendor's explanation of the refusal, when stated. */
+            error_description?: string | null;
+            /** @description The `state` echoed back by the vendor to `/connect/return`. */
+            state: string;
+        };
         /**
          * @description A harness capability tracked in the per-harness feature matrix.
          * @enum {string}
@@ -4473,6 +4616,16 @@ export interface components {
              * @description vCPU-seconds the provider does not bill for, per month.
              */
             vcpu_seconds_per_month: number;
+        };
+        /**
+         * @description What `POST /v1/auth/github/exchange` answers with on success.
+         *
+         *     The plaintext session token is returned once over JSON to the browser tab
+         *     that initiated sign-in; flyco sets no cookies.
+         */
+        GithubSession: {
+            /** @description The freshly minted `fs_` browser session token. */
+            token: string;
         };
         /**
          * @description `POST /v1/sessions/{id}/handoff/complete` body — the integrity record
@@ -5787,8 +5940,8 @@ export interface components {
          *
          *     Every field but `state` is optional because a refusal is a redirect too:
          *     a user who closes the consent screen comes back with `error` and no
-         *     `code`, and that has to reach the return page as a problem rather than
-         *     as an extractor failure.
+         *     `code`, and that has to reach the return page cleanly rather than as an
+         *     extractor failure.
          */
         ProviderCallback: {
             /** @description The single-use authorization code. */
@@ -6609,10 +6762,15 @@ export interface components {
          * @description What `POST /v1/auth/github/start` must carry.
          *
          *     This is the one public route whose whole job is minting account state,
-         *     which makes it the one a registration bot wants — so the request is not
-         *     the sign-in itself but proof a human, not a script, asked for it.
+         *     which makes it the one a registration bot wants — so the request carries
+         *     both human proof and the initiating browser's PKCE challenge.
          */
         StartGithubLogin: {
+            /**
+             * @description Base64url-encoded SHA-256 (`S256`) challenge of the verifier the
+             *     initiating browser holds in `sessionStorage`.
+             */
+            code_challenge: string;
             /** @description The `cf-turnstile-response` token the login page's widget produced. */
             turnstile_token: string;
         };
@@ -7392,6 +7550,44 @@ export interface operations {
             };
         };
     };
+    "flyco_api::oauth::exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Extractor arguments */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The single-use authorization code GitHub returned to the callback. */
+                    code: string;
+                    /**
+                     * @description The `sessionStorage`-held PKCE verifier matching the `code_challenge`
+                     *     sent to [`start`].
+                     */
+                    code_verifier: string;
+                    /** @description The `state` minted by [`start`] and echoed back by GitHub. */
+                    state: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description The freshly minted `fs_` browser session token. */
+                        token: string;
+                    };
+                };
+            };
+        };
+    };
     "flyco_api::oauth::start": {
         parameters: {
             query?: never;
@@ -7403,6 +7599,11 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
+                    /**
+                     * @description Base64url-encoded SHA-256 (`S256`) challenge of the verifier the
+                     *     initiating browser holds in `sessionStorage`.
+                     */
+                    code_challenge: string;
                     /** @description The `cf-turnstile-response` token the login page's widget produced. */
                     turnstile_token: string;
                 };
@@ -9570,6 +9771,59 @@ export interface operations {
             };
         };
     };
+    "flyco_api::provider_oauth::azure_exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Extractor arguments */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The attempt id returned by the matching `POST .../oauth/start`. */
+                    attempt_id: components["schemas"]["Uuid"];
+                    /** @description The single-use authorization code, when consent was granted. */
+                    code?: string | null;
+                    /** @description The vendor's machine-readable refusal, when consent was declined. */
+                    error?: string | null;
+                    /** @description The vendor's explanation of the refusal, when stated. */
+                    error_description?: string | null;
+                    /** @description The `state` echoed back by the vendor to `/connect/return`. */
+                    state: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        state: "pending";
+                    } | {
+                        /** @description The account that signed in, as the vendor names it. */
+                        account: string;
+                        /** @description What that account may link, in the vendor's own order. */
+                        choices: components["schemas"]["ProviderOauthChoice"][];
+                        /** @enum {string} */
+                        state: "authorized";
+                    } | {
+                        /** @description The problem slug the return page was sent, e.g. `microsoft-rejected`. */
+                        problem: string;
+                        /** @description What the vendor said, in its own words. */
+                        reason: string;
+                        /** @enum {string} */
+                        state: "failed";
+                    };
+                };
+            };
+        };
+    };
     "flyco_api::provider_oauth::azure_start": {
         parameters: {
             query?: never;
@@ -9758,6 +10012,59 @@ export interface operations {
             };
         };
     };
+    "flyco_api::provider_oauth::codespaces_exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Extractor arguments */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The attempt id returned by the matching `POST .../oauth/start`. */
+                    attempt_id: components["schemas"]["Uuid"];
+                    /** @description The single-use authorization code, when consent was granted. */
+                    code?: string | null;
+                    /** @description The vendor's machine-readable refusal, when consent was declined. */
+                    error?: string | null;
+                    /** @description The vendor's explanation of the refusal, when stated. */
+                    error_description?: string | null;
+                    /** @description The `state` echoed back by the vendor to `/connect/return`. */
+                    state: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        state: "pending";
+                    } | {
+                        /** @description The account that signed in, as the vendor names it. */
+                        account: string;
+                        /** @description What that account may link, in the vendor's own order. */
+                        choices: components["schemas"]["ProviderOauthChoice"][];
+                        /** @enum {string} */
+                        state: "authorized";
+                    } | {
+                        /** @description The problem slug the return page was sent, e.g. `microsoft-rejected`. */
+                        problem: string;
+                        /** @description What the vendor said, in its own words. */
+                        reason: string;
+                        /** @enum {string} */
+                        state: "failed";
+                    };
+                };
+            };
+        };
+    };
     "flyco_api::provider_oauth::codespaces_start": {
         parameters: {
             query?: never;
@@ -9889,6 +10196,59 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    "flyco_api::provider_oauth::gcp_exchange": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description Extractor arguments */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description The attempt id returned by the matching `POST .../oauth/start`. */
+                    attempt_id: components["schemas"]["Uuid"];
+                    /** @description The single-use authorization code, when consent was granted. */
+                    code?: string | null;
+                    /** @description The vendor's machine-readable refusal, when consent was declined. */
+                    error?: string | null;
+                    /** @description The vendor's explanation of the refusal, when stated. */
+                    error_description?: string | null;
+                    /** @description The `state` echoed back by the vendor to `/connect/return`. */
+                    state: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        state: "pending";
+                    } | {
+                        /** @description The account that signed in, as the vendor names it. */
+                        account: string;
+                        /** @description What that account may link, in the vendor's own order. */
+                        choices: components["schemas"]["ProviderOauthChoice"][];
+                        /** @enum {string} */
+                        state: "authorized";
+                    } | {
+                        /** @description The problem slug the return page was sent, e.g. `microsoft-rejected`. */
+                        problem: string;
+                        /** @description What the vendor said, in its own words. */
+                        reason: string;
+                        /** @enum {string} */
+                        state: "failed";
+                    };
+                };
             };
         };
     };

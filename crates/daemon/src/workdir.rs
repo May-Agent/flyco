@@ -37,7 +37,7 @@ use flyco_core::workdir::{
     FILE_BYTES_MAX, FileChange, FileContent, FileDiff, WorkdirDiff, WorkdirRefusal, WorkdirReply,
     WorkdirRequest,
 };
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 
 use crate::git::run_git;
@@ -250,6 +250,7 @@ impl Workspace {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|error| unreadable(&error))?;
         let mut stdin = child
@@ -258,21 +259,53 @@ impl Workspace {
             .ok_or_else(|| WorkdirRefusal::Unreadable {
                 detail: "git check-ignore did not take a path list".to_owned(),
             })?;
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| WorkdirRefusal::Unreadable {
+                detail: "git check-ignore stdout was not piped".to_owned(),
+            })?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| WorkdirRefusal::Unreadable {
+                detail: "git check-ignore stderr was not piped".to_owned(),
+            })?;
         let mut paths = Vec::new();
         for entry in entries {
             paths.extend_from_slice(entry.name.as_bytes());
             paths.push(0);
         }
-        stdin
-            .write_all(&paths)
-            .await
-            .map_err(|error| unreadable(&error))?;
-        drop(stdin);
+        let write_stdin = async move {
+            let result = stdin.write_all(&paths).await;
+            drop(stdin);
+            result
+        };
+        let read_stdout = async {
+            let mut buf = Vec::new();
+            stdout_pipe.read_to_end(&mut buf).await.map(|_| buf)
+        };
+        let read_stderr = async {
+            let mut buf = Vec::new();
+            stderr_pipe.read_to_end(&mut buf).await.map(|_| buf)
+        };
+        let (write_res, stdout_res, stderr_res) =
+            tokio::join!(write_stdin, read_stdout, read_stderr);
 
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|error| unreadable(&error))?;
+        let status = child.wait().await.map_err(|error| unreadable(&error))?;
+        let stdout = stdout_res.map_err(|error| unreadable(&error))?;
+        let stderr = stderr_res.map_err(|error| unreadable(&error))?;
+        if let Err(error) = write_res
+            && (error.kind() != std::io::ErrorKind::BrokenPipe
+                || matches!(status.code(), Some(0 | 1)))
+        {
+            return Err(unreadable(&error));
+        }
+        let output = std::process::Output {
+            status,
+            stdout,
+            stderr,
+        };
         // 0: something is ignored. 1: nothing is. Anything else is git
         // refusing, and a listing that silently marked nothing would be
         // claiming a `target/` is checked in.

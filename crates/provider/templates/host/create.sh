@@ -1,6 +1,6 @@
 set -eu
-podman rm --force --ignore {{ container }}
-podman volume exists {{ volume }} || podman volume create {{ volume }}
+podman rm --force --ignore {{ container }} </dev/null
+podman volume exists {{ volume }} </dev/null || podman volume create {{ volume }} </dev/null
 podman run --detach \
   --name {{ container }} \
   --volume {{ volume }}:{{ workdir }} \
@@ -8,6 +8,4 @@ podman run --detach \
   --label flyco.session={{ session }} \
   --restart on-failure \
   --env-file /dev/stdin \
-  {{ image }} <<'FLYCO_ENV_EOF'
-{{ config_env }}={{ config_base64 }}
-FLYCO_ENV_EOF
+  {{ image }}

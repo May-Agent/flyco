@@ -245,6 +245,7 @@ pub fn family_tokens(instance_type: &str) -> Vec<String> {
 #[derive(Debug, Clone, Default)]
 pub struct Quotas {
     covered: Vec<(Coverage, String, u32)>,
+    used_by_pool: Vec<u32>,
     used_vcpus: Vec<(Market, String, u32)>,
 }
 
@@ -253,10 +254,12 @@ impl Quotas {
     ///
     /// `running` is every instance already on compute, paired with the shape
     /// of its type: the vCPU count is what a quota is spent in, and EC2 does
-    /// not state it on the instance.
+    /// not state it on the instance. Each running instance is charged to its
+    /// single binding quota pool so families sharing a pool (such as Standard
+    /// A/C/D/H/I/M/R/T/Z) sum together without double-counting.
     #[must_use]
     pub fn new(quotas: Vec<Quota>, running: &[(Market, &InstanceTypeInfo)]) -> Self {
-        let covered = quotas
+        let covered: Vec<(Coverage, String, u32)> = quotas
             .into_iter()
             .filter_map(|quota| {
                 let coverage = quota.coverage()?;
@@ -264,9 +267,21 @@ impl Quotas {
             })
             .collect();
 
+        let mut used_by_pool = vec![0_u32; covered.len()];
         let mut used_vcpus: Vec<(Market, String, u32)> = Vec::new();
         for (market, info) in running {
-            for family in family_tokens(&info.instance_type) {
+            let tokens = family_tokens(&info.instance_type);
+            if let Some(pool_index) = tokens.iter().find_map(|token| {
+                covered.iter().position(|(coverage, _, _)| {
+                    coverage.market == *market
+                        && coverage.families.iter().any(|family| family == token)
+                })
+            }) {
+                used_by_pool[pool_index] =
+                    used_by_pool[pool_index].saturating_add(info.vcpu_info.default_vcpus);
+            }
+
+            for family in tokens {
                 if let Some(entry) = used_vcpus
                     .iter_mut()
                     .find(|(seen, name, _)| seen == market && *name == family)
@@ -280,8 +295,19 @@ impl Quotas {
 
         Self {
             covered,
+            used_by_pool,
             used_vcpus,
         }
+    }
+
+    /// The index of the quota that binds one instance type in one market.
+    fn binding_index(&self, instance_type: &str, market: Market) -> Option<usize> {
+        let tokens = family_tokens(instance_type);
+        tokens.iter().find_map(|token| {
+            self.covered.iter().position(|(coverage, _, _)| {
+                coverage.market == market && coverage.families.iter().any(|family| family == token)
+            })
+        })
     }
 
     /// The quota that binds one instance type in one market.
@@ -292,12 +318,8 @@ impl Quotas {
     /// checked against the standard pool.
     #[must_use]
     pub fn binding(&self, instance_type: &str, market: Market) -> Option<&(Coverage, String, u32)> {
-        let tokens = family_tokens(instance_type);
-        tokens.iter().find_map(|token| {
-            self.covered.iter().find(|(coverage, _, _)| {
-                coverage.market == market && coverage.families.iter().any(|family| family == token)
-            })
-        })
+        self.binding_index(instance_type, market)
+            .map(|index| &self.covered[index])
     }
 
     /// How many vCPUs of one family are already running in one market.
@@ -341,7 +363,7 @@ impl Quotas {
             });
         }
 
-        let Some((coverage, code, limit)) = self.binding(name, market) else {
+        let Some(pool_index) = self.binding_index(name, market) else {
             return Err(ProviderError::Unavailable {
                 machine_type: name.to_owned(),
                 region: region.to_owned(),
@@ -349,18 +371,13 @@ impl Quotas {
                     .to_owned(),
             });
         };
+        let (coverage, code, limit) = &self.covered[pool_index];
 
         let (used, requested) = match coverage.unit {
-            QuotaUnit::Vcpus => {
-                let family = family_tokens(name)
-                    .into_iter()
-                    .find(|token| coverage.families.contains(token))
-                    .unwrap_or_default();
-                (
-                    self.used(&family, market),
-                    instance_type.vcpu_info.default_vcpus,
-                )
-            }
+            QuotaUnit::Vcpus => (
+                self.used_by_pool[pool_index],
+                instance_type.vcpu_info.default_vcpus,
+            ),
             // One host, and an allocation flyco does not enumerate.
             QuotaUnit::Hosts => (0, 1),
         };
@@ -556,5 +573,48 @@ mod tests {
             .require_capacity_for(&unknown, "us-west-2", CapacityMode::OnDemand)
             .expect_err("an unknown family must not read as unlimited");
         assert!(matches!(error, ProviderError::Unavailable { .. }));
+    }
+
+    #[test]
+    fn shared_pool_sums_vcpus_across_all_member_families() {
+        // `t3` (family `t`), `m6i` (family `m`), and `c7g` (family `c`) all
+        // draw from `Running On-Demand Standard (A, C, D, H, I, M, R, T, Z)`.
+        let make = |name: &str, vcpus: u32| InstanceTypeInfo {
+            instance_type: name.to_owned(),
+            supported_usage_classes: super::super::ec2::UsageClassSet {
+                item: vec!["on-demand".to_owned(), "spot".to_owned()],
+            },
+            processor_info: ProcessorInfo {
+                supported_architectures: ArchitectureSet {
+                    item: vec!["x86_64".to_owned()],
+                },
+            },
+            vcpu_info: super::super::ec2::VCpuInfo {
+                default_vcpus: vcpus,
+            },
+            memory_info: super::super::ec2::MemoryInfo { size_in_mib: 4_096 },
+        };
+        let t3 = make("t3.4xlarge", 16);
+        let m6i = make("m6i.4xlarge", 16);
+        let c7g = make("c7g.medium", 1);
+
+        // The fixture's Standard On-Demand limit is 32 vCPUs; 16 (t3) + 16 (m6i)
+        // = 32 used, leaving zero room for a 1-vCPU c7g instance.
+        let quotas = Quotas::new(
+            quotas_from(include_str!("../../fixtures/aws/list_service_quotas.json")),
+            &[(Market::OnDemand, &t3), (Market::OnDemand, &m6i)],
+        );
+        let error = quotas
+            .require_capacity_for(&c7g, "us-west-2", CapacityMode::OnDemand)
+            .expect_err("shared Standard pool is full across t3 + m6i");
+        assert!(matches!(
+            error,
+            ProviderError::QuotaExceeded {
+                used: 32,
+                limit: 32,
+                requested: 1,
+                ..
+            }
+        ));
     }
 }

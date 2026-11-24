@@ -2,11 +2,12 @@
  * The consent road for Azure and Google Cloud (docs/ux.md §4 C5, C6).
  *
  * Both vendors offer the screen GitHub offers: their own sign-in, a list
- * of what flyco asks for, one approval. Flyco opens it in a new tab and
- * waits here, polling the attempt until the vendor has sent the browser
- * back; then it asks which subscription or project, and creates its own
- * limited identity there. The user's sign-in is used for that one setup
- * and never kept, so nothing runs as them afterwards.
+ * of what flyco asks for, one approval. Flyco opens it in a new tab (and
+ * keeps a direct link on screen in case the browser blocked the popup) and
+ * waits here, polling the attempt until the return tab completes the
+ * authenticated exchange; then it asks which subscription or project, and
+ * creates its own limited identity there. The user's sign-in is used for
+ * that one setup and never kept, so nothing runs as them afterwards.
  *
  * The vendor's terminal in the browser stays reachable by a quiet link,
  * for a tenant whose administrator has switched consent off.
@@ -15,6 +16,10 @@ import { Show, createSignal, onCleanup } from "solid-js";
 import Logomark, { PROVIDER_MARK } from "../../Logomark";
 import ProblemNotice from "../../ProblemNotice";
 import { useReadiness } from "../../Readiness";
+import {
+  forgetProviderOauthAttempt,
+  rememberProviderOauthAttempt,
+} from "../../../api/auth";
 import {
   finishAzureOauth,
   finishCodespacesOauth,
@@ -29,6 +34,7 @@ import { PROVIDER_LABEL } from "../../../lib/providers";
 import type { PageComponent, Primary } from "../page";
 import {
   ChoiceCards,
+  ExternalLink,
   QuietLink,
   Waiting,
   openInNewTab,
@@ -77,6 +83,15 @@ const VENDOR: Record<
   },
 };
 
+function stateFromAuthorizeUrl(authorizeUrl: string): string | null {
+  try {
+    const state = new URL(authorizeUrl).searchParams.get("state");
+    return state !== null && state.length > 0 ? state : null;
+  } catch {
+    return null;
+  }
+}
+
 export const CloudSignIn: PageComponent<{
   id: "cloud-sign-in";
   provider: ConsentCloud;
@@ -84,6 +99,8 @@ export const CloudSignIn: PageComponent<{
   const readiness = useReadiness();
   const vendor = VENDOR[props.page.provider];
   const [attempt, setAttempt] = createSignal<string | null>(null);
+  const [authorizeUrl, setAuthorizeUrl] = createSignal<string | null>(null);
+  const [restarting, setRestarting] = createSignal(false);
   const [failure, setFailure] = createSignal<unknown>(null);
   /** What the vendor said when the browser came back without a sign-in. */
   const [refusal, setRefusal] = createSignal<string | null>(null);
@@ -105,10 +122,20 @@ export const CloudSignIn: PageComponent<{
     timer = undefined;
   });
 
-  function failTimeout(): void {
+  function clearAttempt(): void {
+    const active = attempt();
+    if (active !== null) {
+      forgetProviderOauthAttempt(active);
+    }
     clearTimeout(timer);
     timer = undefined;
+    pollGeneration += 1;
     setAttempt(null);
+    setAuthorizeUrl(null);
+  }
+
+  function failTimeout(): void {
+    clearAttempt();
     setFailure(new Error(`Timed out waiting for ${vendor.name} sign-in. Try again.`));
   }
 
@@ -128,6 +155,52 @@ export const CloudSignIn: PageComponent<{
     }, POLL_MS);
   }
 
+  async function beginOauthAttempt(): Promise<void> {
+    const started = await startProviderOauth(props.page.provider);
+    if (closed) {
+      return;
+    }
+    const previous = attempt();
+    if (previous !== null) {
+      forgetProviderOauthAttempt(previous);
+    }
+    const state = stateFromAuthorizeUrl(started.authorize_url);
+    if (state !== null) {
+      rememberProviderOauthAttempt(
+        props.page.provider,
+        state,
+        started.attempt_id,
+      );
+    }
+    pollGeneration += 1;
+    pollDeadline = Date.now() + CLOUD_POLL_DEADLINE_MS;
+    setAuthorizeUrl(started.authorize_url);
+    setAttempt(started.attempt_id);
+    openInNewTab(started.authorize_url);
+    schedule(started.attempt_id, pollGeneration);
+  }
+
+  async function restart(): Promise<void> {
+    if (restarting()) {
+      return;
+    }
+    setRestarting(true);
+    setFailure(null);
+    setRefusal(null);
+    try {
+      await beginOauthAttempt();
+    } catch (error) {
+      if (!closed) {
+        clearAttempt();
+        setFailure(error);
+      }
+    } finally {
+      if (!closed) {
+        setRestarting(false);
+      }
+    }
+  }
+
   /** Asks once whether the vendor has sent the browser back; asks again if not. */
   async function ask(attemptId: string, gen: number): Promise<void> {
     if (closed || gen !== pollGeneration) {
@@ -143,6 +216,7 @@ export const CloudSignIn: PageComponent<{
         return;
       }
       if (progress.state === "authorized") {
+        setAuthorizeUrl(null);
         if (props.page.provider === "codespaces") {
           // Nothing to choose: the finish creates the environment
           // repository and links the account in one call.
@@ -168,14 +242,14 @@ export const CloudSignIn: PageComponent<{
       if (progress.state === "failed") {
         // The vendor's tab has already said this; this tab is the one that
         // can act on it.
-        setAttempt(null);
+        clearAttempt();
         setRefusal(progress.reason);
         return;
       }
       schedule(attemptId, gen);
     } catch (error) {
       if (!closed && gen === pollGeneration) {
-        setAttempt(null);
+        clearAttempt();
         setFailure(error);
       }
     }
@@ -219,15 +293,14 @@ export const CloudSignIn: PageComponent<{
             setWidening(true);
           }
         }
-        const started = await startProviderOauth(props.page.provider);
-        if (closed) {
-          return;
+        try {
+          await beginOauthAttempt();
+        } catch (error) {
+          if (!closed) {
+            clearAttempt();
+            setFailure(error);
+          }
         }
-        pollGeneration += 1;
-        pollDeadline = Date.now() + CLOUD_POLL_DEADLINE_MS;
-        openInNewTab(started.authorize_url);
-        setAttempt(started.attempt_id);
-        schedule(started.attempt_id, pollGeneration);
       },
     };
   };
@@ -245,6 +318,17 @@ export const CloudSignIn: PageComponent<{
         </Show>
         <Show when={attempt() !== null}>
           <Waiting>Waiting for you to finish in the other tab…</Waiting>
+          <Show when={authorizeUrl()}>
+            {(url) => (
+              <ExternalLink href={url()}>
+                Open {vendor.name} sign-in
+              </ExternalLink>
+            )}
+          </Show>
+          <QuietLink disabled={restarting()} onClick={() => void restart()}>
+            Retry
+          </QuietLink>
+          <QuietLink onClick={() => clearAttempt()}>Cancel</QuietLink>
         </Show>
         <Show when={failure()}>
           {(error) => <ProblemNotice error={error()} />}
@@ -266,13 +350,14 @@ export const CloudSignIn: PageComponent<{
         </Show>
         <Show when={props.page.provider !== "codespaces"}>
           <QuietLink
-            onClick={() =>
+            onClick={() => {
+              clearAttempt();
               props.advance({
                 cloudRoute: "cloud-shell",
                 cloudConsent: null,
                 cloudChoice: null,
-              })
-            }
+              });
+            }}
           >
             Use Cloud Shell instead
           </QuietLink>

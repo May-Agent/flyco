@@ -184,9 +184,11 @@ async fn resolve(
             branch: if index == 0 { branch.clone() } else { None },
         })
         .collect();
-    let machine = match spec_machine(spec)? {
+    let mut spec = spec.clone();
+    spec.resolve_runtime(api).await?;
+    let machine = match spec.machine_choice()? {
         Some(machine) => Some(machine),
-        None => Some(pick_machine(api, spec).await?),
+        None => Some(pick_machine(api, &spec).await?),
     };
     let budget_limit = if let Some(budget) = spec.budget {
         budget
@@ -204,7 +206,7 @@ async fn resolve(
             env = text.split(',').map(|pair| pair.trim().to_owned()).collect();
         }
     }
-    let prompt = match crate::session::resolve_prompt(spec) {
+    let prompt = match crate::session::resolve_prompt(&spec) {
         Some(prompt) => prompt?,
         None => pick::input("What should it do", None)?,
     };
@@ -225,24 +227,6 @@ async fn resolve(
         },
         env,
     ))
-}
-
-/// `spec`'s machine flags as a `MachineChoice`, when all three were given.
-fn spec_machine(spec: &SessionSpec) -> Outcome<Option<MachineChoice>> {
-    match (&spec.machine, &spec.account, &spec.region) {
-        (Some(machine_type), Some(account), Some(region)) => Ok(Some(MachineChoice {
-            provider_account: account
-                .parse()
-                .map_err(|_| Failure::usage("`--account` is not an account id"))?,
-            machine_type: machine_type.clone(),
-            runtime: flyco_core::Runtime::Vm,
-            region: region.clone(),
-            spot: !spec.on_demand,
-            disk_gib: spec.disk.unwrap_or(flyco_core::DEFAULT_DISK_GIB),
-        })),
-        (None, None, None) => Ok(None),
-        _ => unreachable!("clap's requires= rules out a partial machine choice"),
-    }
 }
 
 /// Repo picker over `GET /v1/github/repos`.
@@ -372,7 +356,8 @@ async fn attach(
     tui: HarnessTui,
     mode: out::Mode,
 ) -> Outcome<Exit> {
-    let mut follow = Follow::new(api, id);
+    let mut follow = Follow::live(api, id);
+    follow.connect().await?;
 
     // Commands are refused on anything but `Active` — a provisioning
     // session has no daemon to take them — so the launch waits for the
@@ -418,7 +403,7 @@ async fn attach(
         }
     }
 
-    api.post::<HarnessTui, serde_json::Value>(&format!("/v1/sessions/{id}/terminal/harness"), &tui)
+    api.post_json_empty(&format!("/v1/sessions/{id}/terminal/harness"), &tui)
         .await?;
     // A resize is a repaint: a TUI already in the foreground answers it
     // with a full screen, which is how an attach to a live-but-quiet

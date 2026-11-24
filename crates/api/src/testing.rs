@@ -36,7 +36,7 @@ use crate::vendors::Vendors;
 
 /// The schema every database-backed test starts from, in the order
 /// `wrangler d1 migrations apply` would run it.
-pub const MIGRATIONS: [&str; 37] = [
+pub const MIGRATIONS: [&str; 38] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_sessions.sql"),
     include_str!("../../../migrations/0003_daemon.sql"),
@@ -74,6 +74,7 @@ pub const MIGRATIONS: [&str; 37] = [
     include_str!("../../../migrations/0036_drop_harness_usage_snapshot.sql"),
     include_str!("../../../migrations/0037_keep_machine_awake.sql"),
     include_str!("../../../migrations/0038_shared_skills.sql"),
+    include_str!("../../../migrations/0039_idempotency_request_hash.sql"),
 ];
 
 /// Client id the test configuration presents to GitHub.
@@ -112,6 +113,13 @@ pub const TURNSTILE_HOSTNAMES: &str = "flyco.test";
 
 /// The GitHub access token [`TestGithub`] hands back.
 pub const GITHUB_ACCESS_TOKEN: &str = "gho_test_access_token";
+
+/// A codespace-injected `GITHUB_TOKEN` belonging to [`GITHUB_LOGIN`].
+pub const CODESPACE_GITHUB_TOKEN: &str = "ghu_test_codespace_token";
+
+/// A codespace-injected `GITHUB_TOKEN` belonging to [`OTHER_LOGIN`] (e.g. a
+/// collaborator on a shared repository).
+pub const OTHER_CODESPACE_GITHUB_TOKEN: &str = "ghu_other_codespace_token";
 
 /// The refresh token an expiring [`TestGithub`] grant carries.
 pub const GITHUB_REFRESH_TOKEN: &str = "ghr_test_refresh_token";
@@ -282,6 +290,9 @@ pub struct TestGithub {
     /// gives a token that cannot read it, which is what the codespaces
     /// bootstrap check denies on.
     pub unreadable: Option<&'static str>,
+    /// When set, `get_repo` reports the environment repository as public
+    /// rather than private.
+    pub public_env_repo: bool,
     /// What the token endpoint answers `exchange_code` and `refresh` with.
     pub grant: GithubGrantShape,
     /// The files of each repository, by slug: what `read_tree` lists and
@@ -314,6 +325,7 @@ impl Default for TestGithub {
             scopes: Some(&["repo"]),
             plan: Some("pro"),
             unreadable: None,
+            public_env_repo: false,
             grant: GithubGrantShape::Lasting,
             files: &[],
         }
@@ -328,6 +340,7 @@ impl TestGithub {
             scopes: Some(&["read:user"]),
             plan: Some("pro"),
             unreadable: None,
+            public_env_repo: false,
             grant: GithubGrantShape::Lasting,
             files: &[],
         }
@@ -340,6 +353,7 @@ impl TestGithub {
             scopes: Some(&["repo", "codespace", "read:packages"]),
             plan: Some("pro"),
             unreadable: None,
+            public_env_repo: false,
             grant: GithubGrantShape::Lasting,
             files: &[],
         }
@@ -353,6 +367,7 @@ impl TestGithub {
             scopes: Some(&["repo"]),
             plan: Some("pro"),
             unreadable: None,
+            public_env_repo: false,
             grant: GithubGrantShape::Renewable,
             files: &[],
         }
@@ -366,6 +381,7 @@ impl TestGithub {
             scopes: Some(&["repo"]),
             plan: Some("pro"),
             unreadable: None,
+            public_env_repo: false,
             grant: GithubGrantShape::RefusedRenewal,
             files: &[],
         }
@@ -513,12 +529,13 @@ impl GithubOauth for TestGithub {
                 reason: "Not Found".to_owned(),
             }));
         }
+        let is_env_repo = slug.as_str().ends_with("/flyco-sessions");
         ready(Ok(Self::repos()
             .into_iter()
             .find(|repo| &repo.slug == slug)
             .unwrap_or_else(|| flyco_core::RepoSummary {
                 slug: slug.clone(),
-                private: false,
+                private: is_env_repo && !self.public_env_repo,
                 default_branch: OTHER_DEFAULT_BRANCH.parse().expect("a valid branch"),
                 description: None,
                 pushed_at_unix: None,
@@ -601,6 +618,30 @@ impl GithubOauth for TestGithub {
         &self,
         token: &GithubToken,
     ) -> impl Future<Output = Result<crate::github::GithubIdentity, GithubError>> + Send {
+        if token.access_token == CODESPACE_GITHUB_TOKEN {
+            return ready(Ok(crate::github::GithubIdentity {
+                user: GithubUser {
+                    id: GITHUB_ID,
+                    login: GITHUB_LOGIN.to_owned(),
+                    name: Some(GITHUB_NAME.to_owned()),
+                    plan: self.plan.map(|name| crate::github::GithubPlan {
+                        name: name.to_owned(),
+                    }),
+                },
+                scopes: None,
+            }));
+        }
+        if token.access_token == OTHER_CODESPACE_GITHUB_TOKEN {
+            return ready(Ok(crate::github::GithubIdentity {
+                user: GithubUser {
+                    id: OTHER_GITHUB_ID,
+                    login: OTHER_LOGIN.to_owned(),
+                    name: None,
+                    plan: None,
+                },
+                scopes: None,
+            }));
+        }
         assert!(
             Self::is_ours(token),
             "a call ran under a token this exchange never minted"
@@ -1269,12 +1310,17 @@ impl MicrosoftOauth for TestMicrosoft {
         client: microsoft::OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> impl Future<Output = Result<microsoft::SignIn, MicrosoftError>> + Send {
         assert_eq!(client.id, AZURE_CLIENT_ID);
         assert_eq!(client.secret, AZURE_CLIENT_SECRET);
         assert!(
             redirect_uri.ends_with("/v1/providers/azure/oauth/callback"),
             "the exchange is bound to flyco's own callback: {redirect_uri}"
+        );
+        assert!(
+            !code_verifier.is_empty(),
+            "the exchange carries the attempt's PKCE verifier"
         );
         ready(
             if self.behaviour == CloudBehaviour::Succeeds && code == CLOUD_CODE {
@@ -1355,12 +1401,17 @@ impl GoogleOauth for TestGoogle {
         client: google::OauthClient<'_>,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> impl Future<Output = Result<google::SignIn, GoogleError>> + Send {
         assert_eq!(client.id, GOOGLE_CLIENT_ID);
         assert_eq!(client.secret, GOOGLE_CLIENT_SECRET);
         assert!(
             redirect_uri.ends_with("/v1/providers/gcp/oauth/callback"),
             "the exchange is bound to flyco's own callback: {redirect_uri}"
+        );
+        assert!(
+            !code_verifier.is_empty(),
+            "the exchange carries the attempt's PKCE verifier"
         );
         ready(
             if self.behaviour == CloudBehaviour::Succeeds && code == CLOUD_CODE {

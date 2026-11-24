@@ -84,6 +84,16 @@ describe("web push", () => {
     expect(localStorage.getItem("flyco.push_subscription_id")).toBe("sub-1");
   });
 
+  it("rolls back the browser push subscription if control-plane registration fails", async () => {
+    getVapidPublicKey.mockResolvedValue({ key: "BEL1" });
+    subscribePush.mockRejectedValue(new Error("registration failed"));
+
+    const { subscribeToPush } = await import("./push");
+    await expect(subscribeToPush()).rejects.toThrow("registration failed");
+    expect(unsubscribeMock).toHaveBeenCalledOnce();
+    expect(localStorage.getItem("flyco.push_subscription_id")).toBeNull();
+  });
+
   it("propagates a not-implemented VAPID key without ever touching the browser subscription", async () => {
     getVapidPublicKey.mockRejectedValue(notImplemented());
 
@@ -106,6 +116,27 @@ describe("web push", () => {
     expect(localStorage.getItem("flyco.push_subscription_id")).toBeNull();
   });
 
+  it("treats a 404 from the control plane as already removed and still unsubscribes the browser", async () => {
+    const { ApiProblem } = await import("../api/problem");
+    localStorage.setItem("flyco.push_subscription_id", "sub-gone");
+    getSubscriptionMock.mockResolvedValue({ unsubscribe: unsubscribeMock });
+    unsubscribePush.mockRejectedValue(
+      new ApiProblem({
+        type: "https://flyco.dev/problems/push-subscription-not-found",
+        title: "Not Found",
+        status: 404,
+        detail: "push subscription not found",
+      }),
+    );
+
+    const { unsubscribeFromPush } = await import("./push");
+    const existed = await unsubscribeFromPush();
+
+    expect(existed).toBe(true);
+    expect(unsubscribeMock).toHaveBeenCalledOnce();
+    expect(localStorage.getItem("flyco.push_subscription_id")).toBeNull();
+  });
+
   it("returns false without calling the control plane when there is no browser subscription", async () => {
     getSubscriptionMock.mockResolvedValue(null);
 
@@ -114,5 +145,18 @@ describe("web push", () => {
 
     expect(existed).toBe(false);
     expect(unsubscribePush).not.toHaveBeenCalled();
+  });
+
+  it("unregisters remote and browser subscriptions on sign-out", async () => {
+    localStorage.setItem("flyco.push_subscription_id", "sub-signout");
+    getSubscriptionMock.mockResolvedValue({ unsubscribe: unsubscribeMock });
+    unsubscribePush.mockResolvedValue(undefined);
+
+    const { unregisterPushOnSignOut } = await import("./push");
+    unregisterPushOnSignOut();
+
+    expect(unsubscribePush).toHaveBeenCalledWith("sub-signout");
+    expect(localStorage.getItem("flyco.push_subscription_id")).toBeNull();
+    await vi.waitFor(() => expect(unsubscribeMock).toHaveBeenCalledOnce());
   });
 });

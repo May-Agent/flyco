@@ -74,6 +74,8 @@ struct Credential<'a> {
 /// refresh token, so the entry cannot expire or refresh from the CLI's
 /// side.
 fn provision_oauth(dir: &Path, token: &str) -> Result<(), TuiError> {
+    use std::io::Write as _;
+
     let io = |error: std::io::Error| TuiError::CredentialWrite(error.to_string());
     std::fs::create_dir_all(dir).map_err(io)?;
     let file = CredentialFile {
@@ -84,13 +86,26 @@ fn provision_oauth(dir: &Path, token: &str) -> Result<(), TuiError> {
     };
     let body = serde_json::to_string(&file).expect("a credential file serializes");
     let path = dir.join(".credentials.json");
-    std::fs::write(&path, body).map_err(io)?;
-    // The credential is a secret: the CLI's own store is owner-only, and
-    // this one follows it.
+    let tmp_path = dir.join(format!(".credentials.json.{}.tmp", uuid::Uuid::new_v4()));
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(io)?;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let write_result = (|| -> std::io::Result<()> {
+        let mut tmp = options.open(&tmp_path)?;
+        tmp.write_all(body.as_bytes())?;
+        tmp.sync_all()?;
+        drop(tmp);
+        std::fs::rename(&tmp_path, &path)?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(io(error));
     }
     Ok(())
 }
@@ -160,14 +175,16 @@ impl HarnessTui {
     /// Returns [`TuiError`] when the program itself could not be resolved —
     /// the claude binary missing from the sidecar tree, or an agent with
     /// no TUI at all.
-    pub fn command(&self, resume: bool) -> Result<CommandBuilder, TuiError> {
+    pub async fn command(&self, resume: bool) -> Result<CommandBuilder, TuiError> {
         let program = match &self.program {
             Program::Bin(bin) => bin.clone(),
             Program::None(agent) => return Err(TuiError::NoTui(agent.clone())),
             Program::Claude(resolved) => resolved.clone()?,
         };
-        if let Some((dir, token)) = &self.oauth_credential {
-            provision_oauth(dir, token)?;
+        if let Some((dir, token)) = self.oauth_credential.clone() {
+            tokio::task::spawn_blocking(move || provision_oauth(&dir, &token))
+                .await
+                .map_err(|error| TuiError::CredentialWrite(error.to_string()))??;
         }
         let mut command = CommandBuilder::new(program);
         command.args(if resume {

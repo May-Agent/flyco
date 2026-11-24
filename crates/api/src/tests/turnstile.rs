@@ -30,7 +30,11 @@ async fn router_with(db: &Db, turnstile: TestTurnstile) -> Router {
 
 /// The body the login page posts once its widget has answered.
 fn start_body() -> serde_json::Value {
-    json!({"turnstile_token": "the-widget's-answer"})
+    let pair = crate::crypto::pkce().expect("mint PKCE");
+    json!({
+        "turnstile_token": "the-widget's-answer",
+        "code_challenge": pair.challenge,
+    })
 }
 
 /// OAuth states minted so far — a refused sign-in must leave none behind.

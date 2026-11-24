@@ -125,6 +125,7 @@ pub async fn handoff(api: &Api, args: Args, mode: out::Mode) -> Outcome<Exit> {
     if interactive() {
         fill_spec(api, &mut spec).await?;
     }
+    spec.resolve_runtime(api).await?;
     let mut request = spec.to_request(args.harness.unwrap_or(session.harness), brief)?;
     // The handoff's patch diffs against the local tree's merge-base, so the
     // session's first checkout — where the patch lands — is the local
@@ -158,7 +159,7 @@ pub async fn handoff(api: &Api, args: Args, mode: out::Mode) -> Outcome<Exit> {
     let _ = tokio::fs::remove_file(&transcript).await;
     if let Err(failure) = uploaded {
         let _ = api
-            .post::<serde_json::Value, serde_json::Value>(
+            .post_json_empty(
                 &format!("/v1/sessions/{id}/archive"),
                 &serde_json::json!({}),
             )
@@ -188,7 +189,7 @@ async fn upload(
         .await?;
     api.put_file(&format!("/v1/sessions/{id}/handoff/transcript"), transcript)
         .await?;
-    api.post::<HandoffManifest, serde_json::Value>(
+    api.post_json_empty(
         &format!("/v1/sessions/{id}/handoff/complete"),
         &HandoffManifest {
             patch_sha256: hex::encode(Sha256::digest(patch)),
@@ -441,19 +442,26 @@ async fn fill_spec(api: &Api, spec: &mut SessionSpec) -> Outcome<()> {
         // `pick_machine` answers account+type+region+spot+disk at once;
         // spread its answer over the flags `to_request` reads.
         let machine = crate::human::pick_machine(api, spec).await?;
-        spec.account = Some(machine.provider_account.to_string());
-        spec.machine = Some(machine.machine_type);
-        spec.region = Some(machine.region);
-        spec.disk = Some(machine.disk_gib);
-        if !machine.spot {
-            spec.on_demand = true;
-        }
+        apply_picked_machine(spec, machine);
     }
     if spec.budget.is_none() {
         let text = pick::input("Budget for the session, in dollars", Some("10"))?;
         spec.budget = Some(crate::cli::parse_usd(&text).map_err(Failure::usage)?);
     }
     Ok(())
+}
+
+/// Copies a picked [`flyco_core::MachineChoice`] onto [`SessionSpec`],
+/// preserving its `runtime` so container and host picks do not fall back to VM.
+fn apply_picked_machine(spec: &mut SessionSpec, machine: flyco_core::MachineChoice) {
+    spec.account = Some(machine.provider_account.to_string());
+    spec.machine = Some(machine.machine_type);
+    spec.region = Some(machine.region);
+    spec.runtime = Some(machine.runtime);
+    spec.disk = Some(machine.disk_gib);
+    if !machine.spot {
+        spec.on_demand = true;
+    }
 }
 
 /// The `~`-rooted store a harness keeps its sessions in.
@@ -1304,5 +1312,27 @@ mod tests {
         assert_eq!(rewrite_paths("see /r/a.", "/r/a"), "see /r/a.");
         assert_eq!(rewrite_paths("see /r/a:", "/r/a"), "see /srv/flyco/work:");
         assert_eq!(rewrite_paths("see /r/a", "/r/a"), "see /srv/flyco/work");
+    }
+
+    #[test]
+    fn apply_picked_machine_preserves_container_runtime() {
+        let mut spec = SessionSpec {
+            repo: vec!["o/r".to_owned()],
+            budget: Some(flyco_core::Usd::from_dollars(5)),
+            ..SessionSpec::default()
+        };
+        let picked = flyco_core::MachineChoice {
+            provider_account: flyco_core::ProviderAccountId::generate(),
+            machine_type: "aca-1c2g".to_owned(),
+            runtime: flyco_core::Runtime::Container,
+            region: "eastus".to_owned(),
+            spot: false,
+            disk_gib: 32,
+        };
+        apply_picked_machine(&mut spec, picked.clone());
+        let request = spec
+            .to_request(HarnessKind::ClaudeCode, "handoff".to_owned())
+            .expect("request");
+        assert_eq!(request.machine, Some(picked));
     }
 }

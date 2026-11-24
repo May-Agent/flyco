@@ -4,16 +4,18 @@
 //! The wire format of the vendor calls is pinned separately, against
 //! recorded exchanges, in [`crate::microsoft`] and [`crate::google`]. What is
 //! asserted here is everything around them: that the authorize URL carries
-//! this deployment's own client and callback, that a state redeems once and
-//! only for the sign-in that minted it, that a poll is not a consumption,
-//! that an attempt is bound to the user who started it, that the callback
-//! answers a browser with a navigation whatever happens, and that the finish
-//! ends in the same store path `POST /v1/providers` does.
+//! this deployment's own client, callback and PKCE challenge, that the public
+//! callback forwards parameters in the fragment without exchanging or setting
+//! cookies, that the exchange requires the initiating user's Bearer session
+//! and matching `state`, that a state redeems once, that a poll is not a
+//! consumption, and that the finish ends in the same store path
+//! `POST /v1/providers` does.
 
 use flyco_core::{
     CloudProviderKind, CurrentUser, FinishAzureOauth, FinishGcpOauth, Problem, ProviderAccountView,
     ProviderOauthProgress, ProviderOauthStart,
 };
+use serde_json::json;
 use skyzen::routing::Router;
 use skyzen_services::{Db, Kv, Queue};
 use skyzen_test::mock::InMemoryQueue;
@@ -37,6 +39,10 @@ use crate::vendors::Vendors;
 const AZURE_START: &str = "/v1/providers/azure/oauth/start";
 const GCP_START: &str = "/v1/providers/gcp/oauth/start";
 const PROVIDERS: &str = "/v1/providers";
+
+fn exchange_path(provider: &str) -> String {
+    format!("/v1/providers/{provider}/oauth/exchange")
+}
 
 fn poll_path(provider: &str, started: &ProviderOauthStart) -> String {
     format!("/v1/providers/{provider}/oauth/{}", started.attempt_id)
@@ -103,6 +109,29 @@ async fn begin(client: &TestClient<Router>, token: &str, path: &str) -> Provider
     response.json()
 }
 
+/// Completes the authenticated exchange step for `started`.
+async fn exchange_ok(
+    client: &TestClient<Router>,
+    token: &str,
+    provider: &str,
+    started: &ProviderOauthStart,
+    code: &str,
+) -> ProviderOauthProgress {
+    let response = client
+        .post(&exchange_path(provider))
+        .bearer(token)
+        .json(&json!({
+            "attempt_id": started.attempt_id,
+            "state": state_of(started),
+            "code": code,
+        }))
+        .send()
+        .await;
+    response.assert_status(200);
+    assert!(response.headers().get("set-cookie").is_none());
+    response.json()
+}
+
 /// The `state` an authorize URL published.
 fn state_of(started: &ProviderOauthStart) -> String {
     Url::parse(&started.authorize_url)
@@ -129,10 +158,17 @@ fn query(url: &Url, name: &str) -> Option<String> {
         .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
 }
 
+/// One fragment parameter of a URL.
+fn fragment_param(url: &Url, name: &str) -> Option<String> {
+    let fragment = url.fragment()?;
+    url::form_urlencoded::parse(fragment.as_bytes())
+        .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+}
+
 // ── Starting ──
 
 #[skyzen::test]
-async fn an_azure_sign_in_starts_at_microsoft_with_this_deployments_own_client(
+async fn an_azure_sign_in_starts_at_microsoft_with_this_deployments_own_client_and_pkce(
     ctx: TestContext,
     kv: Kv,
     db: Db,
@@ -163,11 +199,20 @@ async fn an_azure_sign_in_starts_at_microsoft_with_this_deployments_own_client(
         scope.contains("graph.microsoft.com"),
         "creating the service principal needs Graph: {scope}"
     );
+    assert_eq!(
+        query(&url, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+    assert_eq!(
+        query(&url, "code_challenge").map(|c| c.len()),
+        Some(43),
+        "S256 PKCE challenge is 43 base64url chars"
+    );
     assert_ne!(state_of(&started), "");
 }
 
 #[skyzen::test]
-async fn a_gcp_sign_in_starts_at_google_with_this_deployments_own_client(
+async fn a_gcp_sign_in_starts_at_google_with_this_deployments_own_client_and_pkce(
     ctx: TestContext,
     kv: Kv,
     db: Db,
@@ -187,6 +232,11 @@ async fn a_gcp_sign_in_starts_at_google_with_this_deployments_own_client(
             .expect("the URL names its scopes")
             .contains("cloud-platform")
     );
+    assert_eq!(
+        query(&url, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+    assert_eq!(query(&url, "code_challenge").map(|c| c.len()), Some(43));
 }
 
 #[skyzen::test]
@@ -195,61 +245,50 @@ async fn a_sign_in_cannot_be_started_without_a_flyco_session(ctx: TestContext, k
     client.post(AZURE_START).send().await.assert_status(401);
 }
 
-// ── The callback ──
+// ── The callback (forwarding only, zero exchange, zero cookies) ──
 
 #[skyzen::test]
-async fn a_callback_with_an_unknown_state_sends_the_browser_back_with_the_problem(
-    ctx: TestContext,
-    kv: Kv,
-    db: Db,
-) {
-    let (client, _user, _token) = signed_in(&ctx, &kv, &db).await;
-
-    let response = client
-        .get(&callback_path("azure", CLOUD_CODE, "never-issued"))
-        .send()
-        .await;
-
-    // A browser mid-navigation, so the refusal is a navigation too.
-    response.assert_status(303);
-    let landed = location(&response);
-    assert_eq!(landed.path(), "/connect/return");
-    assert_eq!(query(&landed, "provider").as_deref(), Some("azure"));
-    assert_eq!(
-        query(&landed, "problem").as_deref(),
-        Some("unknown-oauth-state")
-    );
-}
-
-#[skyzen::test]
-async fn a_callback_records_what_the_vendor_said_and_sends_the_browser_home(
+async fn callback_forwards_code_and_state_in_fragment_without_exchanging_or_setting_cookies(
     ctx: TestContext,
     kv: Kv,
     db: Db,
 ) {
     let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, AZURE_START).await;
+    let state = state_of(&started);
 
     let response = client
-        .get(&callback_path("azure", CLOUD_CODE, &state_of(&started)))
+        .get(&callback_path("azure", CLOUD_CODE, &state))
         .send()
         .await;
     response.assert_status(303);
+    assert!(
+        response.headers().get("set-cookie").is_none(),
+        "flyco never sets cookies on OAuth callbacks"
+    );
 
     let landed = location(&response);
     let origin = Url::parse(REDIRECT_URI)
         .expect("the test redirect URI is absolute")
         .origin();
-    assert_eq!(
-        landed.origin(),
-        origin,
-        "the SPA that reads this is flyco's"
-    );
+    assert_eq!(landed.origin(), origin);
     assert_eq!(landed.path(), "/connect/return");
-    assert_eq!(query(&landed, "provider").as_deref(), Some("azure"));
-    assert!(query(&landed, "problem").is_none());
+    assert!(
+        landed.query().is_none(),
+        "code and state must ride the fragment, never the query string"
+    );
+    assert_eq!(
+        fragment_param(&landed, "provider").as_deref(),
+        Some("azure")
+    );
+    assert_eq!(fragment_param(&landed, "code").as_deref(), Some(CLOUD_CODE));
+    assert_eq!(
+        fragment_param(&landed, "state").as_deref(),
+        Some(state.as_str())
+    );
 
-    // And the poll the page was already making now has an answer.
+    // Crucially, the unauthenticated GET did NOT exchange the code: the
+    // attempt is still Pending until the signed-in SPA calls POST .../exchange.
     let polled = client
         .get(&poll_path("azure", &started))
         .bearer(&token)
@@ -258,51 +297,179 @@ async fn a_callback_records_what_the_vendor_said_and_sends_the_browser_home(
     polled.assert_status(200);
     assert_eq!(
         polled.json::<ProviderOauthProgress>(),
-        ProviderOauthProgress::Authorized {
-            account: "me@lexo.cool".to_owned(),
-            choices: vec![flyco_core::ProviderOauthChoice {
-                id: AZURE_SUBSCRIPTION_ID.to_owned(),
-                name: AZURE_SUBSCRIPTION_NAME.to_owned(),
-            }],
-        }
+        ProviderOauthProgress::Pending
     );
 }
 
 #[skyzen::test]
-async fn a_state_redeems_exactly_once(ctx: TestContext, kv: Kv, db: Db) {
+async fn callback_forwards_vendor_refusal_in_fragment(ctx: TestContext, kv: Kv, db: Db) {
+    let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
+    let started = begin(&client, &token, GCP_START).await;
+    let state = state_of(&started);
+
+    let response = client
+        .get(&format!(
+            "/v1/providers/gcp/oauth/callback?error=access_denied&error_description=denied&state={state}"
+        ))
+        .send()
+        .await;
+    response.assert_status(303);
+    let landed = location(&response);
+    assert_eq!(landed.path(), "/connect/return");
+    assert!(landed.query().is_none());
+    assert_eq!(fragment_param(&landed, "provider").as_deref(), Some("gcp"));
+    assert_eq!(
+        fragment_param(&landed, "error").as_deref(),
+        Some("access_denied")
+    );
+    assert_eq!(
+        fragment_param(&landed, "error_description").as_deref(),
+        Some("denied")
+    );
+    assert_eq!(
+        fragment_param(&landed, "state").as_deref(),
+        Some(state.as_str())
+    );
+}
+
+// ── Authenticated exchange & CSRF defence ──
+
+#[skyzen::test]
+async fn exchange_requires_a_flyco_session(ctx: TestContext, kv: Kv, db: Db) {
     let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, AZURE_START).await;
-    let path = callback_path("azure", CLOUD_CODE, &state_of(&started));
 
-    client.get(&path).send().await.assert_status(303);
+    client
+        .post(&exchange_path("azure"))
+        .json(&json!({
+            "attempt_id": started.attempt_id,
+            "state": state_of(&started),
+            "code": CLOUD_CODE,
+        }))
+        .send()
+        .await
+        .assert_status(401);
+}
 
-    let again = client.get(&path).send().await;
-    again.assert_status(303);
+#[skyzen::test]
+async fn cross_account_callback_replay_is_rejected_and_leaves_the_attempt_untouched(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+) {
+    let (client, _user, attacker_token) = signed_in(&ctx, &kv, &db).await;
+    let started = begin(&client, &attacker_token, AZURE_START).await;
+
+    let victim = seed_other_user(&db).await;
+    let victim_token = session::issue(&kv, victim.id)
+        .await
+        .expect("issue a session for the other user");
+
+    // Victim's browser attempts to redeem a callback carrying attacker's
+    // attempt_id and state: must be refused because attempt.user != victim.
+    let replayed = client
+        .post(&exchange_path("azure"))
+        .bearer(&victim_token)
+        .json(&json!({
+            "attempt_id": started.attempt_id,
+            "state": state_of(&started),
+            "code": CLOUD_CODE,
+        }))
+        .send()
+        .await;
+    replayed.assert_status(404);
     assert_eq!(
-        query(&location(&again), "problem").as_deref(),
-        Some("unknown-oauth-state"),
-        "a replayed callback resolves to nothing"
+        replayed.json::<Problem>().kind,
+        "https://flyco.dev/problems/provider-oauth-attempt-expired"
+    );
+
+    // Attacker's attempt never received victim's grant.
+    let polled = client
+        .get(&poll_path("azure", &started))
+        .bearer(&attacker_token)
+        .send()
+        .await;
+    polled.assert_status(200);
+    assert_eq!(
+        polled.json::<ProviderOauthProgress>(),
+        ProviderOauthProgress::Pending
     );
 }
 
 #[skyzen::test]
-async fn one_vendors_state_cannot_complete_the_others_sign_in(ctx: TestContext, kv: Kv, db: Db) {
+async fn exchange_with_a_mismatched_state_is_rejected(ctx: TestContext, kv: Kv, db: Db) {
     let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, AZURE_START).await;
 
     let response = client
-        .get(&callback_path("gcp", CLOUD_CODE, &state_of(&started)))
+        .post(&exchange_path("azure"))
+        .bearer(&token)
+        .json(&json!({
+            "attempt_id": started.attempt_id,
+            "state": "wrong-state",
+            "code": CLOUD_CODE,
+        }))
         .send()
         .await;
-    response.assert_status(303);
+    response.assert_status(400);
     assert_eq!(
-        query(&location(&response), "problem").as_deref(),
-        Some("unknown-oauth-state")
+        response.json::<Problem>().kind,
+        "https://flyco.dev/problems/unknown-oauth-state"
     );
 }
 
 #[skyzen::test]
-async fn a_vendor_that_refuses_reaches_the_return_page_as_its_own_problem(
+async fn one_vendors_attempt_cannot_be_exchanged_on_the_other_vendors_route(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+) {
+    let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
+    let started = begin(&client, &token, AZURE_START).await;
+
+    let response = client
+        .post(&exchange_path("gcp"))
+        .bearer(&token)
+        .json(&json!({
+            "attempt_id": started.attempt_id,
+            "state": state_of(&started),
+            "code": CLOUD_CODE,
+        }))
+        .send()
+        .await;
+    response.assert_status(404);
+    assert_eq!(
+        response.json::<Problem>().kind,
+        "https://flyco.dev/problems/provider-oauth-attempt-expired"
+    );
+}
+
+#[skyzen::test]
+async fn an_attempt_exchanges_exactly_once(ctx: TestContext, kv: Kv, db: Db) {
+    let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
+    let started = begin(&client, &token, AZURE_START).await;
+
+    exchange_ok(&client, &token, "azure", &started, CLOUD_CODE).await;
+
+    let again = client
+        .post(&exchange_path("azure"))
+        .bearer(&token)
+        .json(&json!({
+            "attempt_id": started.attempt_id,
+            "state": state_of(&started),
+            "code": CLOUD_CODE,
+        }))
+        .send()
+        .await;
+    again.assert_status(400);
+    assert_eq!(
+        again.json::<Problem>().kind,
+        "https://flyco.dev/problems/unknown-oauth-state"
+    );
+}
+
+#[skyzen::test]
+async fn a_vendor_refusal_during_exchange_records_failure_for_poll(
     ctx: TestContext,
     kv: Kv,
     db: Db,
@@ -318,18 +485,37 @@ async fn a_vendor_that_refuses_reaches_the_return_page_as_its_own_problem(
     let started = begin(&client, &token, AZURE_START).await;
 
     let response = client
-        .get(&callback_path("azure", CLOUD_CODE, &state_of(&started)))
+        .post(&exchange_path("azure"))
+        .bearer(&token)
+        .json(&json!({
+            "attempt_id": started.attempt_id,
+            "state": state_of(&started),
+            "code": CLOUD_CODE,
+        }))
         .send()
         .await;
-    response.assert_status(303);
+    response.assert_status(422);
     assert_eq!(
-        query(&location(&response), "problem").as_deref(),
-        Some("microsoft-rejected")
+        response.json::<Problem>().kind,
+        "https://flyco.dev/problems/microsoft-rejected"
     );
+
+    let polled = client
+        .get(&poll_path("azure", &started))
+        .bearer(&token)
+        .send()
+        .await;
+    polled.assert_status(200);
+    match polled.json::<ProviderOauthProgress>() {
+        ProviderOauthProgress::Failed { problem, .. } => {
+            assert_eq!(problem, "microsoft-rejected");
+        }
+        other => panic!("expected Failed on poll, got {other:?}"),
+    }
 }
 
 #[skyzen::test]
-async fn a_user_who_declined_consent_is_told_so_rather_than_shown_an_extractor_failure(
+async fn a_declined_consent_posted_to_exchange_records_failure_for_poll(
     ctx: TestContext,
     kv: Kv,
     db: Db,
@@ -337,32 +523,23 @@ async fn a_user_who_declined_consent_is_told_so_rather_than_shown_an_extractor_f
     let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, GCP_START).await;
 
-    // What Google appends when the user closes the consent screen: an
-    // error, and no code at all.
     let response = client
-        .get(&format!(
-            "/v1/providers/gcp/oauth/callback?error=access_denied&error_description=denied&state={}",
-            state_of(&started)
-        ))
+        .post(&exchange_path("gcp"))
+        .bearer(&token)
+        .json(&json!({
+            "attempt_id": started.attempt_id,
+            "state": state_of(&started),
+            "error": "access_denied",
+            "error_description": "denied",
+        }))
         .send()
         .await;
-
-    response.assert_status(303);
-    let landed = location(&response);
-    assert_eq!(query(&landed, "provider").as_deref(), Some("gcp"));
+    response.assert_status(422);
     assert_eq!(
-        query(&landed, "problem").as_deref(),
-        Some("google-rejected")
-    );
-    // The vendor's own words travel with the slug, so the return page can
-    // say what happened rather than that something did.
-    assert!(
-        query(&landed, "reason").is_some_and(|reason| reason.contains("denied")),
-        "the reason should carry the vendor's text"
+        response.json::<Problem>().kind,
+        "https://flyco.dev/problems/google-rejected"
     );
 
-    // The page that opened the vendor's tab is still polling; it is told
-    // the sign-in is over rather than left to wait out the attempt.
     let polled = client
         .get(&poll_path("gcp", &started))
         .bearer(&token)
@@ -374,14 +551,14 @@ async fn a_user_who_declined_consent_is_told_so_rather_than_shown_an_extractor_f
             assert_eq!(problem, "google-rejected");
             assert!(reason.contains("denied"), "reason: {reason}");
         }
-        other => panic!("expected the poll to report the failure, got {other:?}"),
+        other => panic!("expected Failed on poll, got {other:?}"),
     }
 }
 
 // ── Polling ──
 
 #[skyzen::test]
-async fn a_poll_before_the_browser_comes_back_is_pending(ctx: TestContext, kv: Kv, db: Db) {
+async fn a_poll_before_the_exchange_is_pending(ctx: TestContext, kv: Kv, db: Db) {
     let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, AZURE_START).await;
 
@@ -452,7 +629,7 @@ async fn an_unknown_attempt_is_indistinguishable_from_an_expired_one(
 // ── Finishing ──
 
 #[skyzen::test]
-async fn finishing_before_the_browser_comes_back_is_refused(ctx: TestContext, kv: Kv, db: Db) {
+async fn finishing_before_the_exchange_is_refused(ctx: TestContext, kv: Kv, db: Db) {
     let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, AZURE_START).await;
 
@@ -480,11 +657,25 @@ async fn finishing_an_azure_sign_in_links_the_subscription_the_user_chose(
 ) {
     let (client, user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, AZURE_START).await;
-    client
-        .get(&callback_path("azure", CLOUD_CODE, &state_of(&started)))
+    let exchanged = exchange_ok(&client, &token, "azure", &started, CLOUD_CODE).await;
+    assert_eq!(
+        exchanged,
+        ProviderOauthProgress::Authorized {
+            account: "me@lexo.cool".to_owned(),
+            choices: vec![flyco_core::ProviderOauthChoice {
+                id: AZURE_SUBSCRIPTION_ID.to_owned(),
+                name: AZURE_SUBSCRIPTION_NAME.to_owned(),
+            }],
+        }
+    );
+
+    let polled = client
+        .get(&poll_path("azure", &started))
+        .bearer(&token)
         .send()
-        .await
-        .assert_status(303);
+        .await;
+    polled.assert_status(200);
+    assert_eq!(polled.json::<ProviderOauthProgress>(), exchanged);
 
     let response = client
         .post(&finish_path("azure", &started))
@@ -543,11 +734,7 @@ async fn finishing_a_gcp_sign_in_links_the_project_the_user_chose(
 ) {
     let (client, user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, GCP_START).await;
-    client
-        .get(&callback_path("gcp", CLOUD_CODE, &state_of(&started)))
-        .send()
-        .await
-        .assert_status(303);
+    exchange_ok(&client, &token, "gcp", &started, CLOUD_CODE).await;
 
     let polled = client
         .get(&poll_path("gcp", &started))
@@ -602,11 +789,7 @@ async fn finishing_a_gcp_sign_in_links_the_project_the_user_chose(
 async fn a_finished_sign_in_cannot_be_finished_again(ctx: TestContext, kv: Kv, db: Db) {
     let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, GCP_START).await;
-    client
-        .get(&callback_path("gcp", CLOUD_CODE, &state_of(&started)))
-        .send()
-        .await
-        .assert_status(303);
+    exchange_ok(&client, &token, "gcp", &started, CLOUD_CODE).await;
 
     let finish = finish_path("gcp", &started);
     let body = FinishGcpOauth {
@@ -633,11 +816,7 @@ async fn a_finished_sign_in_cannot_be_finished_again(ctx: TestContext, kv: Kv, d
 async fn one_users_sign_in_is_not_another_users_to_finish(ctx: TestContext, kv: Kv, db: Db) {
     let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token, GCP_START).await;
-    client
-        .get(&callback_path("gcp", CLOUD_CODE, &state_of(&started)))
-        .send()
-        .await
-        .assert_status(303);
+    exchange_ok(&client, &token, "gcp", &started, CLOUD_CODE).await;
 
     let other = seed_other_user(&db).await;
     let other_token = session::issue(&kv, other.id)

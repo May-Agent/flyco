@@ -19,7 +19,12 @@ export default function Login() {
   onMount(async () => {
     const returnTo = new URLSearchParams(location.search).get("returnTo");
     if (returnTo !== null) {
-      rememberPostLoginPath(returnTo);
+      try {
+        rememberPostLoginPath(returnTo);
+      } catch {
+        // Ignore malformed or cross-origin returnTo values so Turnstile
+        // still initializes and sign-in lands on `/`.
+      }
     }
 
     try {

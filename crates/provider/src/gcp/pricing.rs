@@ -7,7 +7,7 @@
 //! RAM-hours of the `e2` rate in whichever region it runs in.
 //!
 //! That is why the catalog is a fold rather than a lookup: the SKU list is
-//! walked once per region and reduced to a rate table keyed by
+//! walked once and reduced into per-region rate tables keyed by
 //! `(family, market)`, and each machine type is then priced from its own
 //! vCPU and memory counts.
 //!
@@ -27,12 +27,15 @@
 //! is in `azure::pricing`.
 #![expect(clippy::future_not_send, reason = "see the module documentation")]
 
+use std::collections::BTreeMap;
+
 use flyco_core::money::Usd;
 use serde::Deserialize;
 
 use crate::ProviderError;
 use crate::clock::MonotonicClock;
 use crate::http::{HttpRequest, HttpTransport, Method};
+use crate::polling::PageCursor;
 
 /// The Cloud Billing catalog API.
 pub const BILLING_BASE: &str = "https://cloudbilling.googleapis.com/v1";
@@ -202,8 +205,19 @@ impl Money {
     }
 }
 
-/// The family Google left unnamed, back when it was the only one.
-const UNNAMED_FAMILY: &str = "n1";
+/// Substrings in a Compute Engine SKU description that mark non-standard
+/// billing lines (custom shapes, sole-tenancy nodes, extended memory,
+/// confidential VMs, upgrades, or DWS) that must not overwrite standard
+/// predefined VM family rates.
+const EXCLUDED_COMPUTE_MARKERS: [&str; 7] = [
+    "custom",
+    "sole tenancy",
+    "extended",
+    "confidential",
+    "upgrade",
+    "dws",
+    "reserved",
+];
 
 /// Whether a word is a machine-family code.
 ///
@@ -257,6 +271,20 @@ impl Sku {
         }
     }
 
+    /// Whether this SKU prices zonal Balanced Persistent Disk capacity (never
+    /// Regional PD or snapshots, which carry different prices).
+    #[must_use]
+    pub fn is_zonal_balanced_pd(&self) -> bool {
+        if self.category.resource_family != STORAGE_FAMILY
+            || self.category.usage_type != ON_DEMAND_USAGE
+            || !self.description.contains(BALANCED_DISK_MARKER)
+        {
+            return false;
+        }
+        let lower = self.description.to_ascii_lowercase();
+        !lower.contains("regional") && !lower.contains("snapshot") && !lower.contains("hyperdisk")
+    }
+
     /// Which component this SKU prices, and for which machine family.
     ///
     /// The family is the first *family-shaped* word before the marker, not
@@ -267,17 +295,32 @@ impl Sku {
     /// `e2`, `n1`, `c3d`, `t2d` — which none of `Spot`, `Preemptible`,
     /// `Predefined` or `Custom` is.
     ///
-    /// A description with no family word at all (`Custom Instance Core`) is
-    /// `n1`, the family Google left unnamed when it was the only one.
+    /// Custom, Sole Tenancy, Extended, Confidential, Upgrade, DWS, and
+    /// Reserved SKUs are excluded, as are descriptions without an explicit
+    /// family code, so they never overwrite predefined machine rates.
     #[must_use]
     pub fn component(&self) -> Option<(String, Component)> {
-        let (marker, component) = if self.description.contains(CORE_MARKER) {
-            (CORE_MARKER, Component::Core)
+        let lower = self.description.to_ascii_lowercase();
+        if EXCLUDED_COMPUTE_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+        {
+            return None;
+        }
+
+        let (marker, component, expected_group) = if self.description.contains(CORE_MARKER) {
+            (CORE_MARKER, Component::Core, "CPU")
         } else if self.description.contains(RAM_MARKER) {
-            (RAM_MARKER, Component::Ram)
+            (RAM_MARKER, Component::Ram, "RAM")
         } else {
             return None;
         };
+
+        if !self.category.resource_group.is_empty()
+            && self.category.resource_group != expected_group
+        {
+            return None;
+        }
 
         let family = self
             .description
@@ -285,8 +328,7 @@ impl Sku {
             .next()?
             .split_whitespace()
             .map(str::to_ascii_lowercase)
-            .find(|word| is_family_code(word))
-            .unwrap_or_else(|| UNNAMED_FAMILY.to_owned());
+            .find(|word| is_family_code(word))?;
         Some((family, component))
     }
 
@@ -400,6 +442,41 @@ impl RegionRates {
         }
     }
 
+    /// Applies one matching SKU to this rate table.
+    fn apply_sku(&mut self, sku: &Sku) -> Result<(), ProviderError> {
+        if sku.is_zonal_balanced_pd() {
+            if let Some(monthly) = sku.rate_micros()? {
+                self.storage_gib_hourly = Some(Usd::from_micros(
+                    monthly.saturating_add(HOURS_PER_MONTH - 1) / HOURS_PER_MONTH,
+                ));
+            }
+            return Ok(());
+        }
+        let (Some(market), Some((family, component))) = (sku.market(), sku.component()) else {
+            return Ok(());
+        };
+        if let Some(micros) = sku.rate_micros()? {
+            self.record(&family, market, component, micros);
+        }
+        Ok(())
+    }
+
+    /// Merges `overlay` on top of `self` (region-specific rates override
+    /// global ones).
+    fn merge_from(&mut self, overlay: &Self) {
+        if overlay.storage_gib_hourly.is_some() {
+            self.storage_gib_hourly = overlay.storage_gib_hourly;
+        }
+        for (family, market, rates) in &overlay.entries {
+            if let Some(core) = rates.core {
+                self.record(family, *market, Component::Core, core);
+            }
+            if let Some(ram) = rates.ram {
+                self.record(family, *market, Component::Ram, ram);
+            }
+        }
+    }
+
     /// Folds one region's SKUs into a rate table.
     ///
     /// # Errors
@@ -411,40 +488,64 @@ impl RegionRates {
             if !sku.covers(region) {
                 continue;
             }
-            if sku.category.resource_family == STORAGE_FAMILY
-                && sku.description.contains(BALANCED_DISK_MARKER)
-                && sku.category.usage_type == ON_DEMAND_USAGE
-            {
-                if let Some(monthly) = sku.rate_micros()? {
-                    rates.storage_gib_hourly = Some(Usd::from_micros(
-                        monthly.saturating_add(HOURS_PER_MONTH - 1) / HOURS_PER_MONTH,
-                    ));
-                }
-                continue;
-            }
-            let (Some(market), Some((family, component))) = (sku.market(), sku.component()) else {
-                continue;
-            };
-            if let Some(micros) = sku.rate_micros()? {
-                rates.record(&family, market, component, micros);
-            }
+            rates.apply_sku(sku)?;
         }
         Ok(rates)
     }
+
+    /// Folds one full walk of the Cloud Billing SKU catalog into every region
+    /// it mentions plus a global fallback table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError`] when any matching SKU is quoted in a currency
+    /// flyco does not account in.
+    pub fn fold_all(skus: &[Sku]) -> Result<(BTreeMap<String, Self>, Self), ProviderError> {
+        let mut by_region: BTreeMap<String, Self> = BTreeMap::new();
+        let mut global = Self::default();
+
+        for sku in skus {
+            if !sku.is_zonal_balanced_pd() && (sku.market().is_none() || sku.component().is_none())
+            {
+                continue;
+            }
+            for region in &sku.service_regions {
+                if region == "global" {
+                    global.apply_sku(sku)?;
+                } else {
+                    by_region
+                        .entry(region.clone())
+                        .or_default()
+                        .apply_sku(sku)?;
+                }
+            }
+        }
+        Ok((by_region, global))
+    }
 }
 
-/// One region's rates, and when they stop being reused.
+/// Every region's rates from one full SKU catalog walk, and when they expire.
 #[derive(Debug, Clone)]
-struct CachedRegion {
-    region: String,
-    rates: RegionRates,
+struct CachedCatalog {
+    by_region: BTreeMap<String, RegionRates>,
+    global: RegionRates,
     expires_after: u64,
 }
 
-/// Rates per region, with a time-to-live.
+impl CachedCatalog {
+    fn rates_for(&self, region: &str) -> RegionRates {
+        let mut merged = self.global.clone();
+        if let Some(specific) = self.by_region.get(region) {
+            merged.merge_from(specific);
+        }
+        merged
+    }
+}
+
+/// Rates for every region from one cached billing walk, with a time-to-live.
 #[derive(Debug, Clone, Default)]
 pub struct PriceCatalog {
-    cached: Option<CachedRegion>,
+    cached: Option<CachedCatalog>,
 }
 
 impl PriceCatalog {
@@ -465,56 +566,71 @@ impl PriceCatalog {
         format!("{BILLING_BASE}/{COMPUTE_SERVICE}/skus?{}", query.finish())
     }
 
-    /// One region's rate table, reading the catalog if the cache is cold,
-    /// for another region, or expired.
+    /// Returns cached rates for `region` if the catalog walk is still fresh.
+    #[must_use]
+    pub fn cached_region<C: MonotonicClock>(&self, clock: &C, region: &str) -> Option<RegionRates> {
+        let now = clock.elapsed_seconds();
+        self.cached
+            .as_ref()
+            .filter(|cached| now < cached.expires_after)
+            .map(|cached| cached.rates_for(region))
+    }
+
+    /// Folds one full SKU list into all regions and caches it for
+    /// [`CACHE_TTL_SECONDS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError`] if a matching SKU quotes an unsupported
+    /// currency.
+    pub fn store_skus<C: MonotonicClock>(
+        &mut self,
+        clock: &C,
+        skus: &[Sku],
+    ) -> Result<(), ProviderError> {
+        let (by_region, global) = RegionRates::fold_all(skus)?;
+        let now = clock.elapsed_seconds();
+        self.cached = Some(CachedCatalog {
+            by_region,
+            global,
+            expires_after: now.saturating_add(CACHE_TTL_SECONDS),
+        });
+        Ok(())
+    }
+
+    /// One region's rate table, walking the full SKU catalog once when the
+    /// cache is cold or expired and serving every region from that single walk.
     ///
     /// # Errors
     ///
     /// Returns [`ProviderError`] if the catalog refuses the read or quotes a
     /// currency flyco does not account in.
-    ///
-    /// # Panics
-    ///
-    /// Never in practice: the cache is filled immediately above the read
-    /// that borrows it.
     pub async fn region_rates<T: HttpTransport, C: MonotonicClock>(
         &mut self,
         transport: &T,
         clock: &C,
         token: &str,
         region: &str,
-    ) -> Result<&RegionRates, ProviderError> {
-        let now = clock.elapsed_seconds();
-        let fresh = self
-            .cached
-            .as_ref()
-            .is_some_and(|cached| cached.region == region && now < cached.expires_after);
-
-        if !fresh {
-            let rates = read_region(transport, token, region).await?;
-            self.cached = Some(CachedRegion {
-                region: region.to_owned(),
-                rates,
-                expires_after: now.saturating_add(CACHE_TTL_SECONDS),
-            });
+    ) -> Result<RegionRates, ProviderError> {
+        if let Some(rates) = self.cached_region(clock, region) {
+            return Ok(rates);
         }
 
-        Ok(&self
-            .cached
-            .as_ref()
-            .expect("the cache was just filled")
-            .rates)
+        let skus = read_all_skus(transport, token).await?;
+        self.store_skus(clock, &skus)?;
+        Ok(self.cached_region(clock, region).unwrap_or_default())
     }
 }
 
-/// Walks every page of the SKU catalog and folds one region out of it.
-async fn read_region<T: HttpTransport>(
+/// Walks every page of the SKU catalog under a bounded page cap and cursor
+/// progress guard.
+async fn read_all_skus<T: HttpTransport>(
     transport: &T,
     token: &str,
-    region: &str,
-) -> Result<RegionRates, ProviderError> {
+) -> Result<Vec<Sku>, ProviderError> {
     let mut collected = Vec::new();
     let mut next: Option<String> = None;
+    let mut cursor = PageCursor::new();
 
     loop {
         let request =
@@ -526,9 +642,9 @@ async fn read_region<T: HttpTransport>(
 
         let page: SkuPage = response.json()?;
         collected.extend(page.skus);
-        next = page.next_page_token.filter(|token| !token.is_empty());
+        next = cursor.advance(page.next_page_token, "GCP Cloud Billing SKUs")?;
         if next.is_none() {
-            return RegionRates::fold(&collected, region);
+            return Ok(collected);
         }
     }
 }
@@ -688,5 +804,80 @@ mod tests {
         let error = RegionRates::fold(&euros.skus, "europe-west4")
             .expect_err("euros must not be reported as dollars");
         assert!(error.to_string().contains("EUR"));
+    }
+
+    #[test]
+    fn sku_filtering_excludes_custom_sole_tenancy_extended_and_regional_pd() {
+        let page: SkuPage = serde_json::from_value(serde_json::json!({
+            "skus": [
+                {
+                    "description": "Custom Instance Core running in Americas",
+                    "category": { "resourceFamily": "Compute", "resourceGroup": "CPU", "usageType": "OnDemand" },
+                    "serviceRegions": ["us-central1"],
+                    "pricingInfo": [{ "pricingExpression": { "tieredRates": [{ "unitPrice": { "currencyCode": "USD", "units": "0", "nanos": 99_000_000 } }] } }]
+                },
+                {
+                    "description": "Sole Tenancy Instance Core running in Americas",
+                    "category": { "resourceFamily": "Compute", "resourceGroup": "CPU", "usageType": "OnDemand" },
+                    "serviceRegions": ["us-central1"],
+                    "pricingInfo": [{ "pricingExpression": { "tieredRates": [{ "unitPrice": { "currencyCode": "USD", "units": "0", "nanos": 99_000_000 } }] } }]
+                },
+                {
+                    "description": "N2 Custom Extended Instance Ram running in Americas",
+                    "category": { "resourceFamily": "Compute", "resourceGroup": "RAM", "usageType": "OnDemand" },
+                    "serviceRegions": ["us-central1"],
+                    "pricingInfo": [{ "pricingExpression": { "tieredRates": [{ "unitPrice": { "currencyCode": "USD", "units": "0", "nanos": 99_000_000 } }] } }]
+                },
+                {
+                    "description": "N1 Predefined Instance Core running in Americas",
+                    "category": { "resourceFamily": "Compute", "resourceGroup": "CPU", "usageType": "OnDemand" },
+                    "serviceRegions": ["us-central1"],
+                    "pricingInfo": [{ "pricingExpression": { "tieredRates": [{ "unitPrice": { "currencyCode": "USD", "units": "0", "nanos": 31_611_000 } }] } }]
+                },
+                {
+                    "description": "Regional Balanced PD Capacity",
+                    "category": { "resourceFamily": "Storage", "resourceGroup": "PDStandard", "usageType": "OnDemand" },
+                    "serviceRegions": ["us-central1"],
+                    "pricingInfo": [{ "pricingExpression": { "tieredRates": [{ "unitPrice": { "currencyCode": "USD", "units": "0", "nanos": 200_000_000 } }] } }]
+                },
+                {
+                    "description": "Balanced PD Capacity",
+                    "category": { "resourceFamily": "Storage", "resourceGroup": "PDStandard", "usageType": "OnDemand" },
+                    "serviceRegions": ["us-central1"],
+                    "pricingInfo": [{ "pricingExpression": { "tieredRates": [{ "unitPrice": { "currencyCode": "USD", "units": "0", "nanos": 100_000_000 } }] } }]
+                }
+            ]
+        }))
+        .expect("skus parse");
+
+        let folded = RegionRates::fold(&page.skus, "us-central1").expect("fold");
+        // Only the predefined N1 core SKU survived (Custom/Sole Tenancy were excluded).
+        assert_eq!(
+            folded.family("n1", Market::OnDemand).and_then(|f| f.core),
+            Some(31_611)
+        );
+        assert!(folded.family("n2", Market::OnDemand).is_none());
+        // Zonal Balanced PD ($0.10/GiB-month -> 137 micros/GiB-hr), NOT Regional ($0.20).
+        assert_eq!(folded.storage_gib_hourly(), Some(Usd::from_micros(137)));
+    }
+
+    #[test]
+    fn price_catalog_caches_all_regions_from_a_single_sku_walk() {
+        let page: SkuPage = serde_json::from_str(SKUS).expect("fixture parses");
+        let clock = crate::clock::ManualClock::new();
+        let mut catalog = super::PriceCatalog::new();
+        catalog
+            .store_skus(&clock, &page.skus)
+            .expect("store all regions");
+
+        // Both regions in the fixture are cached immediately without another walk.
+        let us = catalog
+            .cached_region(&clock, "us-central1")
+            .expect("us-central1 cached");
+        assert!(us.family("e2", Market::OnDemand).is_some());
+        let eu = catalog
+            .cached_region(&clock, "europe-west4")
+            .expect("europe-west4 cached");
+        assert!(eu.family("e2", Market::OnDemand).is_some());
     }
 }

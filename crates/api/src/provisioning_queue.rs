@@ -2120,7 +2120,8 @@ mod worker {
             &queue,
             &rooms,
             &mut Clients {
-                provisioner: &mut CloudProvisioner::new(HostRooms::from_wasm_env(wasm)),
+                provisioner: &mut CloudProvisioner::new(HostRooms::from_wasm_env(wasm))
+                    .with_flycod_installer_url(&config.control_plane_url()),
                 vendors: &Vendors::default(),
                 github: &GithubClient::default(),
                 storage: &storage,

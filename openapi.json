@@ -429,8 +429,8 @@
     },
     "/v1/auth/github/callback": {
       "get": {
-        "summary": "`GET /v1/auth/github/callback` — completes whichever GitHub flow is returning: a Codespaces link when the `state` names a provider attempt, a sign-in when it names one of this module's own.",
-        "description": "`GET /v1/auth/github/callback` — completes whichever GitHub flow is\nreturning: a Codespaces link when the `state` names a provider attempt,\na sign-in when it names one of this module's own.\n\nFor a sign-in: consumes the `state`, exchanges the code, upserts the\naccount, and sends the browser to the SPA with the session token in the\nURL fragment.\n\nDeliberately not annotated with `#[skyzen::openapi]`: the macro emits\nmodule-level items that mention every argument type, and this handler is\ngeneric over [`GithubOauth`], whose parameter does not exist at module\nscope. The route still appears in the exported document, without its\nparameter schemas.",
+        "summary": "`GET /v1/auth/github/callback` — forwards the returning browser to the SPA with the OAuth parameters in the URL fragment.",
+        "description": "`GET /v1/auth/github/callback` — forwards the returning browser to the SPA\nwith the OAuth parameters in the URL fragment.\n\nNever exchanges the code, never consumes state, never mints a session\ntoken, and sets no cookies: the SPA validates `state` against the\ninitiating browser's storage and redeems the code via an explicit `POST`.\n\nPer-call cost: 0 D1 statements, 0 KV operations, 0 Durable Object calls,\n0 R2 operations, 0 subrequests.",
         "operationId": "flyco_api::oauth::callback",
         "parameters": [
           {
@@ -486,10 +486,70 @@
         }
       }
     },
+    "/v1/auth/github/exchange": {
+      "post": {
+        "summary": "`POST /v1/auth/github/exchange` — validates the browser's `state` and PKCE verifier, exchanges the GitHub code, upserts the account, and mints an `fs_` session token.",
+        "description": "`POST /v1/auth/github/exchange` — validates the browser's `state` and PKCE\nverifier, exchanges the GitHub code, upserts the account, and mints an\n`fs_` session token.\n\nPer-call cost: 1 KV read + 2 KV writes (`take` state + `session::issue`),\n1 D1 upsert (`users::upsert_from_github`), 0 Durable Object calls, 0 R2\noperations, 2 external subrequests to GitHub (`access_token` + `GET /user`).",
+        "operationId": "flyco_api::oauth::exchange",
+        "requestBody": {
+          "description": "Extractor arguments",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "What `POST /v1/auth/github/exchange` must carry.",
+                "required": [
+                  "code",
+                  "state",
+                  "code_verifier"
+                ],
+                "properties": {
+                  "code": {
+                    "type": "string",
+                    "description": "The single-use authorization code GitHub returned to the callback."
+                  },
+                  "code_verifier": {
+                    "type": "string",
+                    "description": "The `sessionStorage`-held PKCE verifier matching the `code_challenge`\nsent to [`start`]."
+                  },
+                  "state": {
+                    "type": "string",
+                    "description": "The `state` minted by [`start`] and echoed back by GitHub."
+                  }
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "What `POST /v1/auth/github/exchange` answers with on success.\n\nThe plaintext session token is returned once over JSON to the browser tab\nthat initiated sign-in; flyco sets no cookies.",
+                  "required": [
+                    "token"
+                  ],
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "The freshly minted `fs_` browser session token."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/auth/github/start": {
       "post": {
         "summary": "Begins a GitHub sign-in, returning the URL to send the browser to.",
-        "description": "Begins a GitHub sign-in, returning the URL to send the browser to.\n\nThe Turnstile token is verified *before* any state is minted: a bot that\ncannot produce one gets no OAuth `state`, no KV write, and no path to\nthe callback at all.",
+        "description": "Begins a GitHub sign-in, returning the URL to send the browser to.\n\nThe `code_challenge` shape and the Turnstile token are verified *before*\nany state is minted: a bot or malformed caller gets no OAuth `state`, no KV\nwrite, and no path to the exchange.\n\nPer-call cost: 0 D1 statements, 1 KV write (`auth:oauth-state:{state}`),\n0 Durable Object calls, 0 R2 operations, 1 external subrequest (Turnstile\nsiteverify).",
         "operationId": "flyco_api::oauth::start",
         "requestBody": {
           "description": "Extractor arguments",
@@ -497,11 +557,16 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "description": "What `POST /v1/auth/github/start` must carry.\n\nThis is the one public route whose whole job is minting account state,\nwhich makes it the one a registration bot wants — so the request is not\nthe sign-in itself but proof a human, not a script, asked for it.",
+                "description": "What `POST /v1/auth/github/start` must carry.\n\nThis is the one public route whose whole job is minting account state,\nwhich makes it the one a registration bot wants — so the request carries\nboth human proof and the initiating browser's PKCE challenge.",
                 "required": [
-                  "turnstile_token"
+                  "turnstile_token",
+                  "code_challenge"
                 ],
                 "properties": {
+                  "code_challenge": {
+                    "type": "string",
+                    "description": "Base64url-encoded SHA-256 (`S256`) challenge of the verifier the\ninitiating browser holds in `sessionStorage`."
+                  },
                   "turnstile_token": {
                     "type": "string",
                     "description": "The `cf-turnstile-response` token the login page's widget produced."
@@ -3918,8 +3983,8 @@
     },
     "/v1/providers/azure/oauth/callback": {
       "get": {
-        "summary": "`GET /v1/providers/azure/oauth/callback` — records what Microsoft said.",
-        "description": "`GET /v1/providers/azure/oauth/callback` — records what Microsoft said.\n\nPublic, because the browser arrives from `login.microsoftonline.com` with\nno flyco credential. It authenticates itself with the `state` it carries.",
+        "summary": "`GET /v1/providers/azure/oauth/callback` — forwards Microsoft's redirect to `/connect/return#provider=azure&...` without exchanging the code or setting cookies.",
+        "description": "`GET /v1/providers/azure/oauth/callback` — forwards Microsoft's redirect to\n`/connect/return#provider=azure&...` without exchanging the code or setting\ncookies.\n\nPer-call cost: 0 D1 statements, 0 KV operations, 0 Durable Object calls,\n0 R2 operations, 0 subrequests.",
         "operationId": "flyco_api::provider_oauth::azure_callback",
         "parameters": [
           {
@@ -3975,10 +4040,146 @@
         }
       }
     },
+    "/v1/providers/azure/oauth/exchange": {
+      "post": {
+        "summary": "`POST /v1/providers/azure/oauth/exchange` — verifies the caller owns the attempt and `state`, then redeems Microsoft's code using the attempt's PKCE verifier.",
+        "description": "`POST /v1/providers/azure/oauth/exchange` — verifies the caller owns the\nattempt and `state`, then redeems Microsoft's code using the attempt's PKCE\nverifier.\n\nPer-call cost: 0 D1 statements, 1 KV read + 1 KV write, 0 Durable Object\ncalls, 0 R2 operations, 3 external subrequests to Microsoft (code exchange,\nGraph token refresh, list subscriptions) on success.",
+        "operationId": "flyco_api::provider_oauth::azure_exchange",
+        "requestBody": {
+          "description": "Extractor arguments",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Request body of `POST /v1/providers/{azure,gcp,codespaces}/oauth/exchange`.",
+                "required": [
+                  "attempt_id",
+                  "state"
+                ],
+                "properties": {
+                  "attempt_id": {
+                    "$ref": "#/components/schemas/Uuid",
+                    "description": "The attempt id returned by the matching `POST .../oauth/start`."
+                  },
+                  "code": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The single-use authorization code, when consent was granted."
+                  },
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The vendor's machine-readable refusal, when consent was declined."
+                  },
+                  "error_description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The vendor's explanation of the refusal, when stated."
+                  },
+                  "state": {
+                    "type": "string",
+                    "description": "The `state` echoed back by the vendor to `/connect/return`."
+                  }
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "description": "The browser has not come back from the vendor yet.",
+                      "required": [
+                        "state"
+                      ],
+                      "properties": {
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "pending"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "description": "The vendor said who signed in and what they may link.",
+                      "required": [
+                        "account",
+                        "choices",
+                        "state"
+                      ],
+                      "properties": {
+                        "account": {
+                          "type": "string",
+                          "description": "The account that signed in, as the vendor names it."
+                        },
+                        "choices": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/ProviderOauthChoice"
+                          },
+                          "description": "What that account may link, in the vendor's own order."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "authorized"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "description": "The browser came back, but without a sign-in: the user declined,\ntheir organization wants an administrator to approve the app first,\nor the vendor refused the exchange. The page that is polling is the\none place the user is still looking, so it is told rather than left\nwaiting for a callback that has already happened.",
+                      "required": [
+                        "problem",
+                        "reason",
+                        "state"
+                      ],
+                      "properties": {
+                        "problem": {
+                          "type": "string",
+                          "description": "The problem slug the return page was sent, e.g. `microsoft-rejected`."
+                        },
+                        "reason": {
+                          "type": "string",
+                          "description": "What the vendor said, in its own words."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "failed"
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "description": "Answer of `GET /v1/providers/{azure|gcp}/oauth/{attempt_id}`.\n\nTwo states rather than one nullable body, for the reason\n[`CodexOauthPending`](crate::CodexOauthPending) is its own answer: a poll\nthat found nothing is a perfectly good `200` that says so, and the page\nasks again."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/providers/azure/oauth/start": {
       "post": {
         "summary": "`POST /v1/providers/azure/oauth/start` — begins a Microsoft sign-in.",
-        "description": "`POST /v1/providers/azure/oauth/start` — begins a Microsoft sign-in.",
+        "description": "`POST /v1/providers/azure/oauth/start` — begins a Microsoft sign-in.\n\nPer-call cost: 0 D1 statements, 1 KV write (`auth:provider-oauth:{attempt_id}`),\n0 Durable Object calls, 0 R2 operations, 0 subrequests.",
         "operationId": "flyco_api::provider_oauth::azure_start",
         "responses": {
           "200": {
@@ -4303,10 +4504,146 @@
         }
       }
     },
+    "/v1/providers/codespaces/oauth/exchange": {
+      "post": {
+        "summary": "`POST /v1/providers/codespaces/oauth/exchange` — verifies the caller owns the attempt and `state`, then redeems GitHub's code and checks the `codespace` and `repo` scopes.",
+        "description": "`POST /v1/providers/codespaces/oauth/exchange` — verifies the caller owns\nthe attempt and `state`, then redeems GitHub's code and checks the\n`codespace` and `repo` scopes.\n\nPer-call cost: 0 D1 statements, 1 KV read + 1 KV write, 0 Durable Object\ncalls, 0 R2 operations, 2 external subrequests to GitHub (`access_token` +\n`GET /user`) on success.",
+        "operationId": "flyco_api::provider_oauth::codespaces_exchange",
+        "requestBody": {
+          "description": "Extractor arguments",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Request body of `POST /v1/providers/{azure,gcp,codespaces}/oauth/exchange`.",
+                "required": [
+                  "attempt_id",
+                  "state"
+                ],
+                "properties": {
+                  "attempt_id": {
+                    "$ref": "#/components/schemas/Uuid",
+                    "description": "The attempt id returned by the matching `POST .../oauth/start`."
+                  },
+                  "code": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The single-use authorization code, when consent was granted."
+                  },
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The vendor's machine-readable refusal, when consent was declined."
+                  },
+                  "error_description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The vendor's explanation of the refusal, when stated."
+                  },
+                  "state": {
+                    "type": "string",
+                    "description": "The `state` echoed back by the vendor to `/connect/return`."
+                  }
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "description": "The browser has not come back from the vendor yet.",
+                      "required": [
+                        "state"
+                      ],
+                      "properties": {
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "pending"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "description": "The vendor said who signed in and what they may link.",
+                      "required": [
+                        "account",
+                        "choices",
+                        "state"
+                      ],
+                      "properties": {
+                        "account": {
+                          "type": "string",
+                          "description": "The account that signed in, as the vendor names it."
+                        },
+                        "choices": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/ProviderOauthChoice"
+                          },
+                          "description": "What that account may link, in the vendor's own order."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "authorized"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "description": "The browser came back, but without a sign-in: the user declined,\ntheir organization wants an administrator to approve the app first,\nor the vendor refused the exchange. The page that is polling is the\none place the user is still looking, so it is told rather than left\nwaiting for a callback that has already happened.",
+                      "required": [
+                        "problem",
+                        "reason",
+                        "state"
+                      ],
+                      "properties": {
+                        "problem": {
+                          "type": "string",
+                          "description": "The problem slug the return page was sent, e.g. `microsoft-rejected`."
+                        },
+                        "reason": {
+                          "type": "string",
+                          "description": "What the vendor said, in its own words."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "failed"
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "description": "Answer of `GET /v1/providers/{azure|gcp}/oauth/{attempt_id}`.\n\nTwo states rather than one nullable body, for the reason\n[`CodexOauthPending`](crate::CodexOauthPending) is its own answer: a poll\nthat found nothing is a perfectly good `200` that says so, and the page\nasks again."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/providers/codespaces/oauth/start": {
       "post": {
         "summary": "`POST /v1/providers/codespaces/oauth/start` — begins a GitHub sign-in for the `codespace` scope.",
-        "description": "`POST /v1/providers/codespaces/oauth/start` — begins a GitHub sign-in\nfor the `codespace` scope.",
+        "description": "`POST /v1/providers/codespaces/oauth/start` — begins a GitHub sign-in\nfor the `codespace` scope.\n\nPer-call cost: 0 D1 statements, 1 KV write (`auth:provider-oauth:{attempt_id}`),\n0 Durable Object calls, 0 R2 operations, 0 subrequests.",
         "operationId": "flyco_api::provider_oauth::codespaces_start",
         "responses": {
           "200": {
@@ -4517,8 +4854,8 @@
     },
     "/v1/providers/gcp/oauth/callback": {
       "get": {
-        "summary": "`GET /v1/providers/gcp/oauth/callback` — records what Google said.",
-        "description": "`GET /v1/providers/gcp/oauth/callback` — records what Google said.\n\nPublic, for the reason [`azure_callback`] is.",
+        "summary": "`GET /v1/providers/gcp/oauth/callback` — forwards Google's redirect to `/connect/return#provider=gcp&...` without exchanging the code or setting cookies.",
+        "description": "`GET /v1/providers/gcp/oauth/callback` — forwards Google's redirect to\n`/connect/return#provider=gcp&...` without exchanging the code or setting\ncookies.\n\nPer-call cost: 0 D1 statements, 0 KV operations, 0 Durable Object calls,\n0 R2 operations, 0 subrequests.",
         "operationId": "flyco_api::provider_oauth::gcp_callback",
         "parameters": [
           {
@@ -4574,10 +4911,146 @@
         }
       }
     },
+    "/v1/providers/gcp/oauth/exchange": {
+      "post": {
+        "summary": "`POST /v1/providers/gcp/oauth/exchange` — verifies the caller owns the attempt and `state`, then redeems Google's code using the attempt's PKCE verifier.",
+        "description": "`POST /v1/providers/gcp/oauth/exchange` — verifies the caller owns the\nattempt and `state`, then redeems Google's code using the attempt's PKCE\nverifier.\n\nPer-call cost: 0 D1 statements, 1 KV read + 1 KV write, 0 Durable Object\ncalls, 0 R2 operations, 2 external subrequests to Google (code exchange,\nlist projects) on success.",
+        "operationId": "flyco_api::provider_oauth::gcp_exchange",
+        "requestBody": {
+          "description": "Extractor arguments",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Request body of `POST /v1/providers/{azure,gcp,codespaces}/oauth/exchange`.",
+                "required": [
+                  "attempt_id",
+                  "state"
+                ],
+                "properties": {
+                  "attempt_id": {
+                    "$ref": "#/components/schemas/Uuid",
+                    "description": "The attempt id returned by the matching `POST .../oauth/start`."
+                  },
+                  "code": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The single-use authorization code, when consent was granted."
+                  },
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The vendor's machine-readable refusal, when consent was declined."
+                  },
+                  "error_description": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "The vendor's explanation of the refusal, when stated."
+                  },
+                  "state": {
+                    "type": "string",
+                    "description": "The `state` echoed back by the vendor to `/connect/return`."
+                  }
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "object",
+                      "description": "The browser has not come back from the vendor yet.",
+                      "required": [
+                        "state"
+                      ],
+                      "properties": {
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "pending"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "description": "The vendor said who signed in and what they may link.",
+                      "required": [
+                        "account",
+                        "choices",
+                        "state"
+                      ],
+                      "properties": {
+                        "account": {
+                          "type": "string",
+                          "description": "The account that signed in, as the vendor names it."
+                        },
+                        "choices": {
+                          "type": "array",
+                          "items": {
+                            "$ref": "#/components/schemas/ProviderOauthChoice"
+                          },
+                          "description": "What that account may link, in the vendor's own order."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "authorized"
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "type": "object",
+                      "description": "The browser came back, but without a sign-in: the user declined,\ntheir organization wants an administrator to approve the app first,\nor the vendor refused the exchange. The page that is polling is the\none place the user is still looking, so it is told rather than left\nwaiting for a callback that has already happened.",
+                      "required": [
+                        "problem",
+                        "reason",
+                        "state"
+                      ],
+                      "properties": {
+                        "problem": {
+                          "type": "string",
+                          "description": "The problem slug the return page was sent, e.g. `microsoft-rejected`."
+                        },
+                        "reason": {
+                          "type": "string",
+                          "description": "What the vendor said, in its own words."
+                        },
+                        "state": {
+                          "type": "string",
+                          "enum": [
+                            "failed"
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "description": "Answer of `GET /v1/providers/{azure|gcp}/oauth/{attempt_id}`.\n\nTwo states rather than one nullable body, for the reason\n[`CodexOauthPending`](crate::CodexOauthPending) is its own answer: a poll\nthat found nothing is a perfectly good `200` that says so, and the page\nasks again."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/providers/gcp/oauth/start": {
       "post": {
         "summary": "`POST /v1/providers/gcp/oauth/start` — begins a Google sign-in.",
-        "description": "`POST /v1/providers/gcp/oauth/start` — begins a Google sign-in.",
+        "description": "`POST /v1/providers/gcp/oauth/start` — begins a Google sign-in.\n\nPer-call cost: 0 D1 statements, 1 KV write (`auth:provider-oauth:{attempt_id}`),\n0 Durable Object calls, 0 R2 operations, 0 subrequests.",
         "operationId": "flyco_api::provider_oauth::gcp_start",
         "responses": {
           "200": {
@@ -11392,6 +11865,68 @@
           }
         }
       },
+      "ExchangeGithubLogin": {
+        "type": "object",
+        "description": "What `POST /v1/auth/github/exchange` must carry.",
+        "required": [
+          "code",
+          "state",
+          "code_verifier"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The single-use authorization code GitHub returned to the callback."
+          },
+          "code_verifier": {
+            "type": "string",
+            "description": "The `sessionStorage`-held PKCE verifier matching the `code_challenge`\nsent to [`start`]."
+          },
+          "state": {
+            "type": "string",
+            "description": "The `state` minted by [`start`] and echoed back by GitHub."
+          }
+        }
+      },
+      "ExchangeProviderOauth": {
+        "type": "object",
+        "description": "Request body of `POST /v1/providers/{azure,gcp,codespaces}/oauth/exchange`.",
+        "required": [
+          "attempt_id",
+          "state"
+        ],
+        "properties": {
+          "attempt_id": {
+            "$ref": "#/components/schemas/Uuid",
+            "description": "The attempt id returned by the matching `POST .../oauth/start`."
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The single-use authorization code, when consent was granted."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The vendor's machine-readable refusal, when consent was declined."
+          },
+          "error_description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The vendor's explanation of the refusal, when stated."
+          },
+          "state": {
+            "type": "string",
+            "description": "The `state` echoed back by the vendor to `/connect/return`."
+          }
+        }
+      },
       "Feature": {
         "type": "string",
         "description": "A harness capability tracked in the per-harness feature matrix.",
@@ -11552,6 +12087,19 @@
             "format": "int64",
             "description": "vCPU-seconds the provider does not bill for, per month.",
             "minimum": 0
+          }
+        }
+      },
+      "GithubSession": {
+        "type": "object",
+        "description": "What `POST /v1/auth/github/exchange` answers with on success.\n\nThe plaintext session token is returned once over JSON to the browser tab\nthat initiated sign-in; flyco sets no cookies.",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The freshly minted `fs_` browser session token."
           }
         }
       },
@@ -13742,7 +14290,7 @@
       },
       "ProviderCallback": {
         "type": "object",
-        "description": "The query string a vendor appends when it returns the browser.\n\nEvery field but `state` is optional because a refusal is a redirect too:\na user who closes the consent screen comes back with `error` and no\n`code`, and that has to reach the return page as a problem rather than\nas an extractor failure.",
+        "description": "The query string a vendor appends when it returns the browser.\n\nEvery field but `state` is optional because a refusal is a redirect too:\na user who closes the consent screen comes back with `error` and no\n`code`, and that has to reach the return page cleanly rather than as an\nextractor failure.",
         "required": [
           "state"
         ],
@@ -14950,11 +15498,16 @@
       },
       "StartGithubLogin": {
         "type": "object",
-        "description": "What `POST /v1/auth/github/start` must carry.\n\nThis is the one public route whose whole job is minting account state,\nwhich makes it the one a registration bot wants — so the request is not\nthe sign-in itself but proof a human, not a script, asked for it.",
+        "description": "What `POST /v1/auth/github/start` must carry.\n\nThis is the one public route whose whole job is minting account state,\nwhich makes it the one a registration bot wants — so the request carries\nboth human proof and the initiating browser's PKCE challenge.",
         "required": [
-          "turnstile_token"
+          "turnstile_token",
+          "code_challenge"
         ],
         "properties": {
+          "code_challenge": {
+            "type": "string",
+            "description": "Base64url-encoded SHA-256 (`S256`) challenge of the verifier the\ninitiating browser holds in `sessionStorage`."
+          },
           "turnstile_token": {
             "type": "string",
             "description": "The `cf-turnstile-response` token the login page's widget produced."

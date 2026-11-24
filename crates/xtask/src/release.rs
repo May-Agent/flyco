@@ -138,6 +138,22 @@ impl Channel {
         format!("{BUCKET}/{}", self.key(object))
     }
 
+    /// Content-addressed object key in the bucket for a versioned binary.
+    #[must_use]
+    pub fn digest_key(self, object: &PublishedObject, sha256: &str) -> String {
+        format!(
+            "releases/{}/{}",
+            self.name,
+            object.versioned_digest_key(sha256)
+        )
+    }
+
+    /// Bucket-qualified content-addressed key for `wrangler r2 object`.
+    #[must_use]
+    pub fn digest_bucket_key(self, object: &PublishedObject, sha256: &str) -> String {
+        format!("{BUCKET}/{}", self.digest_key(object, sha256))
+    }
+
     /// Directory the publish stages this channel's objects in.
     ///
     /// Everything uploaded is uploaded from here, so what a `--dry-run`
@@ -171,20 +187,22 @@ impl Channel {
         format!("{}/v1/healthz", self.origin)
     }
 
-    /// The tags one publish puts on the session image: the channel, the wire
-    /// protocol version the daemon inside speaks, and `latest`.
-    ///
-    /// The wire tag is what a driver can pin when it must start a container
-    /// that the deployed control plane will accept; the channel tag is what
-    /// an operator reads; `latest` is what the host path names by default.
+    /// The tags one publish puts on the session image: when `only_wire_tag`
+    /// is true (during `--allow-wire-mismatch` before the new Worker deploys),
+    /// only `:wire-<N>` is pushed so `:dev` and `:latest` continue serving the
+    /// protocol the deployed Worker speaks.
     #[must_use]
-    pub fn image_tags(self, wire_protocol_version: u32) -> [String; 3] {
+    pub fn image_tags(self, wire_protocol_version: u32, only_wire_tag: bool) -> Vec<String> {
         let image = flyco_core::release::SESSION_IMAGE;
-        [
-            format!("{image}:{}", self.name),
-            format!("{image}:wire-{wire_protocol_version}"),
-            format!("{image}:latest"),
-        ]
+        if only_wire_tag {
+            vec![format!("{image}:wire-{wire_protocol_version}")]
+        } else {
+            vec![
+                format!("{image}:{}", self.name),
+                format!("{image}:wire-{wire_protocol_version}"),
+                format!("{image}:latest"),
+            ]
+        }
     }
 }
 
@@ -347,6 +365,36 @@ impl Release {
             .chain(&self.assets)
     }
 
+    /// Uploads every object of the release in order: each architecture's
+    /// content-addressed binary (`wire-<N>/<sha256>/<name>`), its mutable
+    /// binary, and its checksum, followed by the unit files and installer.
+    #[must_use]
+    pub fn upload_invocations(&self) -> Vec<(String, Invocation)> {
+        let mut uploads = Vec::new();
+        for artifact in &self.artifacts {
+            let digest_key = self
+                .channel
+                .digest_key(&artifact.binary.published, &artifact.line.digest);
+            uploads.push((
+                digest_key,
+                Invocation::upload_digest(self.channel, &artifact.binary, &artifact.line.digest),
+            ));
+            for object in artifact.objects() {
+                uploads.push((
+                    self.channel.key(&object.published),
+                    Invocation::upload(self.channel, object),
+                ));
+            }
+        }
+        for asset in &self.assets {
+            uploads.push((
+                self.channel.key(&asset.published),
+                Invocation::upload(self.channel, asset),
+            ));
+        }
+        uploads
+    }
+
     /// The objects a finished publish reads back through `/install/`.
     ///
     /// Everything but the binaries themselves, which are tens of megabytes
@@ -426,17 +474,46 @@ impl Invocation {
     /// describe an object the same way.
     #[must_use]
     pub fn upload(channel: Channel, object: &ReleaseObject) -> Self {
+        Self::upload_to_key(channel.bucket_key(&object.published), object)
+    }
+
+    /// Uploads a versioned binary under its content-addressed SHA-256 key so
+    /// installers fetching `?sha256=<digest>` never see edge-cache skew.
+    #[must_use]
+    pub fn upload_digest(channel: Channel, object: &ReleaseObject, sha256: &str) -> Self {
+        Self::upload_to_key(channel.digest_bucket_key(&object.published, sha256), object)
+    }
+
+    fn upload_to_key(bucket_key: String, object: &ReleaseObject) -> Self {
         Self {
             program: "wrangler",
             args: vec![
                 "r2".to_owned(),
                 "object".to_owned(),
                 "put".to_owned(),
-                channel.bucket_key(&object.published),
+                bucket_key,
                 "--file".to_owned(),
                 object.file.display().to_string(),
                 "--content-type".to_owned(),
                 object.published.content_type.to_owned(),
+                "--remote".to_owned(),
+            ],
+        }
+    }
+
+    /// `wrangler r2 object get <bucket>/<key> --pipe --remote`: reads an object
+    /// directly from R2 when verifying a `--allow-wire-mismatch` publish before
+    /// the new Worker is deployed.
+    #[must_use]
+    pub fn r2_get(channel: Channel, object: &ReleaseObject) -> Self {
+        Self {
+            program: "wrangler",
+            args: vec![
+                "r2".to_owned(),
+                "object".to_owned(),
+                "get".to_owned(),
+                channel.bucket_key(&object.published),
+                "--pipe".to_owned(),
                 "--remote".to_owned(),
             ],
         }
@@ -456,6 +533,7 @@ impl Invocation {
         channel: Channel,
         stage_dir: &Path,
         wire_protocol_version: u32,
+        only_wire_tag: bool,
         push: bool,
     ) -> Self {
         let mut args = vec![
@@ -470,7 +548,7 @@ impl Invocation {
                 format!("linux/{}", host_platform())
             },
         ];
-        for tag in channel.image_tags(wire_protocol_version) {
+        for tag in channel.image_tags(wire_protocol_version, only_wire_tag) {
             args.push("--tag".to_owned());
             args.push(tag);
         }
@@ -729,15 +807,19 @@ mod tests {
     }
 
     #[test]
-    fn a_publish_tags_the_image_by_channel_wire_version_and_latest() {
+    fn a_publish_tags_the_image_by_channel_wire_version_and_latest_or_wire_only_on_mismatch() {
         let channel = CHANNELS[0];
         assert_eq!(
-            channel.image_tags(9),
-            [
+            channel.image_tags(9, false),
+            vec![
                 "ghcr.io/lexoliu/flyco-session:dev".to_owned(),
                 "ghcr.io/lexoliu/flyco-session:wire-9".to_owned(),
                 "ghcr.io/lexoliu/flyco-session:latest".to_owned(),
             ]
+        );
+        assert_eq!(
+            channel.image_tags(9, true),
+            vec!["ghcr.io/lexoliu/flyco-session:wire-9".to_owned()]
         );
     }
 
@@ -746,7 +828,7 @@ mod tests {
         let channel = CHANNELS[0];
         let stage = Path::new("/tmp/stage dir");
 
-        let pushed = Invocation::image_build(channel, stage, 9, true);
+        let pushed = Invocation::image_build(channel, stage, 9, false, true);
         assert_eq!(pushed.program, "docker");
         assert!(pushed.args.contains(&"linux/amd64,linux/arm64".to_owned()));
         assert!(pushed.args.contains(&"--push".to_owned()));
@@ -767,7 +849,19 @@ mod tests {
             "every tag of the publish goes on the one build: {pushed}"
         );
 
-        let loaded = Invocation::image_build(channel, stage, 9, false);
+        let mismatch = Invocation::image_build(channel, stage, 9, true, true);
+        assert_eq!(
+            mismatch.args.iter().filter(|arg| *arg == "--tag").count(),
+            1,
+            "wire-mismatch only tags :wire-<N>: {mismatch}"
+        );
+        assert!(
+            mismatch
+                .args
+                .contains(&"ghcr.io/lexoliu/flyco-session:wire-9".to_owned())
+        );
+
+        let loaded = Invocation::image_build(channel, stage, 9, false, false);
         assert!(
             loaded
                 .args
@@ -775,6 +869,31 @@ mod tests {
         );
         assert!(loaded.args.contains(&"--load".to_owned()));
         assert!(!loaded.args.contains(&"--push".to_owned()));
+    }
+
+    #[test]
+    fn upload_invocations_upload_digest_key_before_checksum() {
+        let release = release();
+        let keys: Vec<String> = release
+            .upload_invocations()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let x86_digest_idx = keys
+            .iter()
+            .position(|k| {
+                k.contains(&release.artifacts[0].line.digest) && k.ends_with("flycod-linux-x86_64")
+            })
+            .expect("x86 digest upload present");
+        let x86_sha_idx = keys
+            .iter()
+            .position(|k| k.ends_with("flycod-linux-x86_64.sha256"))
+            .expect("x86 sha256 upload present");
+        assert!(x86_digest_idx < x86_sha_idx);
+        assert_eq!(
+            keys.last().map(String::as_str),
+            Some("releases/dev/flycod.sh")
+        );
     }
 
     #[test]

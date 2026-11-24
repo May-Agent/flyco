@@ -30,6 +30,16 @@ struct CloudInit {
     config_path: String,
     config_base64: String,
     installer_url: String,
+    asset_base: String,
+}
+
+fn asset_base_of(installer_url: &str) -> &str {
+    let without_query = installer_url
+        .split_once('?')
+        .map_or(installer_url, |(base, _)| base);
+    without_query
+        .rsplit_once('/')
+        .map_or(without_query, |(dir, _)| dir)
 }
 
 /// Quotes a value as a YAML single-quoted scalar.
@@ -63,6 +73,7 @@ pub fn render(daemon_config: &str, installer_url: &str) -> Result<String, Provid
         config_path: yaml_quoted(CONFIG_PATH),
         config_base64: engine.encode(daemon_config),
         installer_url: yaml_quoted(installer_url),
+        asset_base: yaml_quoted(asset_base_of(installer_url)),
     }
     .render()
     .map_err(|_| ProviderError::Malformed("the cloud-init template did not render"))?;
@@ -128,6 +139,21 @@ mod tests {
 
         assert!(cloud_config.contains("'/run/flycod-install.sh'"));
         assert!(cloud_config.contains("'https://dev.flyco.dev/install/flycod.sh'"));
+        assert!(cloud_config.contains("'--asset-base', 'https://dev.flyco.dev/install'"));
         assert!(!cloud_config.contains("| sh"));
+    }
+
+    #[test]
+    fn cloud_init_passes_custom_origin_asset_base() {
+        let cloud_config = decoded(
+            &render(
+                "daemon_token = \"fd_live\"\n",
+                "https://flyco.dev/install/flycod.sh",
+            )
+            .expect("the template renders"),
+        );
+
+        assert!(cloud_config.contains("'https://flyco.dev/install/flycod.sh'"));
+        assert!(cloud_config.contains("'--asset-base', 'https://flyco.dev/install'"));
     }
 }

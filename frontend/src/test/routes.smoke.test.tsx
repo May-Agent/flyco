@@ -27,10 +27,13 @@ import InstructionsSection from "../routes/settings/InstructionsSection";
 import AccountSection from "../routes/settings/AccountSection";
 import NotFound from "../routes/NotFound";
 import { HOST_ENROLL_COMMAND } from "./setup";
-import { command, route, type } from "../components/flow/testSupport";
+import { command, json, postedTo, route, type } from "../components/flow/testSupport";
+import { rememberProviderOauthAttempt } from "../api/auth";
 import { consumePostLoginPath } from "../lib/postLoginPath";
-import { clearSessionToken, setSessionToken } from "../lib/session";
+import { clearSessionToken, getSessionToken, setSessionToken } from "../lib/session";
 import { dismissWelcome } from "../lib/localPreferences";
+
+const CLI_ATTEMPT = "11111111-2222-4333-8444-555555555555";
 
 /**
  * Renders the same route tree as src/main.tsx, starting at a given path.
@@ -138,13 +141,68 @@ describe("route smoke tests", () => {
     expect(localStorage.getItem("flyco.session_token")).toBeNull();
   });
 
-  it("renders /auth/complete as an explicit error state without a token", () => {
+  it("renders /auth/complete as an explicit error state without a fragment", () => {
+    window.history.replaceState(null, "", "/auth/complete");
     const { getByRole } = renderAt("/auth/complete", false);
     expect(getByRole("alert")).toBeInTheDocument();
   });
 
+  it("exchanges #code and #state on /auth/complete when sessionStorage state matches and scrubs hash", async () => {
+    sessionStorage.setItem(
+      "flyco.github_oauth_pending",
+      JSON.stringify({ state: "gh_matching_state", codeVerifier: "verifier-123" }),
+    );
+    window.history.replaceState(
+      null,
+      "",
+      "/auth/complete#code=gh_code_1&state=gh_matching_state",
+    );
+    route(
+      (path, method) => method === "POST" && path === "/v1/auth/github/exchange",
+      () => json({ token: "fs_exchanged_session" }),
+    );
+
+    const { findByText } = renderAt("/auth/complete", false);
+
+    expect(await findByText("Welcome back, octocat")).toBeInTheDocument();
+    expect(window.location.hash).toBe("");
+    expect(getSessionToken()).toBe("fs_exchanged_session");
+    expect(postedTo("/v1/auth/github/exchange")).toEqual({
+      code: "gh_code_1",
+      state: "gh_matching_state",
+      code_verifier: "verifier-123",
+    });
+  });
+
+  it("rejects /auth/complete login CSRF when state does not match sessionStorage", async () => {
+    sessionStorage.setItem(
+      "flyco.github_oauth_pending",
+      JSON.stringify({ state: "gh_expected", codeVerifier: "verifier-123" }),
+    );
+    window.history.replaceState(
+      null,
+      "",
+      "/auth/complete#code=attacker_code&state=gh_attacker",
+    );
+    const exchangeCalled = vi.fn();
+    route(
+      (path, method) => method === "POST" && path === "/v1/auth/github/exchange",
+      () => {
+        exchangeCalled();
+        return json({ token: "fs_should_not_happen" });
+      },
+    );
+
+    const { findByRole } = renderAt("/auth/complete", false);
+
+    expect(await findByRole("alert")).toHaveTextContent(/does not match an active sign-in/);
+    expect(window.location.hash).toBe("");
+    expect(exchangeCalled).not.toHaveBeenCalled();
+    expect(getSessionToken()).toBeNull();
+  });
+
   it("sends a signed-out /cli/authorize visit through sign-in, and back", async () => {
-    const { findByText } = renderAt("/cli/authorize?id=attempt-1", false);
+    const { findByText } = renderAt(`/cli/authorize?id=${CLI_ATTEMPT}`, false);
     expect(await findByText("Sign in with GitHub")).toBeInTheDocument();
     // Approving a terminal belongs to an account, so the attempt id rides
     // the returnTo the shell builds, and sign-in lands back on the ask.
@@ -152,17 +210,17 @@ describe("route smoke tests", () => {
     expect(vi.mocked(fetch).mock.calls.map(([input]) => String(input))).toEqual(
       [expect.stringContaining("/v1/config")],
     );
-    expect(consumePostLoginPath()).toBe("/cli/authorize?id=attempt-1");
+    expect(consumePostLoginPath()).toBe(`/cli/authorize?id=${CLI_ATTEMPT}`);
   });
 
   it("asks on /cli/authorize, and approving posts the decision", async () => {
     route(
       (path, method) =>
-        method === "POST" && path === "/v1/cli-sessions/attempt-1/approve",
+        method === "POST" && path === `/v1/cli-sessions/${CLI_ATTEMPT}/approve`,
       () => new Response(null, { status: 204 }),
     );
     const { findByRole, getByRole, findByText } = renderAt(
-      "/cli/authorize?id=attempt-1",
+      `/cli/authorize?id=${CLI_ATTEMPT}`,
     );
     await findByRole("heading", { level: 1, name: "Sign in the flyco CLI?" });
 
@@ -172,7 +230,7 @@ describe("route smoke tests", () => {
     expect(
       vi.mocked(fetch).mock.calls.some(
         ([input, init]) =>
-          String(input).endsWith("/v1/cli-sessions/attempt-1/approve") &&
+          String(input).endsWith(`/v1/cli-sessions/${CLI_ATTEMPT}/approve`) &&
           init?.method === "POST",
       ),
     ).toBe(true);
@@ -181,11 +239,11 @@ describe("route smoke tests", () => {
   it("denies on /cli/authorize, posting the refusal", async () => {
     route(
       (path, method) =>
-        method === "POST" && path === "/v1/cli-sessions/attempt-1/deny",
+        method === "POST" && path === `/v1/cli-sessions/${CLI_ATTEMPT}/deny`,
       () => new Response(null, { status: 204 }),
     );
     const { findByRole, getByRole, findByText } = renderAt(
-      "/cli/authorize?id=attempt-1",
+      `/cli/authorize?id=${CLI_ATTEMPT}`,
     );
     await findByRole("heading", { level: 1, name: "Sign in the flyco CLI?" });
 
@@ -195,14 +253,25 @@ describe("route smoke tests", () => {
     expect(
       vi.mocked(fetch).mock.calls.some(
         ([input, init]) =>
-          String(input).endsWith("/v1/cli-sessions/attempt-1/deny") &&
+          String(input).endsWith(`/v1/cli-sessions/${CLI_ATTEMPT}/deny`) &&
           init?.method === "POST",
       ),
     ).toBe(true);
   });
 
+  it("rejects Deny-to-Approve path injection payloads on /cli/authorize", async () => {
+    const { findByRole, queryByRole } = renderAt(
+      `/cli/authorize?id=${CLI_ATTEMPT}/approve%23`,
+    );
+    expect(await findByRole("alert")).toBeInTheDocument();
+    expect(queryByRole("button", { name: "Deny" })).not.toBeInTheDocument();
+    expect(
+      queryByRole("button", { name: "Approve sign-in" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("renders /cli/authorize without the session rail", async () => {
-    const { findByRole, queryByRole } = renderAt("/cli/authorize?id=attempt-1");
+    const { findByRole, queryByRole } = renderAt(`/cli/authorize?id=${CLI_ATTEMPT}`);
     await findByRole("heading", { level: 1, name: "Sign in the flyco CLI?" });
 
     // A signed-in visitor approving a terminal is not yet inside the
@@ -225,7 +294,7 @@ describe("route smoke tests", () => {
   it("surfaces a refused approval rather than claiming it", async () => {
     route(
       (path, method) =>
-        method === "POST" && path === "/v1/cli-sessions/attempt-1/approve",
+        method === "POST" && path === `/v1/cli-sessions/${CLI_ATTEMPT}/approve`,
       () =>
         new Response(
           JSON.stringify({
@@ -241,7 +310,7 @@ describe("route smoke tests", () => {
         ),
     );
     const { findByRole, getByRole, findByText } = renderAt(
-      "/cli/authorize?id=attempt-1",
+      `/cli/authorize?id=${CLI_ATTEMPT}`,
     );
     await findByRole("heading", { level: 1, name: "Sign in the flyco CLI?" });
 
@@ -390,22 +459,92 @@ describe("route smoke tests", () => {
     ).toBeInTheDocument();
   });
 
-  it("tells the tab a vendor sent back that flyco carries on elsewhere", async () => {
-    const { findByRole, getByText, queryByRole } = renderAt(
-      "/connect/return?provider=azure",
+  it("exchanges the fragment callback on /connect/return and tells the tab flyco carries on elsewhere", async () => {
+    rememberProviderOauthAttempt("azure", "az_state_1", CLI_ATTEMPT);
+    window.history.replaceState(
+      null,
+      "",
+      "/connect/return#provider=azure&code=az_code_1&state=az_state_1",
     );
+    route(
+      (path, method) =>
+        method === "POST" && path === "/v1/providers/azure/oauth/exchange",
+      () =>
+        json({
+          state: "authorized",
+          account: "me@lexo.cool",
+          choices: [],
+        }),
+    );
+    const { findByRole, getByText, queryByRole } = renderAt("/connect/return");
     expect(
       await findByRole("heading", { level: 1, name: "Signed in with Azure" }),
     ).toBeInTheDocument();
+    expect(window.location.hash).toBe("");
+    expect(postedTo("/v1/providers/azure/oauth/exchange")).toEqual({
+      attempt_id: CLI_ATTEMPT,
+      state: "az_state_1",
+      code: "az_code_1",
+    });
     expect(getByText(/You can close this tab/)).toBeInTheDocument();
     // Nothing to press: this tab is not where the flow is.
     expect(queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("explains a refused consent and carries one action back into the flow", async () => {
-    const { findByRole, getByText, getByRole } = renderAt(
-      "/connect/return?provider=gcp&problem=google-rejected&reason=access_denied%3A%20denied",
+  it("rejects an unmatched /connect/return callback without calling exchange", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/connect/return#provider=codespaces&code=victim_code&state=cs_attacker",
     );
+    const exchangeCalled = vi.fn();
+    route(
+      (path, method) =>
+        method === "POST" && path === "/v1/providers/codespaces/oauth/exchange",
+      () => {
+        exchangeCalled();
+        return json({ state: "authorized", account: "victim", choices: [] });
+      },
+    );
+    const { findByRole, getByText } = renderAt("/connect/return");
+    expect(
+      await findByRole("heading", {
+        level: 1,
+        name: "GitHub Codespaces did not complete the sign-in",
+      }),
+    ).toBeInTheDocument();
+    expect(window.location.hash).toBe("");
+    expect(exchangeCalled).not.toHaveBeenCalled();
+    expect(
+      getByText(/does not match an active sign-in in this browser/),
+    ).toBeInTheDocument();
+  });
+
+  it("explains a refused consent and carries one action back into the flow", async () => {
+    rememberProviderOauthAttempt("gcp", "gcp_state_2", CLI_ATTEMPT);
+    window.history.replaceState(
+      null,
+      "",
+      "/connect/return#provider=gcp&error=access_denied&error_description=denied&state=gcp_state_2",
+    );
+    route(
+      (path, method) =>
+        method === "POST" && path === "/v1/providers/gcp/oauth/exchange",
+      () =>
+        new Response(
+          JSON.stringify({
+            type: "https://flyco.dev/problems/google-rejected",
+            title: "Unprocessable Entity",
+            status: 422,
+            detail: "Google refused this sign-in: access_denied: denied",
+          }),
+          {
+            status: 422,
+            headers: { "content-type": "application/problem+json" },
+          },
+        ),
+    );
+    const { findByRole, getByText, getByRole } = renderAt("/connect/return");
     expect(
       await findByRole("heading", {
         level: 1,

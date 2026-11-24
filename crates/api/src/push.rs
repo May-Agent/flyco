@@ -25,11 +25,99 @@ use crate::extract::path_id;
 use crate::problem::Outcome;
 use crate::respond::{Created, NoContent};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::stream::{self, StreamExt as _};
 use jwt_compact::{AlgorithmExt as _, Claims, Header, alg::Es256};
 use web_push_native::{Auth, WebPushBuilder, p256::PublicKey};
 use zenwave::{Client as _, ResponseExt as _};
 
 const PUSH_TTL_SECONDS: u32 = 60 * 60;
+
+/// Maximum push subscriptions one account may hold.
+///
+/// Caps both D1 storage and outbound notification fan-out so delivering a
+/// session notification stays far below Cloudflare Workers' 50-subrequest
+/// ceiling.
+pub const MAX_SUBSCRIPTIONS_PER_USER: usize = 10;
+
+/// Tighter per-session delivery cap for notifications emitted from the shared
+/// minute cron (`usage_limits::sweep`), where multiple resumed sessions share
+/// one 50-subrequest Worker budget.
+const MAX_CRON_DELIVERIES_PER_NOTIFICATION: usize = 4;
+
+/// Maximum concurrent outbound Web Push HTTP requests per notification.
+const DELIVERY_CONCURRENCY: usize = 4;
+
+/// Whether `host` is a strict subdomain of `parent` (with a non-empty label
+/// before the dot and no empty labels).
+fn is_subdomain_of(host: &str, parent: &str) -> bool {
+    host.strip_suffix(parent)
+        .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1 && !prefix.starts_with('.'))
+}
+
+/// Allowlist of vetted browser Web Push service hosts (Apple APNs Web Push,
+/// Google FCM, Mozilla Autopush, and Microsoft WNS).
+fn is_allowed_push_host(host: &str) -> bool {
+    host == "web.push.apple.com"
+        || is_subdomain_of(host, "push.apple.com")
+        || host == "fcm.googleapis.com"
+        || host == "android.googleapis.com"
+        || host == "updates.push.services.mozilla.com"
+        || is_subdomain_of(host, "push.services.mozilla.com")
+        || is_subdomain_of(host, "notify.windows.com")
+}
+
+/// Validates that `raw` is an HTTPS URL pointing at a vetted Web Push service
+/// origin (never an IP literal, loopback/private host, non-standard port,
+/// embedded credentials, or the control plane's own host).
+fn validate_endpoint(config: &ApiConfig, raw: &str) -> Result<url::Url, ApiError> {
+    if raw.trim().is_empty() {
+        return Err(ApiError::InvalidPushSubscription(
+            "the endpoint is required",
+        ));
+    }
+    let endpoint = url::Url::parse(raw)
+        .map_err(|_| ApiError::InvalidPushSubscription("the endpoint must be an absolute URL"))?;
+    if endpoint.scheme() != "https" {
+        return Err(ApiError::InvalidPushSubscription(
+            "the endpoint must use HTTPS",
+        ));
+    }
+    if !endpoint.username().is_empty() || endpoint.password().is_some() {
+        return Err(ApiError::InvalidPushSubscription(
+            "the endpoint must not contain credentials",
+        ));
+    }
+    if endpoint.port().is_some() {
+        return Err(ApiError::InvalidPushSubscription(
+            "the endpoint must use the default HTTPS port",
+        ));
+    }
+    let Some(url::Host::Domain(domain)) = endpoint.host() else {
+        return Err(ApiError::InvalidPushSubscription(
+            "the endpoint must name a supported push service host",
+        ));
+    };
+    let normalized = domain.to_ascii_lowercase();
+    if normalized.ends_with('.') || normalized.contains("..") {
+        return Err(ApiError::InvalidPushSubscription(
+            "the endpoint host is not valid",
+        ));
+    }
+    if let Ok(control_plane) = url::Url::parse(&config.control_plane_url())
+        && let Some(url::Host::Domain(self_host)) = control_plane.host()
+        && normalized == self_host.to_ascii_lowercase()
+    {
+        return Err(ApiError::InvalidPushSubscription(
+            "the endpoint must not point at the control plane",
+        ));
+    }
+    if !is_allowed_push_host(&normalized) {
+        return Err(ApiError::InvalidPushSubscription(
+            "the endpoint must use a supported browser push service",
+        ));
+    }
+    Ok(endpoint)
+}
 
 /// A user-visible notification delivered by the service worker.
 #[derive(Debug, serde::Serialize)]
@@ -91,6 +179,12 @@ async fn vapid_public_key(State(config): State<ApiConfig>) -> Outcome<Json<Vapid
     .into()
 }
 
+#[derive(Debug, skyzen::FromRow)]
+struct UserSubscriptionCount {
+    total: i64,
+    same_endpoint: i64,
+}
+
 /// Registers this browser for push notifications.
 #[skyzen::openapi]
 async fn subscribe_push(
@@ -105,35 +199,46 @@ async fn subscribe_push(
         .into()
 }
 
-/// Registers a browser, or re-registers one that already exists.
+/// Registers a browser, or re-registers one that already exists for the same
+/// user.
+///
+/// Costs 1 indexed D1 read (per-user subscription cap check) and 1 D1 write
+/// (owner-fenced upsert).
 ///
 /// The endpoint is the identity a push service knows a browser by, so a
 /// browser that re-subscribes — after a service worker update, or a key
 /// rotation — must land on the same row. Inserting a second one would send
-/// every notification twice.
+/// every notification twice. An endpoint already registered to a different
+/// account is refused rather than overwritten.
 async fn subscribe(
     db: &Db,
     config: &ApiConfig,
     user: UserId,
     subscription: PushSubscription,
 ) -> Result<PushSubscriptionView, ApiError> {
-    if subscription.endpoint.trim().is_empty() {
-        return Err(ApiError::InvalidPushSubscription(
-            "the endpoint is required",
-        ));
-    }
-    let endpoint = url::Url::parse(&subscription.endpoint)
-        .map_err(|_| ApiError::InvalidPushSubscription("the endpoint must be an absolute URL"))?;
-    if endpoint.scheme() != "https" {
-        return Err(ApiError::InvalidPushSubscription(
-            "the endpoint must use HTTPS",
-        ));
-    }
+    validate_endpoint(config, &subscription.endpoint)?;
     build_message(config, &subscription, b"Flyco subscription check").map_err(|_| {
         ApiError::InvalidPushSubscription("the endpoint or encryption keys are invalid")
     })?;
 
-    let row: SubscriptionRow = sql!(
+    let endpoint = subscription.endpoint.as_str();
+    let counts: UserSubscriptionCount = sql!(
+        db,
+        "SELECT COUNT(*) AS total, \
+         COALESCE(SUM(CASE WHEN endpoint = {endpoint} THEN 1 ELSE 0 END), 0) AS same_endpoint \
+         FROM push_subscriptions WHERE user_id = {user}"
+    )
+    .fetch_one()
+    .await?;
+    if counts.same_endpoint == 0
+        && counts.total >= i64::try_from(MAX_SUBSCRIPTIONS_PER_USER).unwrap_or(i64::MAX)
+    {
+        return Err(ApiError::InvalidPushSubscription(
+            "at most 10 push subscriptions are allowed per account",
+        ));
+    }
+
+    let row: Option<SubscriptionRow> = sql!(
         db,
         "INSERT INTO push_subscriptions \
          (id, user_id, endpoint, p256dh, auth, expiration_time_ms, created_at_unix) \
@@ -141,13 +246,15 @@ async fn subscribe(
                  {subscription.keys.p256dh}, {subscription.keys.auth}, \
                  {subscription.expiration_time}, {now_unix()}) \
          ON CONFLICT (endpoint) DO UPDATE SET \
-         user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth, \
+         p256dh = excluded.p256dh, auth = excluded.auth, \
          expiration_time_ms = excluded.expiration_time_ms \
+         WHERE push_subscriptions.user_id = excluded.user_id \
          RETURNING id, endpoint, created_at_unix"
     )
-    .fetch_one()
+    .fetch_optional()
     .await?;
 
+    let row = row.ok_or(ApiError::PushSubscriptionConflict)?;
     Ok(row.into())
 }
 
@@ -172,6 +279,7 @@ pub async fn notify_approval(
             url: format!("/sessions/{session}"),
             tag: format!("approval-{session}"),
         },
+        MAX_SUBSCRIPTIONS_PER_USER,
     )
     .await
 }
@@ -203,6 +311,7 @@ pub async fn notify_turn(
             url: format!("/sessions/{session}"),
             tag: format!("turn-{session}"),
         },
+        MAX_SUBSCRIPTIONS_PER_USER,
     )
     .await
 }
@@ -240,6 +349,7 @@ pub async fn notify_usage_limit(
             url: format!("/sessions/{session}"),
             tag: format!("usage-limit-{session}"),
         },
+        MAX_SUBSCRIPTIONS_PER_USER,
     )
     .await
 }
@@ -269,6 +379,10 @@ fn usage_limit_body(pause: &UsageLimitPause) -> String {
 /// actionable: the agent has been handed the continuation and is answering,
 /// which is the moment to look at the session again.
 ///
+/// Called from the shared minute cron, so fan-out is bounded to
+/// [`MAX_CRON_DELIVERIES_PER_NOTIFICATION`] most recent subscriptions per
+/// session.
+///
 /// # Errors
 ///
 /// Returns a database or Web Push encoding error.
@@ -289,6 +403,7 @@ pub async fn notify_usage_limit_over(
             url: format!("/sessions/{session}"),
             tag: format!("usage-limit-{session}"),
         },
+        MAX_CRON_DELIVERIES_PER_NOTIFICATION,
     )
     .await
 }
@@ -298,28 +413,55 @@ async fn notify_session(
     config: &ApiConfig,
     session: SessionId,
     notification: PushNotification<'_>,
+    max_deliveries: usize,
 ) -> Result<(), ApiError> {
+    let limit = i64::try_from(max_deliveries.min(MAX_SUBSCRIPTIONS_PER_USER)).unwrap_or(10);
     let subscriptions: Vec<DeliverySubscription> = sql!(
         db,
         "SELECT p.id, p.endpoint, p.p256dh, p.auth FROM push_subscriptions p \
-         JOIN sessions s ON s.user_id = p.user_id WHERE s.id = {session}"
+         JOIN sessions s ON s.user_id = p.user_id WHERE s.id = {session} \
+         ORDER BY p.created_at_unix DESC LIMIT {limit}"
     )
     .fetch_all()
     .await?;
+    if subscriptions.is_empty() {
+        return Ok(());
+    }
     let payload = serde_json::to_vec(&notification)
         .map_err(|error| ApiError::PushDeliveryFailed(error.to_string()))?;
 
-    for subscription in subscriptions {
-        match deliver(config, &subscription, &payload).await {
+    let outcomes: Vec<(PushSubscriptionId, Result<Delivery, ApiError>)> =
+        stream::iter(subscriptions)
+            .map(|subscription| {
+                let payload = &payload;
+                async move {
+                    let id = subscription.id;
+                    let result =
+                        if let Err(error) = validate_endpoint(config, &subscription.endpoint) {
+                            Err(error)
+                        } else {
+                            deliver(config, &subscription, payload).await
+                        };
+                    (id, result)
+                }
+            })
+            .buffer_unordered(DELIVERY_CONCURRENCY)
+            .collect()
+            .await;
+
+    for (id, outcome) in outcomes {
+        match outcome {
             Ok(Delivery::Sent) => {}
             Ok(Delivery::Expired) => {
-                let id = subscription.id;
-                sql!(db, "DELETE FROM push_subscriptions WHERE id = {id}")
+                if let Err(error) = sql!(db, "DELETE FROM push_subscriptions WHERE id = {id}")
                     .execute()
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(%error, subscription = %id, %session, "could not delete expired web push subscription");
+                }
             }
             Err(error) => {
-                tracing::error!(%error, subscription = %subscription.id, %session, "web push delivery failed");
+                tracing::error!(%error, subscription = %id, %session, "web push delivery failed");
             }
         }
     }

@@ -2,17 +2,18 @@
 //!
 //! There is no socket to join any more. A daemon or an enrolled machine
 //! holds three routes against its room — attach, a command stream, and a
-//! frame POST — and this module is the Worker half of each: authenticate
-//! the caller, then forward into the Durable Object that owns the
-//! session or the machine.
+//! frame POST — and this module is the Worker half of each: forward an
+//! already middleware-authenticated caller into the Durable Object that owns
+//! the session or the machine.
 //!
 //! # Authentication
 //!
-//! Both peers are native HTTP clients, so both present an ordinary
-//! bearer credential: a session daemon its `fd_` token, an enrolled
-//! machine its `fh_` token. Each is bound to the id in the path and
-//! checked on every call — there is no handshake to carry state between
-//! them.
+//! Both peers are native HTTP clients, so both present an ordinary bearer
+//! credential: a session daemon its `fd_` token checked by
+//! [`crate::middleware::RequireDaemon`], an enrolled machine its `fh_` token
+//! checked by [`crate::middleware::RequireHost`]. Each is bound to the id in
+//! the path before the handler runs, so these functions take the verified id
+//! directly without repeating the D1 credential lookup.
 //!
 //! # What lives on the durable side
 //!
@@ -33,59 +34,20 @@ use crate::error::ApiError;
 use crate::host_room::HostAttachResponse;
 use crate::respond::NoContent;
 use crate::rooms::{HostRooms, Rooms};
-use crate::{daemon_tokens, hosts, sessions};
-
-/// Checks a session daemon's bearer credential.
-///
-/// # Errors
-///
-/// Returns [`ApiError::MissingCredential`] with no `Authorization` header
-/// and [`ApiError::InvalidDaemonCredential`] for a token that is not this
-/// session's.
-async fn authenticate_daemon(
-    db: &Db,
-    session: SessionId,
-    presented: Option<&str>,
-) -> Result<(), ApiError> {
-    let presented = presented.ok_or(ApiError::MissingCredential)?;
-    if daemon_tokens::authenticates(db, session, presented).await? {
-        Ok(())
-    } else {
-        Err(ApiError::InvalidDaemonCredential)
-    }
-}
-
-/// Checks an enrolled machine's bearer credential.
-///
-/// # Errors
-///
-/// Returns [`ApiError::MissingCredential`] with no `Authorization` header
-/// and [`ApiError::InvalidHostCredential`] for a token that is not this
-/// host's.
-async fn authenticate_host(db: &Db, host: HostId, presented: Option<&str>) -> Result<(), ApiError> {
-    let presented = presented.ok_or(ApiError::MissingCredential)?;
-    if hosts::authenticates(db, host, presented).await? {
-        Ok(())
-    } else {
-        Err(ApiError::InvalidHostCredential)
-    }
-}
+use crate::{hosts, sessions};
 
 /// Attaches a session's daemon to its room.
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::InvalidDaemonCredential`] if the token is not this
-/// session's, [`ApiError::ProtocolMismatch`] if the daemon speaks another
-/// wire protocol, or [`ApiError::Room`] if the room could not be reached.
+/// Returns [`ApiError::ProtocolMismatch`] if the daemon speaks another wire
+/// protocol, or [`ApiError::Room`] if the room could not be reached.
 pub async fn attach_daemon(
     rooms: &Rooms,
     db: &Db,
     session: SessionId,
-    presented: Option<&str>,
     attach: DaemonAttach,
 ) -> Result<DaemonAttached, ApiError> {
-    authenticate_daemon(db, session, presented).await?;
     if attach.protocol_version != flyco_core::WIRE_PROTOCOL_VERSION {
         return Err(ApiError::ProtocolMismatch {
             daemon: attach.protocol_version,
@@ -109,16 +71,13 @@ pub async fn attach_daemon(
 ///
 /// # Errors
 ///
-/// Same as [`attach_daemon`], plus [`ApiError::RelayEpochStale`] if the
-/// epoch names a superseded attach.
+/// Returns [`ApiError::RelayEpochStale`] if the epoch names a superseded
+/// attach, or [`ApiError::Room`] if the room could not be reached.
 pub async fn daemon_commands(
     rooms: &Rooms,
-    db: &Db,
     session: SessionId,
-    presented: Option<&str>,
     epoch: u64,
 ) -> Result<Response, ApiError> {
-    authenticate_daemon(db, session, presented).await?;
     rooms.daemon_commands(session, epoch).await
 }
 
@@ -126,16 +85,15 @@ pub async fn daemon_commands(
 ///
 /// # Errors
 ///
-/// Same as [`daemon_commands`], plus [`ApiError::RelayFramesGap`] if the
-/// batch skips a sequence number.
+/// Returns [`ApiError::RelayEpochStale`] if the epoch is stale,
+/// [`ApiError::RelayFramesGap`] if the batch skips a sequence number, or
+/// [`ApiError::Room`] if the room could not be reached.
 pub async fn daemon_frames(
     rooms: &Rooms,
     db: &Db,
     session: SessionId,
-    presented: Option<&str>,
     batch: DaemonFrames,
 ) -> Result<NoContent, ApiError> {
-    authenticate_daemon(db, session, presented).await?;
     rooms.daemon_frames(db, session, &batch).await?;
     Ok(NoContent)
 }
@@ -144,17 +102,13 @@ pub async fn daemon_frames(
 ///
 /// # Errors
 ///
-/// Returns [`ApiError::InvalidHostCredential`] if the token is not this
-/// host's, or [`ApiError::Room`] if the room could not be reached.
+/// Returns [`ApiError::Room`] if the room could not be reached.
 pub async fn attach_host(
     rooms: &HostRooms,
     db: &Db,
     host: HostId,
-    presented: Option<&str>,
     attach: HostAttach,
 ) -> Result<HostAttachResponse, ApiError> {
-    authenticate_host(db, host, presented).await?;
-
     // A machine that attaches is online, and this is the only hop where
     // the control plane can write that down: the attach itself reaches a
     // Durable Object, which cannot touch D1. The reverse — an attachment
@@ -170,16 +124,13 @@ pub async fn attach_host(
 ///
 /// # Errors
 ///
-/// Same as [`attach_host`], plus [`ApiError::RelayEpochStale`] if the
-/// epoch names a superseded attach.
+/// Returns [`ApiError::RelayEpochStale`] if the epoch names a superseded
+/// attach, or [`ApiError::Room`] if the room could not be reached.
 pub async fn host_commands(
     rooms: &HostRooms,
-    db: &Db,
     host: HostId,
-    presented: Option<&str>,
     epoch: u64,
 ) -> Result<Response, ApiError> {
-    authenticate_host(db, host, presented).await?;
     rooms.commands(host, epoch).await
 }
 
@@ -187,16 +138,14 @@ pub async fn host_commands(
 ///
 /// # Errors
 ///
-/// Same as [`host_commands`], plus [`ApiError::RelayFramesGap`] if the
-/// batch skips a sequence number.
+/// Returns [`ApiError::RelayEpochStale`] if the epoch is stale,
+/// [`ApiError::RelayFramesGap`] if the batch skips a sequence number, or
+/// [`ApiError::Room`] if the room could not be reached.
 pub async fn host_frames(
     rooms: &HostRooms,
-    db: &Db,
     host: HostId,
-    presented: Option<&str>,
     batch: HostFrames,
 ) -> Result<NoContent, ApiError> {
-    authenticate_host(db, host, presented).await?;
     rooms.frames(host, &batch).await?;
     Ok(NoContent)
 }

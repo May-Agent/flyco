@@ -32,12 +32,15 @@
 //! * A **remove** is `podman rm --force --ignore`, which says the same
 //!   thing.
 
+use core::fmt;
 use core::future::Future;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use flyco_core::host::JobOutcome;
 use flyco_provider::ProviderError;
-use flyco_provider::host::{ContainerJob, script};
+use flyco_provider::host::{ContainerJob, RenderedScript, script};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use super::config::PodmanConfig;
 
@@ -46,9 +49,10 @@ const RUNUSER: &str = "runuser";
 
 /// The shell a rendered job script is handed to.
 ///
-/// `-c`, not stdin: a create script feeds the session's configuration to
-/// `podman run --env-file /dev/stdin` through a here-document, so the
-/// shell's own standard input is not free to carry the script as well.
+/// `-c` runs the non-secret script while the shell's stdin pipe delivers the
+/// session's secret `FLYCO_DAEMON_CONFIG` env-file directly to
+/// `podman run --env-file /dev/stdin`, keeping credentials out of argv and
+/// `/proc/<pid>/cmdline`.
 const SHELL: &str = "/bin/sh";
 
 /// Podman itself, for the one thing that is a question rather than a job.
@@ -110,17 +114,31 @@ pub enum PodmanError {
 }
 
 /// One process to run: a program and its argument vector, never a shell
-/// string.
+/// string containing credentials.
 ///
 /// Every argument is one element and the program is executed directly, so a
 /// container name cannot be re-split into another command — the same
-/// property the rendered scripts have, kept on the way to them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// property the rendered scripts have, kept on the way to them. Optional
+/// standard input carries secret env-file payloads so they never enter
+/// `/proc/<pid>/cmdline`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Invocation {
     /// Program to execute, resolved on `PATH`.
     pub program: String,
     /// Arguments, already split.
     pub args: Vec<String>,
+    /// Optional bytes written to the child's standard input and closed.
+    pub stdin: Option<String>,
+}
+
+impl fmt::Debug for Invocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Invocation")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("has_stdin", &self.stdin.is_some())
+            .finish()
+    }
 }
 
 /// What running one process produced.
@@ -166,19 +184,87 @@ pub struct ProcessRunner;
 
 impl CommandRunner for ProcessRunner {
     async fn run(&self, invocation: Invocation) -> Result<CommandOutcome, PodmanError> {
-        let output = tokio::process::Command::new(&invocation.program)
+        let mut command = tokio::process::Command::new(&invocation.program);
+        command
             .args(&invocation.args)
-            .output()
-            .await
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        let Some(stdin_payload) = invocation.stdin else {
+            let output = command
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .map_err(|source| PodmanError::Spawn {
+                    program: invocation.program.clone(),
+                    source,
+                })?;
+
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            return Ok(CommandOutcome {
+                code: output.status.code(),
+                output: text.trim().to_owned(),
+            });
+        };
+
+        let mut child =
+            command
+                .stdin(Stdio::piped())
+                .spawn()
+                .map_err(|source| PodmanError::Spawn {
+                    program: invocation.program.clone(),
+                    source,
+                })?;
+
+        let mut child_stdin = child.stdin.take();
+        let mut child_stdout = child.stdout.take();
+        let mut child_stderr = child.stderr.take();
+
+        let write_stdin = async move {
+            if let Some(mut stdin) = child_stdin.take() {
+                // Ignore BrokenPipe if the child exited early before reading
+                // stdin (for example, `podman rm` failed under `set -eu`);
+                // the non-zero exit status and stderr carry the real error.
+                if let Err(error) = stdin.write_all(stdin_payload.as_bytes()).await
+                    && error.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    return Err(error);
+                }
+                let _ = stdin.shutdown().await;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let read_stdout = async move {
+            let mut buf = Vec::new();
+            if let Some(mut stdout) = child_stdout.take() {
+                stdout.read_to_end(&mut buf).await?;
+            }
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        };
+        let read_stderr = async move {
+            let mut buf = Vec::new();
+            if let Some(mut stderr) = child_stderr.take() {
+                stderr.read_to_end(&mut buf).await?;
+            }
+            Ok::<Vec<u8>, std::io::Error>(buf)
+        };
+
+        let ((), stdout, stderr) = tokio::try_join!(write_stdin, read_stdout, read_stderr)
             .map_err(|source| PodmanError::Spawn {
                 program: invocation.program.clone(),
                 source,
             })?;
+        let status = child.wait().await.map_err(|source| PodmanError::Spawn {
+            program: invocation.program.clone(),
+            source,
+        })?;
 
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
+        let mut text = String::from_utf8_lossy(&stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&stderr));
         Ok(CommandOutcome {
-            code: output.status.code(),
+            code: status.code(),
             output: text.trim().to_owned(),
         })
     }
@@ -218,6 +304,7 @@ impl Rootless {
             .run(Invocation {
                 program: ID.to_owned(),
                 args: vec!["-u".to_owned(), podman.user.clone()],
+                stdin: None,
             })
             .await?;
 
@@ -249,7 +336,7 @@ impl Rootless {
     }
 
     /// One process, run as the container user.
-    fn command<I>(&self, program: &str, arguments: I) -> Invocation
+    fn command<I>(&self, program: &str, arguments: I, stdin: Option<String>) -> Invocation
     where
         I: IntoIterator<Item = String>,
     {
@@ -265,19 +352,25 @@ impl Rootless {
         Invocation {
             program: RUNUSER.to_owned(),
             args,
+            stdin,
         }
     }
 
-    /// The invocation that runs one rendered job script.
+    /// The invocation that runs one rendered job script, piping any secret
+    /// env-file payload through standard input rather than command-line argv.
     #[must_use]
-    pub fn shell(&self, script: &str) -> Invocation {
-        self.command(SHELL, ["-c".to_owned(), script.to_owned()])
+    pub fn shell(&self, rendered: &RenderedScript) -> Invocation {
+        self.command(
+            SHELL,
+            ["-c".to_owned(), rendered.script.clone()],
+            rendered.stdin.clone(),
+        )
     }
 
     /// The invocation that asks Podman a question.
     #[must_use]
     pub fn podman<const N: usize>(&self, arguments: [&str; N]) -> Invocation {
-        self.command(PODMAN, arguments.map(ToOwned::to_owned))
+        self.command(PODMAN, arguments.map(ToOwned::to_owned), None)
     }
 }
 
@@ -358,7 +451,7 @@ impl<R: CommandRunner> LocalExecutor<R> {
     }
 
     /// Runs one rendered script, refusing on a non-zero exit.
-    async fn script(&self, script: &str, job: &'static str) -> Result<(), PodmanError> {
+    async fn script(&self, script: &RenderedScript, job: &'static str) -> Result<(), PodmanError> {
         let outcome = self.runner.run(self.rootless.shell(script)).await?;
         if outcome.succeeded() {
             return Ok(());
@@ -390,7 +483,7 @@ impl<R: CommandRunner + 'static> Jobs for LocalExecutor<R> {
 }
 
 /// The script one job runs, as the control plane's own planner renders it.
-fn render(job: &ContainerJob) -> Result<String, PodmanError> {
+fn render(job: &ContainerJob) -> Result<RenderedScript, PodmanError> {
     script::render(job).map_err(PodmanError::Render)
 }
 
@@ -518,6 +611,17 @@ mod tests {
         assert_eq!(ran[1].args[prefix().len() + 1], "-c");
         let script = &ran[1].args[prefix().len() + 2];
         assert!(script.contains("podman run --detach"), "{script}");
+        assert!(
+            !script.contains(flyco_provider::host::CONFIG_ENV),
+            "daemon config must ride stdin rather than argv: {script}"
+        );
+        assert!(
+            ran[1]
+                .stdin
+                .as_deref()
+                .is_some_and(|stdin| stdin.starts_with("FLYCO_DAEMON_CONFIG=")),
+            "create must pipe FLYCO_DAEMON_CONFIG on stdin"
+        );
         assert!(
             script.contains(&format!("--name {}", container_name(machine))),
             "{script}"
@@ -654,7 +758,34 @@ mod tests {
                 keeps,
                 "keep_volume = {keep_volume}: {script}"
             );
+            assert_eq!(
+                script.contains(&format!(
+                    "if podman volume exists {}; then",
+                    volume_name(machine)
+                )),
+                keeps,
+                "volume removal is guarded by podman volume exists: {script}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn process_runner_pipes_stdin_without_exposing_it_in_argv() {
+        let runner = super::ProcessRunner;
+        let invocation = super::Invocation {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "cat".to_owned()],
+            stdin: Some("FLYCO_DAEMON_CONFIG=c2VjcmV0\n".to_owned()),
+        };
+        let debug = format!("{invocation:?}");
+        assert!(
+            !debug.contains("c2VjcmV0"),
+            "Debug formatting must redact stdin secrets: {debug}"
+        );
+
+        let outcome = runner.run(invocation).await.expect("sh cat runs");
+        assert!(outcome.succeeded());
+        assert_eq!(outcome.output, "FLYCO_DAEMON_CONFIG=c2VjcmV0");
     }
 
     #[tokio::test]

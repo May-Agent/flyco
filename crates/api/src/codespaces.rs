@@ -32,6 +32,7 @@ use flyco_core::{
 use flyco_provider::codespaces::EnvRepo;
 use flyco_provider::{LiveTransport, ProviderError};
 use skyzen::routing::{CreateRouteNode as _, Route, RouteNode, Routes as _};
+use skyzen::sql;
 use skyzen::utils::{Json, State};
 use skyzen_services::Db;
 
@@ -224,13 +225,31 @@ pub async fn bootstrap(
     .into()
 }
 
+/// Token prefixes that GitHub issues for non-codespace credentials — classic
+/// OAuth app tokens (`gho_`, carried by sibling Flyco sessions), classic PATs
+/// (`ghp_`), fine-grained PATs (`github_pat_`), and Actions/App installation
+/// tokens (`ghs_`). A codespace's injected `GITHUB_TOKEN` is a GitHub App
+/// user-to-server token (`ghu_`).
+fn is_disallowed_bootstrap_token(token: &str) -> bool {
+    token.starts_with("gho_")
+        || token.starts_with("ghp_")
+        || token.starts_with("github_pat_")
+        || token.starts_with("ghs_")
+}
+
 /// Answers the bootstrap call.
+///
+/// Costs 2 D1 reads (machine row + linked account), 1 atomic D1 write
+/// (clearing `machines.bootstrap_enc`), and 2 GitHub subrequests (`GET /user`
+/// to verify owner identity and absence of `X-OAuth-Scopes`, and
+/// `GET /repos/{env_repo}` to verify private-repository read access).
 ///
 /// The order of the checks is the order the facts arrive: the machine row
 /// is needed before there is an account to check the token against, and
-/// the token is checked before the payload is opened — so a denial never
-/// touches the sealed configuration, and a machine row that does not exist
-/// yet is the `404` the codespace's own retry is written for.
+/// the token is checked before the payload is opened and atomically cleared
+/// — so a denial never touches the sealed configuration, and a machine row
+/// that does not exist yet is the `404` the codespace's own retry is written
+/// for.
 async fn serve(
     db: &Db,
     config: &ApiConfig,
@@ -252,7 +271,12 @@ async fn serve(
             ApiError::ProviderAccountNotFound => ApiError::CodespacesBootstrapDenied,
             other => other,
         })?;
-    let ProviderCredentials::Codespaces { env_repo, .. } = account.credentials() else {
+    let ProviderCredentials::Codespaces {
+        token: account_token,
+        env_repo,
+        ..
+    } = account.credentials()
+    else {
         return Err(ApiError::CorruptRecord(
             "a codespaces machine is provisioned through a non-codespaces account",
         ));
@@ -261,18 +285,42 @@ async fn serve(
         ApiError::CorruptRecord("this account's environment repository is not owner/name")
     })?;
 
-    // The authentication of this endpoint, in full: GitHub answers whether
-    // the presented token can read the private environment repository this
-    // account provisions on. A codespace's injected `GITHUB_TOKEN` is
-    // scoped to exactly that repository; anything else's is not, and a
-    // 404/401/403 from the lookup is a denial rather than GitHub's outage.
-    github
-        .get_repo(
-            &GithubToken {
-                access_token: access_token.to_owned(),
-            },
-            &slug,
-        )
+    // Reject classic OAuth tokens (including the linked account's own token
+    // and sibling sessions' `github.token` values) and PATs before calling
+    // GitHub: a codespace's injected `GITHUB_TOKEN` is a codespace-scoped
+    // user-to-server token, never a user OAuth credential.
+    if is_disallowed_bootstrap_token(access_token) || access_token == account_token.as_str() {
+        return Err(ApiError::CodespacesBootstrapDenied);
+    }
+
+    let presented = GithubToken {
+        access_token: access_token.to_owned(),
+    };
+
+    // Verify caller identity and token scope:
+    // 1. Classic OAuth tokens and PATs carry `X-OAuth-Scopes` (`scopes: Some`);
+    //    codespace-injected `ghu_` tokens carry none (`scopes: None`).
+    // 2. The caller must be the owner of `env_repo`, blocking collaborators or
+    //    shared readers of `env_repo` from bootstrapping another user's machine.
+    let identity = github
+        .current_user(&presented)
+        .await
+        .map_err(|error| match error {
+            GithubError::Status {
+                call: GithubCall::UserProfile,
+                status: 401 | 403 | 404,
+                ..
+            } => ApiError::CodespacesBootstrapDenied,
+            other => ApiError::from(other),
+        })?;
+    if identity.scopes.is_some() || !identity.user.login.eq_ignore_ascii_case(slug.owner()) {
+        return Err(ApiError::CodespacesBootstrapDenied);
+    }
+
+    // Verify the presented token can read the private environment repository
+    // this account provisions on, and that the repository is still private.
+    let repo = github
+        .get_repo(&presented, &slug)
         .await
         .map_err(|error| match error {
             GithubError::Status {
@@ -282,14 +330,34 @@ async fn serve(
             } => ApiError::CodespacesBootstrapDenied,
             other => ApiError::from(other),
         })?;
+    if !repo.private {
+        return Err(ApiError::CodespacesBootstrapDenied);
+    }
 
     let Some(sealed) = row.bootstrap_enc else {
         return Err(ApiError::MachineNotReady);
     };
     let config_toml = config.token_cipher().open(&sealed)?;
+
+    // Consume `bootstrap_enc` atomically on first delivery so sibling sessions
+    // or later callers can never replay `/bootstrap` for a live `flycod.toml`.
+    // Comparing against the exact sealed ciphertext ensures at most one
+    // concurrent caller wins the delivery.
+    let machine = row.machine;
+    let consumed = sql!(
+        db,
+        "UPDATE machines SET bootstrap_enc = NULL \
+         WHERE id = {machine} AND bootstrap_enc = {sealed}"
+    )
+    .execute()
+    .await?;
+    if consumed.rows_written == 0 {
+        return Err(ApiError::MachineNotReady);
+    }
+
     tracing::info!(
         codespace = codespace_name,
-        "served a codespace its configuration"
+        "served and consumed a codespace bootstrap configuration"
     );
     Ok(CodespacesBootstrap { config_toml })
 }

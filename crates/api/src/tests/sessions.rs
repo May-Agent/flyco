@@ -3133,6 +3133,141 @@ async fn a_failed_create_releases_its_key_for_retry(ctx: TestContext, kv: Kv, db
 }
 
 #[skyzen::test]
+async fn an_idempotency_key_rejects_mismatched_payloads_expires_and_prunes(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+) {
+    let router = migrated_router(&db).await;
+    let caller = sign_in(&kv, &db, seed_user(&db).await).await;
+    let client = ctx.client(router);
+
+    let first = client
+        .post("/v1/sessions")
+        .bearer(&caller.token)
+        .header("idempotency-key", "payload-checked-key")
+        .json(&open(&caller, REPO, 10))
+        .send()
+        .await;
+    first.assert_status(201);
+    let first_id = first.json::<SessionDetail>().summary.id;
+
+    // Reusing the same key with a different payload within TTL is refused.
+    let mut altered = open(&caller, REPO, 10);
+    altered.prompt = "A completely different task".to_owned();
+    let mismatch = client
+        .post("/v1/sessions")
+        .bearer(&caller.token)
+        .header("idempotency-key", "payload-checked-key")
+        .json(&altered)
+        .send()
+        .await;
+    mismatch.assert_status(422);
+    assert_eq!(
+        mismatch.json::<Problem>().kind,
+        "https://flyco.dev/problems/idempotency-payload-mismatch"
+    );
+
+    // Once the committed key ages past TTL_SECONDS, reusing it creates a fresh
+    // session instead of replaying forever.
+    let expired_at = crate::clock::now_unix().saturating_sub(crate::idempotency::TTL_SECONDS + 10);
+    skyzen::sql!(
+        db,
+        "UPDATE idempotency_keys SET created_at_unix = {expired_at} \
+         WHERE key = 'payload-checked-key'"
+    )
+    .execute()
+    .await
+    .expect("age committed key");
+
+    let renewed = client
+        .post("/v1/sessions")
+        .bearer(&caller.token)
+        .header("idempotency-key", "payload-checked-key")
+        .json(&altered)
+        .send()
+        .await;
+    renewed.assert_status(201);
+    assert_ne!(
+        renewed.json::<SessionDetail>().summary.id,
+        first_id,
+        "an expired committed key must open a fresh session"
+    );
+
+    // `prune_expired` deletes only rows past TTL_SECONDS.
+    let fresh_key = "fresh-prune-key";
+    let user_id = caller.user.id;
+    skyzen::sql!(
+        db,
+        "INSERT INTO idempotency_keys (user_id, key, request_hash, created_at_unix) \
+         VALUES ({user_id}, {fresh_key}, 'abc', {crate::clock::now_unix()})"
+    )
+    .execute()
+    .await
+    .expect("insert fresh key");
+    let stale_key = "stale-prune-key";
+    skyzen::sql!(
+        db,
+        "INSERT INTO idempotency_keys (user_id, key, request_hash, created_at_unix) \
+         VALUES ({user_id}, {stale_key}, 'def', {expired_at})"
+    )
+    .execute()
+    .await
+    .expect("insert stale key");
+
+    let pruned = crate::idempotency::prune_expired(&db, crate::clock::now_unix())
+        .await
+        .expect("prune expired idempotency keys");
+    assert_eq!(pruned, 1);
+    let remaining: u64 = skyzen::sql!(
+        db,
+        "SELECT COUNT(*) FROM idempotency_keys WHERE key = {stale_key}"
+    )
+    .fetch_scalar()
+    .await
+    .expect("count stale key");
+    assert_eq!(remaining, 0);
+}
+
+#[skyzen::test]
+async fn machine_reserve_failure_marks_the_new_session_failed(ctx: TestContext, kv: Kv, db: Db) {
+    let router = migrated_router(&db).await;
+    let caller = sign_in(&kv, &db, seed_user(&db).await).await;
+    let client = ctx.client(router);
+
+    // Force `machines::reserve` to fail after `sessions::create` succeeds.
+    db.query(
+        "CREATE TRIGGER fail_machine_reserve BEFORE INSERT ON machines \
+         BEGIN SELECT RAISE(ABORT, 'simulated reserve failure'); END;",
+    )
+    .execute()
+    .await
+    .expect("install reserve failure trigger");
+
+    client
+        .post("/v1/sessions")
+        .bearer(&caller.token)
+        .header("idempotency-key", "reserve-failure-key")
+        .json(&open(&caller, REPO, 10))
+        .send()
+        .await
+        .assert_status(500);
+
+    let listed: Vec<SessionSummary> = client
+        .get("/v1/sessions")
+        .bearer(&caller.token)
+        .send()
+        .await
+        .json();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed[0].state,
+        SessionState::Failed,
+        "a failed machines::reserve must transition the session to Failed instead of leaving an orphan Provisioning row"
+    );
+}
+
+#[skyzen::test]
 async fn a_create_carries_the_permission_mode_it_named(ctx: TestContext, kv: Kv, db: Db) {
     let router = migrated_router(&db).await;
     let caller = sign_in(&kv, &db, seed_user(&db).await).await;

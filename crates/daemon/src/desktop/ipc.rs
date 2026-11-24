@@ -21,15 +21,26 @@ use flyco_core::wire::DesktopInputEvent;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use serde::{Deserialize, Serialize};
 
-/// How long a served connection may hold the supervisor's attention.
+/// How long a served connection may hold the supervisor's attention while
+/// reading the request line.
 ///
 /// A request is a line of JSON and the reply is computed in memory — a
 /// client that cannot finish inside this is hung, not slow, and the
 /// socket's next caller should not queue behind it.
 const SERVICE_DEADLINE: Duration = Duration::from_millis(250);
 
+/// How long a reply write may wait for the peer to drain the socket buffer.
+///
+/// Large base64 PNG screenshots exceed the kernel's non-blocking Unix socket
+/// buffer and require polling for writability; this bounds how long a wedged
+/// peer can stall the desktop supervisor.
+const REPLY_WRITE_DEADLINE: Duration = Duration::from_secs(2);
+
 /// The largest request the socket reads — one batched input burst.
 const REQUEST_CAP: usize = 256 * 1024;
+
+/// The largest reply [`ask_blocking`] reads — a base64-encoded PNG screenshot.
+const REPLY_CAP: usize = 16 * 1024 * 1024;
 
 /// The path the MCP process finds the desktop socket at.
 ///
@@ -235,10 +246,62 @@ impl Listener {
         let acted = !matches!(reply, AgentReply::Refused { .. });
         if let Ok(mut encoded) = serde_json::to_vec(&reply) {
             encoded.push(b'\n');
-            let _ = stream.write_all(&encoded);
+            let deadline = std::time::Instant::now() + REPLY_WRITE_DEADLINE;
+            if let Err(error) = write_nonblocking(&mut stream, &encoded, deadline) {
+                tracing::warn!(%error, bytes = encoded.len(), "desktop IPC reply was not fully written");
+            }
         }
         acted
     }
+}
+
+/// Writes `bytes` to a non-blocking Unix stream, polling for writability until
+/// `deadline` so large replies (such as base64 PNG screenshots) are not
+/// truncated on `WouldBlock`.
+fn write_nonblocking(
+    stream: &mut UnixStream,
+    mut remaining: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    while !remaining.is_empty() {
+        match stream.write(remaining) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "desktop IPC peer closed before reading the full reply",
+                ));
+            }
+            Ok(written) => remaining = &remaining[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "desktop IPC reply write timed out",
+                    ));
+                }
+                let wait = deadline.saturating_duration_since(now);
+                let timeout = Timespec {
+                    tv_sec: i64::try_from(wait.as_secs()).unwrap_or(i64::MAX),
+                    tv_nsec: i64::from(wait.subsec_nanos()),
+                };
+                let mut fds = [PollFd::new(stream, PollFlags::OUT)];
+                match rustix::event::poll(&mut fds, Some(&timeout)) {
+                    Ok(0) => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "desktop IPC reply write timed out",
+                        ));
+                    }
+                    Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                    Err(errno) => return Err(std::io::Error::from(errno)),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Listener {
@@ -319,7 +382,7 @@ pub fn ask_blocking(path: &Path, request: &AgentRequest) -> Result<AgentReply, I
                 if reply.contains(&b'\n') {
                     break;
                 }
-                if reply.len() > REQUEST_CAP {
+                if reply.len() > REPLY_CAP {
                     return Err(IpcError::Reply("the reply ran past its cap".to_owned()));
                 }
             }
@@ -332,4 +395,71 @@ pub fn ask_blocking(path: &Path, request: &AgentRequest) -> Result<AgentReply, I
         .unwrap_or(reply.len());
     serde_json::from_slice(&reply[..end])
         .map_err(|error| IpcError::Reply(format!("the reply did not parse: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentReply, AgentRequest, Listener, ask, ask_blocking};
+
+    #[tokio::test]
+    async fn large_screenshot_replies_are_not_truncated_on_would_block() {
+        let path = std::env::temp_dir().join(format!("fi-{:08x}.s", rand::random::<u32>()));
+        let mut listener = Listener::bind(&path).expect("bind desktop ipc socket");
+        // ~1.5 MiB base64 payload — far larger than a Unix socket's non-blocking send buffer.
+        let payload = "A".repeat(1_500_000);
+        let expected = payload.clone();
+
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if listener.service(|request| {
+                    assert!(matches!(request, AgentRequest::Screenshot));
+                    AgentReply::Screenshot {
+                        png_base64: payload.clone(),
+                    }
+                }) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("listener did not receive screenshot request");
+        });
+
+        let reply = ask(&path, &AgentRequest::Screenshot)
+            .await
+            .expect("full screenshot reply");
+        server.join().expect("server thread finished");
+        match reply {
+            AgentReply::Screenshot { png_base64 } => assert_eq!(png_base64, expected),
+            other => panic!("expected screenshot reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blocking_client_reads_large_screenshot_replies() {
+        let path = std::env::temp_dir().join(format!("fb-{:08x}.s", rand::random::<u32>()));
+        let mut listener = Listener::bind(&path).expect("bind desktop ipc socket");
+        let payload = "B".repeat(512 * 1024);
+        let expected = payload.clone();
+
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                if listener.service(|_| AgentReply::Screenshot {
+                    png_base64: payload.clone(),
+                }) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("listener did not receive request");
+        });
+
+        let reply = ask_blocking(&path, &AgentRequest::Screenshot).expect("blocking reply");
+        server.join().expect("server thread finished");
+        match reply {
+            AgentReply::Screenshot { png_base64 } => assert_eq!(png_base64, expected),
+            other => panic!("expected screenshot reply, got {other:?}"),
+        }
+    }
 }

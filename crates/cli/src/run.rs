@@ -88,7 +88,7 @@ pub async fn run(
     // session releases the environment anyway, but `--stop` alone must
     // leave the session resumable.
     if archive {
-        api.post::<serde_json::Value, serde_json::Value>(
+        api.post_json_empty(
             &format!("/v1/sessions/{id}/archive"),
             &serde_json::json!({}),
         )

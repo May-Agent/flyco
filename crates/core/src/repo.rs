@@ -22,10 +22,24 @@ const MAX_SEGMENT: usize = 100;
 pub const MAX_SESSION_REPOS: usize = 16;
 
 /// A GitHub repository in `owner/name` form.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, utoipa::ToSchema)]
+#[serde(try_from = "String")]
 #[schema(value_type = String, description = "GitHub repository in `owner/name` form")]
 pub struct RepoSlug(String);
+
+impl Serialize for RepoSlug {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for RepoSlug {
+    type Error = RepoSlugError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
 
 /// Why a string is not a repository slug.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -44,6 +58,7 @@ fn valid_segment(segment: &str) -> bool {
         && segment.len() <= MAX_SEGMENT
         && segment != "."
         && segment != ".."
+        && !segment.eq_ignore_ascii_case(".git")
         && segment
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
@@ -112,10 +127,24 @@ const MAX_BRANCH: usize = 255;
 /// clone --branch`, and a name git would refuse is a machine that boots and
 /// then fails its checkout minutes later. Parsing it at the edge moves that
 /// refusal to where the user typed it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(transparent)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, utoipa::ToSchema)]
+#[serde(try_from = "String")]
 #[schema(value_type = String, description = "Git branch name")]
 pub struct BranchName(String);
+
+impl Serialize for BranchName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for BranchName {
+    type Error = BranchNameError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
 
 /// Why a string is not a branch name.
 ///
@@ -266,7 +295,7 @@ pub struct RepoSelection {
 /// it.
 pub fn checkout_dir(slug: &RepoSlug, taken: &mut BTreeSet<String>) -> String {
     let mut candidate = slug.name().to_owned();
-    if taken.contains(&candidate) {
+    if taken.contains(&candidate) || candidate.eq_ignore_ascii_case(".git") {
         candidate = format!("{}--{}", slug.owner(), slug.name());
         for suffix in 2.. {
             if !taken.contains(&candidate) {
@@ -496,5 +525,46 @@ mod tests {
         let dir = checkout_dir(&slug, &mut taken);
         assert_eq!(dir, "r.ep");
         assert!(!dir.contains('/'));
+    }
+
+    #[test]
+    fn dot_git_is_rejected_as_a_slug_segment() {
+        for candidate in ["owner/.git", "owner/.GIT", ".git/repo"] {
+            assert!(
+                candidate.parse::<RepoSlug>().is_err(),
+                "`{candidate}` must be rejected"
+            );
+            let json = serde_json::to_string(candidate).expect("serialize");
+            assert!(
+                serde_json::from_str::<RepoSlug>(&json).is_err(),
+                "`{candidate}` must be rejected during deserialization"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_slugs_and_branches_are_rejected_by_serde() {
+        for bad_slug in ["flyco", "a/b/c", "", "/", "owner/..", "owner name/repo"] {
+            let json = serde_json::to_string(bad_slug).expect("serialize");
+            assert!(
+                serde_json::from_str::<RepoSlug>(&json).is_err(),
+                "serde must reject invalid RepoSlug `{bad_slug}`"
+            );
+        }
+        for bad_branch in [
+            "",
+            "--upload-pack=evil",
+            "a..b",
+            "wip.lock",
+            ".hidden",
+            "a b",
+            "trailing/",
+        ] {
+            let json = serde_json::to_string(bad_branch).expect("serialize");
+            assert!(
+                serde_json::from_str::<super::BranchName>(&json).is_err(),
+                "serde must reject invalid BranchName `{bad_branch}`"
+            );
+        }
     }
 }

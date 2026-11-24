@@ -164,9 +164,16 @@ impl PublishFlycod {
         // The image before the bucket: a push the registry refuses (no
         // login, no `write:packages`) stops the publish before a single
         // object has changed under the machines already installing from it.
+        let wire_mismatch = publishing != deployed;
         let stage_dir = self.channel.stage_dir(&workspace.target);
-        let tags = self.channel.image_tags(publishing);
-        let build = Invocation::image_build(self.channel, &stage_dir, publishing, !self.dry_run);
+        let tags = self.channel.image_tags(publishing, wire_mismatch);
+        let build = Invocation::image_build(
+            self.channel,
+            &stage_dir,
+            publishing,
+            wire_mismatch,
+            !self.dry_run,
+        );
         run_to_completion(&build, &workspace.root)
             .await
             .with_context(|| {
@@ -191,13 +198,12 @@ impl PublishFlycod {
             info!(image = %tag, "pushed and read back");
         }
 
-        for object in release.objects() {
-            let upload = Invocation::upload(release.channel, object);
+        for (key, upload) in release.upload_invocations() {
             run_to_completion(&upload, &workspace.root).await?;
-            info!(key = release.channel.key(&object.published), "uploaded");
+            info!(key = %key, "uploaded");
         }
 
-        verify(&release).await
+        verify(&release, &workspace.root, wire_mismatch).await
     }
 }
 
@@ -337,14 +343,15 @@ async fn stage(channel: Channel, workspace: &Workspace) -> Result<Release> {
     })
 }
 
-/// Reads back what the control plane serves and fails on any difference.
+/// Reads back what the control plane (or R2 directly under `--allow-wire-mismatch`)
+/// serves and fails on any difference.
 ///
 /// This is the only check that covers the whole path — build, checksum,
 /// upload, bucket, Worker allowlist, media type — so a publish is not
-/// finished until it passes. The binaries themselves are not downloaded
-/// again: they are tens of megabytes, and the checksum objects read back here
-/// are what a machine trusts them by.
-async fn verify(release: &Release) -> Result<()> {
+/// finished until it passes. When `--allow-wire-mismatch` publishes ahead of
+/// a Worker deploy, the old Worker still serves the old wire protocol, so
+/// objects are read back directly from R2 instead.
+async fn verify(release: &Release, directory: &Path, wire_mismatch: bool) -> Result<()> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("reading the clock")?
@@ -354,6 +361,30 @@ async fn verify(release: &Release) -> Result<()> {
         let expected = fs::read_to_string(&object.file)
             .await
             .with_context(|| format!("reading {}", object.file.display()))?;
+        if wire_mismatch {
+            let get = Invocation::r2_get(release.channel, object);
+            let output = tokio::process::Command::from({
+                let mut command = get.command();
+                command.current_dir(directory);
+                command
+            })
+            .output()
+            .await
+            .with_context(|| format!("spawning `{get}`"))?;
+            ensure!(output.status.success(), "`{get}` failed: {}", output.status);
+            let served = String::from_utf8(output.stdout)
+                .with_context(|| format!("`{get}` returned non-UTF-8 text"))?;
+            ensure!(
+                served == expected,
+                "R2 {} holds {served:?}, this publish staged {expected:?}",
+                release.channel.bucket_key(&object.published)
+            );
+            info!(
+                object = object.name(),
+                "verified directly in R2 (wire mismatch)"
+            );
+            continue;
+        }
         let url = release.channel.verification_url(object.name(), nonce);
         let response = zenwave::get(url.as_str())
             .await

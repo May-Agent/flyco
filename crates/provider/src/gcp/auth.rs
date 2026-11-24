@@ -110,9 +110,30 @@ pub struct ServiceAccountKey {
     pub token_uri: String,
 }
 
+/// Official Google `OAuth2` token endpoints accepted in a service-account key.
+///
+/// Restricting `token_uri` to this allowlist prevents an untrusted key JSON
+/// from turning credential verification into an authenticated SSRF request.
+const ALLOWED_TOKEN_URIS: [&str; 3] = [
+    "https://oauth2.googleapis.com/token",
+    "https://www.googleapis.com/oauth2/v4/token",
+    "https://accounts.google.com/o/oauth2/token",
+];
+
 /// Where Google issues tokens, for a key that names no endpoint.
 fn default_token_uri() -> String {
-    "https://oauth2.googleapis.com/token".to_owned()
+    ALLOWED_TOKEN_URIS[0].to_owned()
+}
+
+/// Validates that `uri` is one of Google's official `OAuth2` token endpoints.
+fn validate_token_uri(uri: &str) -> Result<(), ProviderError> {
+    if ALLOWED_TOKEN_URIS.contains(&uri) {
+        Ok(())
+    } else {
+        Err(ProviderError::Malformed(
+            "the service-account key's token_uri must be a Google OAuth2 token endpoint",
+        ))
+    }
 }
 
 impl fmt::Debug for ServiceAccountKey {
@@ -132,15 +153,17 @@ impl ServiceAccountKey {
     /// # Errors
     ///
     /// Returns [`ProviderError::Malformed`] if the document is not a service
-    /// account key — which is a credential to fix rather than a failure to
-    /// retry.
+    /// account key or names a non-Google `token_uri` — both are credentials to
+    /// fix rather than failures to retry.
     pub fn parse(document: &str) -> Result<Self, ProviderError> {
-        serde_json::from_str(document).map_err(|_| {
+        let key: Self = serde_json::from_str(document).map_err(|_| {
             ProviderError::Malformed(
                 "this is not a Google service-account key: it needs project_id, client_email \
                  and private_key",
             )
-        })
+        })?;
+        validate_token_uri(&key.token_uri)?;
+        Ok(key)
     }
 
     /// The signed assertion that proves possession of the private key.
@@ -186,6 +209,18 @@ impl ServiceAccountKey {
             encoder.encode(signature.to_bytes())
         ))
     }
+}
+
+/// Structured `OAuth2` error fields returned by Google's token endpoint.
+///
+/// Only these fields are surfaced in errors so raw non-OAuth response bodies
+/// are never reflected back to callers.
+#[derive(Debug, Deserialize)]
+struct OAuthError {
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    error_description: Option<String>,
 }
 
 /// What the token endpoint answers with.
@@ -263,19 +298,25 @@ impl TokenCache {
             return Ok(cached.value.clone());
         }
 
+        validate_token_uri(&self.key.token_uri)?;
         let assertion = self.key.assertion(wall_clock.unix_seconds())?;
         let request = HttpRequest::new(Method::Post, self.key.token_uri.clone())
             .form_body(&[("grant_type", GRANT_TYPE), ("assertion", &assertion)]);
 
         let response = transport.send(request).await?;
         if !response.is_success() {
-            // The body of a token failure names what is wrong with the
-            // assertion — a clock skew, a revoked key, a disabled account —
-            // and is the only way to tell them apart without guessing.
+            // Surface only structured OAuth2 error fields so an unexpected
+            // non-OAuth body is never reflected back to the caller.
+            if let Ok(oauth) = response.json::<OAuthError>()
+                && (oauth.error.is_some() || oauth.error_description.is_some())
+            {
+                let code = oauth.error.unwrap_or_default();
+                let message = oauth.error_description.unwrap_or_default();
+                return Err(ProviderError::Refused { code, message });
+            }
             return Err(ProviderError::Rejected(format!(
-                "Google refused the service account (HTTP {}): {}",
-                response.status,
-                response.body_text()
+                "Google refused the service account (HTTP {})",
+                response.status
             )));
         }
 
@@ -532,5 +573,48 @@ mod tests {
         assert!(!rendered.contains("BEGIN PRIVATE KEY"));
         assert!(!format!("{:?}", TokenCache::new(key())).contains("BEGIN PRIVATE KEY"));
         assert!(rendered.contains("flyco-sessions"));
+    }
+
+    #[test]
+    fn a_key_with_a_non_google_token_uri_is_refused() {
+        for uri in [
+            "http://169.254.169.254/latest/meta-data/",
+            "https://evil.example/token",
+            "https://oauth2.googleapis.com/token?extra=1",
+            "https://oauth2.googleapis.com.evil.test/token",
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(KEY).expect("fixture parses");
+            value["token_uri"] = serde_json::Value::String(uri.to_owned());
+            let err = ServiceAccountKey::parse(&value.to_string())
+                .expect_err("non-Google token_uri must be rejected");
+            assert!(
+                matches!(err, crate::ProviderError::Malformed(_)),
+                "{uri}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_oauth_error_body_is_never_reflected() {
+        let transport = RecordedTransport::new(vec![HttpResponse::new(
+            502,
+            b"<html>internal-secret-metadata</html>".to_vec(),
+        )]);
+        let mut cache = TokenCache::new(key());
+
+        let error = cache
+            .access_token(
+                &transport,
+                &ManualClock::new(),
+                &ManualWallClock::at(SIGNED_AT),
+            )
+            .await
+            .expect_err("502 must fail");
+        let text = error.to_string();
+        assert!(text.contains("502"), "{text}");
+        assert!(
+            !text.contains("internal-secret-metadata"),
+            "raw response body must never be reflected: {text}"
+        );
     }
 }

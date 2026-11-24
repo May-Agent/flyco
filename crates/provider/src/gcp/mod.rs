@@ -87,15 +87,33 @@ use flyco_core::machine::{
     MachinePricing, MachineSpec, MachineState, OsFamily, Runtime, StoragePricing,
 };
 
-use core::future::Future;
+use serde::{Deserialize, Serialize};
 
 use crate::clock::{MonotonicClock, SystemClock, SystemTimer, SystemWallClock, Timer, WallClock};
 use crate::http::{HttpRequest, HttpResponse, HttpTransport, Method};
-use crate::polling::{MAX_POLL_ATTEMPTS, poll_delay};
+use crate::polling::{MAX_POLL_ATTEMPTS, POLLS_PER_INVOCATION, PageCursor, poll_delay};
 use crate::{
     CapacityMode, CloudProvider, Continuation, LiveTransport, Machine, ProviderError,
     ProvisionRequest, Provisioning, cloud_init, flycod,
 };
+
+/// Where a GCP provision got to when its invocation poll budget ran out.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum GcpContinuation {
+    /// A Compute Engine `instances.insert` operation still in progress.
+    Instance {
+        operation_url: String,
+        zone: String,
+        capacity_mode: CapacityMode,
+    },
+    /// A Cloud Run job creation operation still in progress.
+    CloudRunJob {
+        operation_url: String,
+        region: String,
+        job: String,
+    },
+}
 
 use auth::{ServiceAccountKey, TokenCache};
 use compute::Operation;
@@ -448,25 +466,40 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
         self.await_operation(operation).await
     }
 
+    /// Sends a `DELETE` request where `404` means the resource is already gone,
+    /// otherwise following the returned operation to `DONE`.
+    async fn delete_and_await(&mut self, url: String) -> Result<(), ProviderError> {
+        let response = self.send(HttpRequest::new(Method::Delete, url)).await?;
+        if response.status == 404 {
+            return Ok(());
+        }
+        if !response.is_success() {
+            return Err(compute::refusal(&response));
+        }
+        let operation: Operation = response.json()?;
+        self.await_operation(operation).await
+    }
+
     /// A `POST` with no body, which is what the lifecycle actions are.
     async fn post_action(&mut self, url: String) -> Result<(), ProviderError> {
         self.send_and_await(HttpRequest::new(Method::Post, url))
             .await
     }
 
-    /// Follows an asynchronous operation to a terminal state.
+    /// Follows an asynchronous operation for up to `budget` polls.
     ///
-    /// The terminal set is exactly `{DONE}`; anything else means keep
-    /// polling, including in-flight values the service invents. And a `DONE`
-    /// operation is **not** a successful one — the failure is reported
-    /// inside the finished operation, so the status alone is never the
-    /// answer.
-    async fn await_operation(&mut self, started: Operation) -> Result<(), ProviderError> {
+    /// Returns `Ok(None)` when `DONE` without error, or `Ok(Some(poll_url))`
+    /// when still running after `budget` polls.
+    async fn follow_operation(
+        &mut self,
+        started: Operation,
+        budget: usize,
+    ) -> Result<Option<String>, ProviderError> {
         let mut operation = started;
 
-        for attempt in 0..MAX_POLL_ATTEMPTS {
+        for attempt in 0..budget {
             if operation.state().is_terminal() {
-                return operation.failure().map_or(Ok(()), Err);
+                return operation.failure().map_or(Ok(None), Err);
             }
 
             let url = operation.self_link.clone().ok_or(ProviderError::Malformed(
@@ -478,9 +511,33 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
             operation = self.get(url).await?;
         }
 
-        Err(ProviderError::Rejected(format!(
-            "a Compute Engine operation was still running after {MAX_POLL_ATTEMPTS} polls"
-        )))
+        if operation.state().is_terminal() {
+            return operation.failure().map_or(Ok(None), Err);
+        }
+        let url = operation.self_link.ok_or(ProviderError::Malformed(
+            "Compute Engine started an operation without naming a URL to follow it on",
+        ))?;
+        Ok(Some(url))
+    }
+
+    /// Follows an asynchronous operation to a terminal state.
+    ///
+    /// The terminal set is exactly `{DONE}`; anything else means keep
+    /// polling, including in-flight values the service invents. And a `DONE`
+    /// operation is **not** a successful one — the failure is reported
+    /// inside the finished operation, so the status alone is never the
+    /// answer.
+    async fn await_operation(&mut self, started: Operation) -> Result<(), ProviderError> {
+        if self
+            .follow_operation(started, MAX_POLL_ATTEMPTS)
+            .await?
+            .is_some()
+        {
+            return Err(ProviderError::Rejected(format!(
+                "a Compute Engine operation was still running after {MAX_POLL_ATTEMPTS} polls"
+            )));
+        }
+        Ok(())
     }
 
     /// Every machine type one zone offers.
@@ -491,6 +548,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
         let base = compute::zone_url(self.project(), zone, "machineTypes");
         let mut next: Option<String> = None;
         let mut collected = Vec::new();
+        let mut cursor = PageCursor::new();
 
         loop {
             let url = next.as_ref().map_or_else(
@@ -505,11 +563,39 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
 
             let page: compute::MachineTypePage = self.get(url).await?;
             collected.extend(page.items);
-            next = page.next_page_token.filter(|token| !token.is_empty());
+            next = cursor.advance(page.next_page_token, "Compute Engine machine types")?;
             if next.is_none() {
                 return Ok(collected);
             }
         }
+    }
+
+    /// Walks the Cloud Billing SKU catalog through [`Self::send`] (so `401`
+    /// triggers a token refresh and retry) and caches all regions at once.
+    async fn region_rates(&mut self, region: &str) -> Result<pricing::RegionRates, ProviderError> {
+        if let Some(rates) = self.prices.cached_region(&self.clock, region) {
+            return Ok(rates);
+        }
+
+        let mut collected = Vec::new();
+        let mut next: Option<String> = None;
+        let mut cursor = PageCursor::new();
+
+        loop {
+            let url = PriceCatalog::skus_url(next.as_deref());
+            let page: pricing::SkuPage = self.get(url).await?;
+            collected.extend(page.skus);
+            next = cursor.advance(page.next_page_token, "GCP Cloud Billing SKUs")?;
+            if next.is_none() {
+                break;
+            }
+        }
+
+        self.prices.store_skus(&self.clock, &collected)?;
+        Ok(self
+            .prices
+            .cached_region(&self.clock, region)
+            .unwrap_or_default())
     }
 
     /// One region's own answer: whether it is up, and what its quotas are.
@@ -651,27 +737,33 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
 
     /// Creates the instance, falling back to on-demand when spot is refused.
     ///
-    /// The fallback re-checks quota, because the two markets are funded from
-    /// different pools: a machine the preemptible pool could afford may have
-    /// no `CPUS` headroom at all, and re-sending it would trade a clear
-    /// refusal for an opaque one.
+    /// Follows the operation for at most [`POLLS_PER_INVOCATION`] polls so one
+    /// Worker invocation stays inside its subrequest budget; returns
+    /// `(capacity_mode, Some(operation_url))` when still in progress.
     async fn create_instance(
         &mut self,
         zone: &str,
         body: compute::Instance,
         vcpus: u32,
         quotas: &Quotas,
-    ) -> Result<CapacityMode, ProviderError> {
+    ) -> Result<(CapacityMode, Option<String>), ProviderError> {
         let url = compute::zone_url(self.project(), zone, "instances");
         let asked_for_spot = body.is_spot();
 
-        let attempt = self
-            .send_and_await(HttpRequest::new(Method::Post, url.clone()).json_body(&body)?)
-            .await;
+        let attempt = async {
+            let operation: Operation = self
+                .fetch(
+                    HttpRequest::new(Method::Post, url.clone()).json_body(&body)?,
+                    compute::refusal,
+                )
+                .await?;
+            self.follow_operation(operation, POLLS_PER_INVOCATION).await
+        }
+        .await;
 
         match attempt {
-            Ok(()) if asked_for_spot => Ok(CapacityMode::Spot),
-            Ok(()) => Ok(CapacityMode::OnDemand),
+            Ok(pending) if asked_for_spot => Ok((CapacityMode::Spot, pending)),
+            Ok(pending) => Ok((CapacityMode::OnDemand, pending)),
             Err(error) if asked_for_spot && spot_unsupported(&error) => {
                 let region = compute::region_of(zone)?;
                 quotas.require_capacity_for(vcpus, &region, CapacityMode::OnDemand)?;
@@ -680,9 +772,16 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
                     "Compute Engine refused spot capacity; retrying the same machine on-demand"
                 );
                 let on_demand = body.without_spot();
-                self.send_and_await(HttpRequest::new(Method::Post, url).json_body(&on_demand)?)
+                let operation: Operation = self
+                    .fetch(
+                        HttpRequest::new(Method::Post, url).json_body(&on_demand)?,
+                        compute::refusal,
+                    )
                     .await?;
-                Ok(CapacityMode::OnDemand)
+                let pending = self
+                    .follow_operation(operation, POLLS_PER_INVOCATION)
+                    .await?;
+                Ok((CapacityMode::OnDemand, pending))
             }
             Err(error) => Err(error),
         }
@@ -721,15 +820,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
 
         let machine_types = self.list_machine_types(zone).await?;
         let quotas = Quotas::from_region(&info);
-        let token = self
-            .tokens
-            .access_token(&self.transport, &self.clock, &self.wall_clock)
-            .await?;
-        let rates = self
-            .prices
-            .region_rates(&self.transport, &self.clock, &token, &region)
-            .await?
-            .clone();
+        let rates = self.region_rates(&region).await?;
 
         let mut report = ZoneReport {
             zone: zone.to_owned(),
@@ -834,6 +925,54 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
             .access_token(&self.transport, &self.clock, &self.wall_clock)
             .await
     }
+    /// The zones a catalog refresh covers (one queue message per zone).
+    #[must_use]
+    pub fn catalog_regions(&self) -> Vec<String> {
+        if self.workspace.zones.is_empty() {
+            DEFAULT_CANDIDATE_ZONES
+                .iter()
+                .map(|zone| (*zone).to_owned())
+                .collect()
+        } else {
+            self.workspace.zones.clone()
+        }
+    }
+
+    /// Reads one zone's Compute Engine catalog plus its parent region's Cloud
+    /// Run entries, or a Cloud Run region's entries directly when `target` is
+    /// a Cloud Run region name rather than a zone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProviderError`] if Compute Engine or Cloud Billing refuses
+    /// any read, or if `target` is neither a valid zone nor a priced Cloud
+    /// Run region.
+    pub async fn region_catalog(
+        &mut self,
+        target: &str,
+    ) -> Result<Vec<MachineCatalogEntry>, ProviderError> {
+        if let Ok(region) = compute::region_of(target) {
+            let report = self.zone_report(target).await?;
+            tracing::debug!(
+                zone = %target,
+                offered = report.offered.len(),
+                excluded = report.excluded.len(),
+                "read a GCP zone's catalog"
+            );
+            let mut entries = report.offered;
+            if let Some(tier) = run::Tier::of(&region) {
+                entries.extend(run::catalog(&region, tier));
+            }
+            return Ok(entries);
+        }
+
+        if let Some(tier) = run::Tier::of(target) {
+            return Ok(run::catalog(target, tier));
+        }
+
+        compute::region_of(target)?;
+        Ok(Vec::new())
+    }
 }
 
 /// Whether a refusal means "the same machine, as ordinary capacity".
@@ -844,31 +983,11 @@ pub fn spot_unsupported(error: &ProviderError) -> bool {
         .is_some_and(|code| SPOT_UNSUPPORTED_CODES.contains(&code))
 }
 
-impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T, C, K, W> {
-    /// A virtual machine on Compute Engine, or a container on Cloud Run.
-    async fn provision_one(
-        &mut self,
-        request: &ProvisionRequest,
-    ) -> Result<Machine, ProviderError> {
-        match request.spec.runtime {
-            Runtime::Vm => self.provision_instance(request).await,
-            Runtime::Container => self.provision_job(request).await,
-        }
-    }
-}
-
 impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> CloudProvider
     for GcpProvider<T, C, K, W>
 {
     async fn catalog(&mut self) -> Result<Vec<MachineCatalogEntry>, ProviderError> {
-        let zones = if self.workspace.zones.is_empty() {
-            DEFAULT_CANDIDATE_ZONES
-                .iter()
-                .map(|zone| (*zone).to_owned())
-                .collect()
-        } else {
-            self.workspace.zones.clone()
-        };
+        let zones = self.catalog_regions();
 
         let mut entries = Vec::new();
         let mut regions: Vec<String> = Vec::new();
@@ -906,17 +1025,32 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> CloudProvider
         &mut self,
         request: &ProvisionRequest,
     ) -> Result<Provisioning, ProviderError> {
-        self.provision_one(request).await.map(Provisioning::Ready)
+        match request.spec.runtime {
+            Runtime::Vm => self.provision_instance(request).await,
+            Runtime::Container => self.provision_job(request).await,
+        }
     }
 
-    fn resume(
+    async fn resume(
         &mut self,
-        _machine: &Machine,
-        _continuation: &Continuation,
-    ) -> impl Future<Output = Result<Provisioning, ProviderError>> {
-        core::future::ready(Err(ProviderError::Malformed(
-            "a Google Cloud machine is built in one call and has nothing to resume",
-        )))
+        machine: &Machine,
+        continuation: &Continuation,
+    ) -> Result<Provisioning, ProviderError> {
+        match continuation.read::<GcpContinuation>()? {
+            GcpContinuation::Instance {
+                operation_url,
+                zone,
+                capacity_mode,
+            } => {
+                self.resume_instance(machine, operation_url, zone, capacity_mode)
+                    .await
+            }
+            GcpContinuation::CloudRunJob {
+                operation_url,
+                region,
+                job,
+            } => self.resume_job(machine, operation_url, region, job).await,
+        }
     }
 
     /// Stop, `setMachineType`, start on a virtual machine; stop and start at
@@ -959,8 +1093,11 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> CloudProvider
         match machine.runtime {
             Runtime::Vm => self.destroy_instance(machine).await,
             Runtime::Container => {
-                let handle = run::Handle::parse(&machine.native_id)?;
-                self.destroy_job(machine, &handle).await
+                if let Ok(handle) = run::Handle::parse(&machine.native_id) {
+                    self.destroy_job(machine, &handle).await
+                } else {
+                    self.destroy_pending_job(machine, &machine.native_id).await
+                }
             }
         }
     }
@@ -971,7 +1108,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
     async fn provision_instance(
         &mut self,
         request: &ProvisionRequest,
-    ) -> Result<Machine, ProviderError> {
+    ) -> Result<Provisioning, ProviderError> {
         let MachineSpec {
             region: zone,
             machine_type,
@@ -987,9 +1124,28 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
         let (found, quotas) = self.deployable_type(zone, machine_type, requested).await?;
 
         let body = self.instance_body(request, &found)?;
-        let capacity_mode = self
+        let (capacity_mode, pending_op) = self
             .create_instance(zone, body, found.guest_cpus, &quotas)
             .await?;
+
+        if let Some(operation_url) = pending_op {
+            return Ok(Provisioning::Pending {
+                machine: Machine {
+                    id,
+                    native_id: self.instance_url(id, zone),
+                    runtime: Runtime::Vm,
+                    region: zone.clone(),
+                    state: MachineState::Provisioning,
+                    capacity_mode,
+                    address: None,
+                },
+                continuation: Continuation::write(&GcpContinuation::Instance {
+                    operation_url,
+                    zone: zone.clone(),
+                    capacity_mode,
+                })?,
+            });
+        }
 
         // Read back only for the address, which the insert cannot state: an
         // ephemeral external address is assigned as the instance comes up.
@@ -1003,7 +1159,7 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
             capacity = ?capacity_mode,
             "provisioned a GCP machine"
         );
-        Ok(Machine {
+        Ok(Provisioning::Ready(Machine {
             id,
             native_id: self.instance_url(id, zone),
             // Compute Engine sells this driver nothing but virtual
@@ -1014,23 +1170,113 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
             state: MachineState::Running,
             capacity_mode,
             address: described.address(),
-        })
+        }))
+    }
+
+    /// Resumes a Compute Engine `instances.insert` operation across
+    /// invocations.
+    async fn resume_instance(
+        &mut self,
+        machine: &Machine,
+        operation_url: String,
+        zone: String,
+        capacity_mode: CapacityMode,
+    ) -> Result<Provisioning, ProviderError> {
+        let current: Operation = self.get(operation_url).await?;
+        if let Some(poll_url) = self.follow_operation(current, POLLS_PER_INVOCATION).await? {
+            return Ok(Provisioning::Pending {
+                machine: machine.clone(),
+                continuation: Continuation::write(&GcpContinuation::Instance {
+                    operation_url: poll_url,
+                    zone,
+                    capacity_mode,
+                })?,
+            });
+        }
+
+        let described = self.describe_instance(machine.id, &zone).await?;
+        Ok(Provisioning::Ready(Machine {
+            id: machine.id,
+            native_id: self.instance_url(machine.id, &zone),
+            runtime: Runtime::Vm,
+            region: zone,
+            state: MachineState::Running,
+            capacity_mode,
+            address: described.address(),
+        }))
     }
 
     /// Stop, `setMachineType`, start.
     ///
     /// Always through a stop, because the machine type is settable only on a
     /// stopped instance, and the disk survives because it is a separate
-    /// resource that was never being deleted. The result is read from the
-    /// operations, never from the instance.
+    /// resource that was never being deleted. Validates CPU architecture and
+    /// quota (subtracting the running VM's own vCPUs from the same pool)
+    /// before stopping, and reads the newly assigned ephemeral IP after start.
     async fn resize_instance(
         &mut self,
         machine: &Machine,
         new_machine_type: &str,
     ) -> Result<Machine, ProviderError> {
         let zone = machine.region.clone();
-        self.deployable_type(&zone, new_machine_type, machine.capacity_mode)
-            .await?;
+        let region = compute::region_of(&zone)?;
+        let current_instance = self.describe_instance(machine.id, &zone).await?;
+
+        let info = self.read_region(&region).await?;
+        if !quotas::is_up(&info) {
+            return Err(ProviderError::Unavailable {
+                machine_type: new_machine_type.to_owned(),
+                region: zone.clone(),
+                reason: format!("Compute Engine reports {region} as {}", info.status),
+            });
+        }
+
+        let machine_types = self.list_machine_types(&zone).await?;
+        let target = machine_types
+            .iter()
+            .find(|candidate| candidate.name == new_machine_type)
+            .ok_or_else(|| ProviderError::Unavailable {
+                machine_type: new_machine_type.to_owned(),
+                region: zone.clone(),
+                reason: "this zone offers no such machine type".to_owned(),
+            })?;
+        if !target.is_offerable() {
+            return Err(ProviderError::Unavailable {
+                machine_type: new_machine_type.to_owned(),
+                region: zone.clone(),
+                reason: "Compute Engine has withdrawn this machine type".to_owned(),
+            });
+        }
+
+        let current_type = current_instance.machine_type_name().and_then(|name| {
+            machine_types
+                .iter()
+                .find(|candidate| candidate.name == name)
+        });
+        if let (Some(current_arch), Some(target_arch)) = (
+            current_type.and_then(compute::MachineType::cpu_architecture),
+            target.cpu_architecture(),
+        ) && current_arch != target_arch
+        {
+            return Err(ProviderError::Unsupported {
+                provider: PROVIDER,
+                operation: "resize",
+                reason: "a virtual machine cannot be resized across CPU architectures",
+            });
+        }
+
+        let releasing_vcpus = if current_instance.consumes_quota() {
+            current_type.map_or(0, |ty| ty.guest_cpus)
+        } else {
+            0
+        };
+        let quotas = Quotas::from_region(&info);
+        quotas.require_capacity_for_resize(
+            target.guest_cpus,
+            releasing_vcpus,
+            &region,
+            machine.capacity_mode,
+        )?;
 
         self.post_action(format!("{}/stop", self.instance_url(machine.id, &zone)))
             .await?;
@@ -1054,9 +1300,14 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
         self.post_action(format!("{}/start", self.instance_url(machine.id, &zone)))
             .await?;
 
+        // Stopping released the ephemeral external IP; read back the newly
+        // assigned address so the control plane persists it.
+        let restarted = self.describe_instance(machine.id, &zone).await?;
+
         tracing::info!(machine = %machine.id, %new_machine_type, "resized a GCP machine");
         Ok(Machine {
             state: MachineState::Running,
+            address: restarted.address(),
             ..machine.clone()
         })
     }
@@ -1088,22 +1339,18 @@ impl<T: HttpTransport, C: MonotonicClock, K: Timer, W: WallClock> GcpProvider<T,
     /// Deletes the instance and then the disk that outlived it.
     ///
     /// In that order: a disk that is still attached cannot be deleted, and
-    /// the instance's deletion is what detaches it.
+    /// the instance's deletion is what detaches it. Both deletes treat `404`
+    /// as already gone so an already-deleted instance never blocks deleting
+    /// its `autoDelete: false` boot disk.
     async fn destroy_instance(&mut self, machine: &Machine) -> Result<(), ProviderError> {
         let zone = machine.region.clone();
-        self.send_and_await(HttpRequest::new(
-            Method::Delete,
-            self.instance_url(machine.id, &zone),
-        ))
-        .await?;
+        self.delete_and_await(self.instance_url(machine.id, &zone))
+            .await?;
 
-        self.send_and_await(HttpRequest::new(
-            Method::Delete,
-            compute::zone_url(
-                self.project(),
-                &zone,
-                &format!("disks/{}", names::boot_disk(machine.id)),
-            ),
+        self.delete_and_await(compute::zone_url(
+            self.project(),
+            &zone,
+            &format!("disks/{}", names::boot_disk(machine.id)),
         ))
         .await?;
 

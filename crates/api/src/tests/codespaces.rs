@@ -29,13 +29,14 @@ use crate::session;
 use crate::testing::{
     CLIENT_ID, CLOUD_CODE, CODESPACES_ENV_REPO, GITHUB_ACCESS_TOKEN, GITHUB_ID, GITHUB_LOGIN,
     TestClaude, TestCodespaces, TestCodex, TestDevin, TestGithub, TestGoogle, TestMicrosoft,
-    migrate, seed_codespaces_account, seed_session, seed_user, test_config, test_rooms,
-    test_router_full,
+    migrate, seed_codespaces_account, seed_other_user, seed_session, seed_user, test_config,
+    test_rooms, test_router_full,
 };
 use crate::vendors::Vendors;
 use crate::{machines, sessions};
 
 const START: &str = "/v1/providers/codespaces/oauth/start";
+const EXCHANGE: &str = "/v1/providers/codespaces/oauth/exchange";
 const BOOTSTRAP: &str = "/v1/providers/codespaces/bootstrap";
 
 /// The name GitHub generates for a codespace, which `CODESPACE_NAME`
@@ -124,6 +125,13 @@ fn query(url: &Url, name: &str) -> Option<String> {
         .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
 }
 
+/// One fragment parameter of a URL.
+fn fragment_param(url: &Url, name: &str) -> Option<String> {
+    let fragment = url.fragment()?;
+    url::form_urlencoded::parse(fragment.as_bytes())
+        .find_map(|(key, value)| (key == name).then(|| value.into_owned()))
+}
+
 fn poll_path(started: &ProviderOauthStart) -> String {
     format!("/v1/providers/codespaces/oauth/{}", started.attempt_id)
 }
@@ -137,8 +145,29 @@ fn finish_path(started: &ProviderOauthStart) -> String {
 
 fn callback_path(code: &str, state: &str) -> String {
     // The shared GitHub callback — the OAuth app registers one URI per
-    // hostname and the `state` decides which flow is coming back.
+    // hostname and the `cs_` state prefix routes Codespaces returns to
+    // `/connect/return`.
     format!("/v1/auth/github/callback?code={code}&state={state}")
+}
+
+async fn exchange_ok(
+    client: &TestClient<Router>,
+    token: &str,
+    started: &ProviderOauthStart,
+    code: &str,
+) -> ProviderOauthProgress {
+    let response = client
+        .post(EXCHANGE)
+        .bearer(token)
+        .json(&serde_json::json!({
+            "attempt_id": started.attempt_id,
+            "state": state_of(started),
+            "code": code,
+        }))
+        .send()
+        .await;
+    response.assert_status(200);
+    response.json()
 }
 
 // ── The sign-in ──
@@ -174,6 +203,80 @@ async fn a_codespaces_sign_in_starts_at_github_asking_for_the_codespace_scope(
 }
 
 #[skyzen::test]
+async fn a_codespaces_callback_forwards_fragment_without_exchanging_or_allowing_cross_account_replay(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+) {
+    let (client, _user, attacker_token) = signed_in(&ctx, &kv, &db).await;
+    let started = begin(&client, &attacker_token).await;
+    let state = state_of(&started);
+
+    let response = client.get(&callback_path(CLOUD_CODE, &state)).send().await;
+    response.assert_status(303);
+    assert!(response.headers().get("set-cookie").is_none());
+    let landed = location(&response);
+    assert_eq!(landed.path(), "/connect/return");
+    assert!(landed.query().is_none());
+    assert_eq!(
+        fragment_param(&landed, "provider").as_deref(),
+        Some("codespaces")
+    );
+    assert_eq!(fragment_param(&landed, "code").as_deref(), Some(CLOUD_CODE));
+    assert_eq!(
+        fragment_param(&landed, "state").as_deref(),
+        Some(state.as_str())
+    );
+
+    // Unauthenticated GET callback leaves the attempt Pending — zero-click
+    // token theft is impossible.
+    let polled = client
+        .get(&poll_path(&started))
+        .bearer(&attacker_token)
+        .send()
+        .await;
+    polled.assert_status(200);
+    assert_eq!(
+        polled.json::<ProviderOauthProgress>(),
+        ProviderOauthProgress::Pending
+    );
+
+    // Victim attempting to exchange attacker's attempt under victim's Bearer
+    // session is rejected.
+    let victim = seed_other_user(&db).await;
+    let victim_token = session::issue(&kv, victim.id)
+        .await
+        .expect("issue victim session");
+    let replayed = client
+        .post(EXCHANGE)
+        .bearer(&victim_token)
+        .json(&serde_json::json!({
+            "attempt_id": started.attempt_id,
+            "state": state,
+            "code": CLOUD_CODE,
+        }))
+        .send()
+        .await;
+    replayed.assert_status(404);
+    assert_eq!(
+        replayed.json::<Problem>().kind,
+        "https://flyco.dev/problems/provider-oauth-attempt-expired"
+    );
+
+    // Attacker's attempt is still Pending.
+    let polled = client
+        .get(&poll_path(&started))
+        .bearer(&attacker_token)
+        .send()
+        .await;
+    polled.assert_status(200);
+    assert_eq!(
+        polled.json::<ProviderOauthProgress>(),
+        ProviderOauthProgress::Pending
+    );
+}
+
+#[skyzen::test]
 async fn a_codespaces_sign_in_reports_the_account_and_nothing_to_choose(
     ctx: TestContext,
     kv: Kv,
@@ -182,22 +285,19 @@ async fn a_codespaces_sign_in_reports_the_account_and_nothing_to_choose(
     let (client, _user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token).await;
 
-    client
-        .get(&callback_path(CLOUD_CODE, &state_of(&started)))
-        .send()
-        .await
-        .assert_status(303);
-
-    let polled = client.get(&poll_path(&started)).bearer(&token).send().await;
-    polled.assert_status(200);
+    let exchanged = exchange_ok(&client, &token, &started, CLOUD_CODE).await;
     assert_eq!(
-        polled.json::<ProviderOauthProgress>(),
+        exchanged,
         ProviderOauthProgress::Authorized {
             account: GITHUB_LOGIN.to_owned(),
             // Nothing to choose: flyco creates the one repository it needs.
             choices: Vec::new(),
         }
     );
+
+    let polled = client.get(&poll_path(&started)).bearer(&token).send().await;
+    polled.assert_status(200);
+    assert_eq!(polled.json::<ProviderOauthProgress>(), exchanged);
 }
 
 #[skyzen::test]
@@ -214,16 +314,19 @@ async fn a_sign_in_that_declined_the_codespace_scope_is_told_so(ctx: TestContext
     let started = begin(&client, &token).await;
 
     let response = client
-        .get(&callback_path(CLOUD_CODE, &state_of(&started)))
+        .post(EXCHANGE)
+        .bearer(&token)
+        .json(&serde_json::json!({
+            "attempt_id": started.attempt_id,
+            "state": state_of(&started),
+            "code": CLOUD_CODE,
+        }))
         .send()
         .await;
-    response.assert_status(303);
-    let landed = location(&response);
-    assert_eq!(landed.path(), "/connect/return");
-    assert_eq!(query(&landed, "provider").as_deref(), Some("codespaces"));
+    response.assert_status(422);
     assert_eq!(
-        query(&landed, "problem").as_deref(),
-        Some("github-rejected")
+        response.json::<Problem>().kind,
+        "https://flyco.dev/problems/github-rejected"
     );
 
     let polled = client.get(&poll_path(&started)).bearer(&token).send().await;
@@ -246,11 +349,7 @@ async fn finishing_links_the_account_the_repository_was_ensured_on(
 ) {
     let (client, user, token) = signed_in(&ctx, &kv, &db).await;
     let started = begin(&client, &token).await;
-    client
-        .get(&callback_path(CLOUD_CODE, &state_of(&started)))
-        .send()
-        .await
-        .assert_status(303);
+    exchange_ok(&client, &token, &started, CLOUD_CODE).await;
 
     let response = client
         .post(&finish_path(&started))
@@ -324,11 +423,7 @@ async fn a_finish_github_refuses_links_nothing(ctx: TestContext, kv: Kv, db: Db)
     )
     .await;
     let started = begin(&client, &token).await;
-    client
-        .get(&callback_path(CLOUD_CODE, &state_of(&started)))
-        .send()
-        .await
-        .assert_status(303);
+    exchange_ok(&client, &token, &started, CLOUD_CODE).await;
 
     let response = client
         .post(&finish_path(&started))
@@ -525,7 +620,7 @@ async fn a_codespace_fetches_the_configuration_its_provision_stored(
 
     let response = client
         .post(BOOTSTRAP)
-        .bearer("the-injected-github-token")
+        .bearer(crate::testing::CODESPACE_GITHUB_TOKEN)
         .json(&flyco_core::CodespacesBootstrapRequest {
             codespace_name: CODESPACE_NAME.to_owned(),
         })
@@ -538,6 +633,152 @@ async fn a_codespace_fetches_the_configuration_its_provision_stored(
         CONFIG_TOML,
         "the document comes back exactly as the provision sealed it"
     );
+
+    // Delivery atomically consumes `bootstrap_enc`, so a second fetch cannot
+    // replay the live daemon configuration.
+    let replay = client
+        .post(BOOTSTRAP)
+        .bearer(crate::testing::CODESPACE_GITHUB_TOKEN)
+        .json(&flyco_core::CodespacesBootstrapRequest {
+            codespace_name: CODESPACE_NAME.to_owned(),
+        })
+        .send()
+        .await;
+    replay.assert_status(409);
+    assert_eq!(
+        replay.json::<Problem>().kind,
+        "https://flyco.dev/problems/machine-not-ready"
+    );
+}
+
+#[skyzen::test]
+async fn user_oauth_tokens_and_collaborator_tokens_cannot_bootstrap_a_codespace(
+    ctx: TestContext,
+    _kv: Kv,
+    db: Db,
+) {
+    migrate(&db).await;
+    seed_codespace(&db, true).await;
+    let client = ctx.client(crate::testing::test_router_full(
+        db.clone(),
+        Queue::new(InMemoryQueue::new()),
+        TestGithub::codespaces_authorized(),
+        crate::testing::TestTurnstile::passing(),
+        crate::testing::test_vendors(),
+        TestCodespaces::succeeding(),
+    ));
+
+    // User OAuth token (`gho_`), classic PAT (`ghp_`), fine-grained PAT
+    // (`github_pat_`), installation token (`ghs_`), and a collaborator's `ghu_`
+    // token must all be denied without consuming `bootstrap_enc`.
+    for disallowed in [
+        crate::testing::GITHUB_ACCESS_TOKEN,
+        "ghp_classic_pat_token",
+        "github_pat_fine_grained_token",
+        "ghs_actions_installation_token",
+        crate::testing::OTHER_CODESPACE_GITHUB_TOKEN,
+    ] {
+        let denied = client
+            .post(BOOTSTRAP)
+            .bearer(disallowed)
+            .json(&flyco_core::CodespacesBootstrapRequest {
+                codespace_name: CODESPACE_NAME.to_owned(),
+            })
+            .send()
+            .await;
+        denied.assert_status(403);
+        assert_eq!(
+            denied.json::<Problem>().kind,
+            "https://flyco.dev/problems/codespaces-bootstrap-denied"
+        );
+    }
+
+    // Because every denial failed before consumption, the real codespace still
+    // receives its configuration on its first legitimate call.
+    let legit = client
+        .post(BOOTSTRAP)
+        .bearer(crate::testing::CODESPACE_GITHUB_TOKEN)
+        .json(&flyco_core::CodespacesBootstrapRequest {
+            codespace_name: CODESPACE_NAME.to_owned(),
+        })
+        .send()
+        .await;
+    legit.assert_status(200);
+    assert_eq!(legit.json::<CodespacesBootstrap>().config_toml, CONFIG_TOML);
+}
+
+#[skyzen::test]
+async fn concurrent_bootstrap_calls_deliver_the_configuration_at_most_once(
+    ctx: TestContext,
+    _kv: Kv,
+    db: Db,
+) {
+    migrate(&db).await;
+    seed_codespace(&db, true).await;
+    let client = ctx.client(crate::testing::test_router(
+        db.clone(),
+        Queue::new(InMemoryQueue::new()),
+    ));
+    let body = flyco_core::CodespacesBootstrapRequest {
+        codespace_name: CODESPACE_NAME.to_owned(),
+    };
+
+    let (first, second) = futures_util::future::join(
+        client
+            .post(BOOTSTRAP)
+            .bearer(crate::testing::CODESPACE_GITHUB_TOKEN)
+            .json(&body)
+            .send(),
+        client
+            .post(BOOTSTRAP)
+            .bearer(crate::testing::CODESPACE_GITHUB_TOKEN)
+            .json(&body)
+            .send(),
+    )
+    .await;
+
+    let mut statuses = [first.status(), second.status()];
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses,
+        [200, 409],
+        "atomic consumption must deliver the sealed config to exactly one caller"
+    );
+}
+
+#[skyzen::test]
+async fn a_public_environment_repository_is_refused_for_bootstrap(
+    ctx: TestContext,
+    _kv: Kv,
+    db: Db,
+) {
+    migrate(&db).await;
+    seed_codespace(&db, true).await;
+    let client = ctx.client(crate::testing::test_router_full(
+        db.clone(),
+        Queue::new(InMemoryQueue::new()),
+        TestGithub {
+            public_env_repo: true,
+            ..TestGithub::codespaces_authorized()
+        },
+        crate::testing::TestTurnstile::passing(),
+        crate::testing::test_vendors(),
+        TestCodespaces::succeeding(),
+    ));
+
+    let denied = client
+        .post(BOOTSTRAP)
+        .bearer(crate::testing::CODESPACE_GITHUB_TOKEN)
+        .json(&flyco_core::CodespacesBootstrapRequest {
+            codespace_name: CODESPACE_NAME.to_owned(),
+        })
+        .send()
+        .await;
+    denied.assert_status(403);
+    assert_eq!(
+        denied.json::<Problem>().kind,
+        "https://flyco.dev/problems/codespaces-bootstrap-denied"
+    );
 }
 
 #[skyzen::test]
@@ -549,7 +790,7 @@ async fn a_token_that_cannot_read_the_environment_repository_is_denied(
     migrate(&db).await;
     seed_codespace(&db, true).await;
     // GitHub answers 404 for a repository this token cannot read — the
-    // shape a foreign codespace's token, or a user's own PAT, takes.
+    // shape a foreign codespace's token takes.
     let client = ctx.client(crate::testing::test_router_full(
         db.clone(),
         Queue::new(InMemoryQueue::new()),
@@ -564,7 +805,7 @@ async fn a_token_that_cannot_read_the_environment_repository_is_denied(
 
     let response = client
         .post(BOOTSTRAP)
-        .bearer("a-token-that-is-not-this-codespaces")
+        .bearer(crate::testing::CODESPACE_GITHUB_TOKEN)
         .json(&flyco_core::CodespacesBootstrapRequest {
             codespace_name: CODESPACE_NAME.to_owned(),
         })
@@ -589,7 +830,7 @@ async fn a_name_nothing_claims_is_a_not_found(ctx: TestContext, _kv: Kv, db: Db)
 
     let response = client
         .post(BOOTSTRAP)
-        .bearer("the-injected-github-token")
+        .bearer(crate::testing::CODESPACE_GITHUB_TOKEN)
         .json(&flyco_core::CodespacesBootstrapRequest {
             codespace_name: "some-other-codespace-1a2b3c4d5e6f7g".to_owned(),
         })
@@ -620,7 +861,7 @@ async fn a_codespace_that_asks_before_the_provision_stores_is_told_to_wait(
 
     let response = client
         .post(BOOTSTRAP)
-        .bearer("the-injected-github-token")
+        .bearer(crate::testing::CODESPACE_GITHUB_TOKEN)
         .json(&flyco_core::CodespacesBootstrapRequest {
             codespace_name: CODESPACE_NAME.to_owned(),
         })

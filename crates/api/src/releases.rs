@@ -40,14 +40,47 @@ pub struct ReleaseArtifact {
 ///
 /// Returns [`StorageError`] if R2 cannot be read.
 pub async fn get(storage: &Storage, name: &str) -> Result<Option<ReleaseArtifact>, StorageError> {
+    get_with_digest(storage, name, None).await
+}
+
+/// Reads an allowlisted development-channel artifact.
+///
+/// When `sha256` is supplied for a versioned binary, looks up the
+/// content-addressed key (`wire-<N>/<sha256>/<name>`) so a re-publish never
+/// races the edge cache between a binary and its `.sha256`. Costs one R2 `get`
+/// when the name (and optional digest) are valid.
+///
+/// # Errors
+///
+/// Returns [`StorageError`] if R2 cannot be read.
+pub async fn get_with_digest(
+    storage: &Storage,
+    name: &str,
+    sha256: Option<&str>,
+) -> Result<Option<ReleaseArtifact>, StorageError> {
     let Some(object) = release::object(name) else {
         return Ok(None);
     };
-    let key = format!("{ROOT}/{}", object.storage_key());
+    let key = match sha256 {
+        Some(digest) => {
+            if !object.versioned || !is_valid_sha256(digest) {
+                return Ok(None);
+            }
+            format!("{ROOT}/{}", object.versioned_digest_key(digest))
+        }
+        None => format!("{ROOT}/{}", object.storage_key()),
+    };
     Ok(storage.get(&key).await?.map(|stored| ReleaseArtifact {
         body: stored.body,
         content_type: object.content_type,
     }))
+}
+
+fn is_valid_sha256(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Whether the bucket holds a daemon speaking this control plane's wire
@@ -224,5 +257,41 @@ mod tests {
     #[skyzen::test]
     async fn an_allowlisted_object_nobody_published_is_absent() {
         assert_eq!(get(&store(), "flycod.sh").await.expect("read"), None);
+    }
+
+    #[skyzen::test]
+    async fn digest_lookup_reads_content_addressed_binary_and_rejects_invalid_digests() {
+        let storage = store();
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        storage
+            .put(
+                &format!(
+                    "{ROOT}/{}",
+                    release::X86_64.binary.versioned_digest_key(digest)
+                ),
+                b"pinned-bytes".to_vec(),
+            )
+            .await
+            .expect("seed");
+
+        let hit = super::get_with_digest(&storage, "flycod-linux-x86_64", Some(digest))
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(hit.body, b"pinned-bytes");
+        assert_eq!(hit.content_type, "application/octet-stream");
+
+        assert_eq!(
+            super::get_with_digest(&storage, "flycod-linux-x86_64", Some("../bad"))
+                .await
+                .expect("read"),
+            None
+        );
+        assert_eq!(
+            super::get_with_digest(&storage, "flycod.sh", Some(digest))
+                .await
+                .expect("read"),
+            None
+        );
     }
 }

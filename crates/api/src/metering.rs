@@ -420,6 +420,18 @@ mod worker {
             &mut failures,
         )
         .await;
+        // Expired `idempotency_keys` housekeeping: one indexed delete an hour.
+        run_leg(
+            "idempotency_prune",
+            async {
+                if at_unix.is_multiple_of(3_600) {
+                    let _ = crate::idempotency::prune_expired(&db, at_unix).await?;
+                }
+                Ok::<(), crate::error::ApiError>(())
+            },
+            &mut failures,
+        )
+        .await;
         run_leg(
             "refresh_stale",
             catalog::refresh_stale(&db, &Kv::new(kv), &Queue::new(queue), at_unix),
