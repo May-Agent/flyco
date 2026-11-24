@@ -1,0 +1,410 @@
+/*
+ * Read-only Swarm observation panel in SessionDetail.
+ *
+ * Uses warm neutral surfaces from tokens.css with status colours strictly
+ * reserved for member lifecycle state (working, waiting, killed).
+ */
+.panel {
+  flex: none;
+  width: 100%;
+  max-width: 840px;
+  margin: var(--space-2) auto 0;
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-4);
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.header:hover {
+  background: var(--color-surface);
+}
+
+.chevron {
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-text-faint);
+  flex: none;
+}
+
+.icon {
+  color: var(--color-text-muted);
+  flex: none;
+}
+
+.title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: var(--tracking-snug);
+}
+
+.counts {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-left: auto;
+  flex: none;
+}
+
+.count {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  font-variant-numeric: tabular-nums;
+}
+
+.countNum {
+  font-family: var(--font-mono);
+  color: var(--color-text);
+}
+
+.countSep,
+.countLabel {
+  color: var(--color-text-muted);
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border-top: var(--border-width) solid var(--color-border);
+  max-height: 44vh;
+  overflow-y: auto;
+}
+
+.goal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.goalTitle {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+  letter-spacing: var(--tracking-snug);
+}
+
+.goalLine {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  line-height: var(--line-normal);
+}
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.sectionHeading {
+  margin: 0;
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--color-text-faint);
+}
+
+.threadList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.threadCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.threadHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.threadTitle {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+
+.threadGoal {
+  font-size: var(--text-xs);
+  color: var(--color-text-muted);
+}
+
+.threadTasks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.taskRow {
+  display: grid;
+  grid-template-columns: minmax(90px, auto) minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.taskName {
+  font-family: var(--font-mono);
+  color: var(--color-text);
+}
+
+.taskSummary {
+  color: var(--color-text-muted);
+  overflow-wrap: anywhere;
+}
+
+.roster {
+  display: flex;
+  flex-direction: column;
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+
+.rosterHead,
+.rosterRow {
+  display: grid;
+  grid-template-columns: minmax(110px, 1.3fr) minmax(72px, 0.8fr) minmax(110px, 1.4fr) minmax(68px, 0.7fr) minmax(72px, 0.8fr);
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+}
+
+.rosterHead {
+  border-bottom: var(--border-width) solid var(--color-border);
+  background: var(--color-surface-sunken);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--color-text-faint);
+}
+
+.rosterRow {
+  font-size: var(--text-xs);
+  color: var(--color-text);
+}
+
+.rosterRow + .rosterRow {
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.rosterRowKilled {
+  opacity: 0.6;
+}
+
+.memberCell {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.statusDot {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-full);
+  background: var(--color-neutral-dot);
+  flex: none;
+}
+
+.statusDot[data-tone="active"] {
+  background: var(--color-success);
+}
+
+.statusDot[data-tone="waiting"] {
+  background: var(--color-warning);
+}
+
+.statusDot[data-tone="killed"] {
+  background: var(--color-danger);
+}
+
+.memberName {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-medium);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roleCell,
+.workspaceCell {
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modelCell {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stateCell {
+  font-weight: var(--weight-medium);
+  color: var(--color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stateCell[data-tone="active"] {
+  color: var(--color-success);
+}
+
+.stateCell[data-tone="waiting"] {
+  color: var(--color-warning);
+}
+
+.stateCell[data-tone="killed"] {
+  color: var(--color-danger);
+}
+
+.board {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.post {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+
+.postMeta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.postSeq {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.postAgent {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-semibold);
+  color: var(--color-text);
+}
+
+.postKind,
+.postTruncated {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  font-size: var(--text-2xs);
+}
+
+.postTruncated {
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.postTime {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--color-text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.postBody {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--line-normal);
+  color: var(--color-text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.mention {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  padding: 0 3px;
+  border-radius: var(--radius-xs);
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+
+@media (max-width: 720px) {
+  .rosterHead {
+    display: none;
+  }
+
+  .rosterRow {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: var(--space-1);
+  }
+
+  .modelCell,
+  .workspaceCell {
+    grid-column: 1 / -1;
+  }
+}

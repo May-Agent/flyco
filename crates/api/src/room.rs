@@ -1091,7 +1091,8 @@ fn prepare_daemon_frame(
         | DaemonToControl::DesktopState { .. }
         | DaemonToControl::DesktopActive
         | DaemonToControl::SpotNotice { .. }
-        | DaemonToControl::RepoAdded { .. } => (true, FrameSideEffect::None),
+        | DaemonToControl::RepoAdded { .. }
+        | DaemonToControl::SwarmUpdated { .. } => (true, FrameSideEffect::None),
         _ => (false, FrameSideEffect::None),
     };
 

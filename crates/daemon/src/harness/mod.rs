@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use flyco_core::{
     ApprovalId, HarnessCommand, HarnessEvent, ModelChoice, ModelOption, PermissionMode,
+    SwarmBoardMessage, SwarmSnapshot,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -128,6 +129,13 @@ pub enum SessionOutput {
         input: Value,
         /// The harness's own suggested permission updates, if any.
         suggestions: Option<Value>,
+    },
+    /// Read-only Antigravity swarm state and message-board batch.
+    SwarmUpdated {
+        /// Latest swarm snapshot, present only when metadata, roster, or plan changed.
+        snapshot: Option<SwarmSnapshot>,
+        /// Newly observed `board.jsonl` lines in ascending `seq` order.
+        board_messages: Vec<SwarmBoardMessage>,
     },
     /// The session cannot continue. Terminal: the output stream ends after
     /// this.

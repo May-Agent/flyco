@@ -47,6 +47,27 @@ describe("parseClientEvent", () => {
     });
   });
 
+  it("parses swarm_updated frames", () => {
+    const frame = {
+      type: "swarm_updated",
+      snapshot: {
+        swarm_id: "sw-1",
+        title: "Release",
+        members: [{ name: "coordinator", role: "coordinator", phase: "working" }],
+      },
+      board_messages: [
+        {
+          seq: 1,
+          agent: "coordinator",
+          text: "@worker begin",
+          time: "2026-11-24T13:55:00Z",
+        },
+      ],
+    };
+    const parsed = parseClientEvent(frame);
+    expect(parsed).toEqual(frame);
+  });
+
   it("refuses a frame this protocol version does not define", () => {
     expect(() => parseClientEvent({ type: "skills" })).toThrow("unrecognized type");
     expect(() => parseClientEvent(null)).toThrow("not a ClientEvent");

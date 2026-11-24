@@ -52,6 +52,7 @@ import SessionComposer, { type SessionCommand } from "../components/SessionCompo
 import SessionDrawer from "../components/SessionDrawer";
 import SessionHeader from "../components/SessionHeader";
 import { useSessions } from "../components/SessionNav";
+import SwarmPanel from "../components/SwarmPanel";
 import Transcript, { ProvisioningTimeline } from "../components/Transcript";
 import composerStyles from "../components/Composer.module.css";
 import {
@@ -94,6 +95,7 @@ import {
   pendingApprovals,
   type TranscriptItem,
 } from "../lib/transcript";
+import { foldSwarmState } from "../lib/swarm";
 import styles from "./SessionDetail.module.css";
 
 /**
@@ -312,6 +314,7 @@ function SessionView(props: { id: string }) {
   });
   const waiting = createMemo(() => pendingApprovals(transcript));
   const signals = createMemo(() => liveSignalsFrom(relay.events()));
+  const swarm = createMemo(() => foldSwarmState(relay.events()));
 
   const status = createMemo((): StatusView | undefined => {
     const current = session();
@@ -1018,6 +1021,9 @@ function SessionView(props: { id: string }) {
 
       <div class={styles.body}>
         <div class={styles.column}>
+          <Show when={swarm()}>
+            {(current) => <SwarmPanel swarm={current()} />}
+          </Show>
           <div class={styles.scroller} ref={scroller} onScroll={noteScroll}>
             <div ref={transcriptBody}>
             {/*

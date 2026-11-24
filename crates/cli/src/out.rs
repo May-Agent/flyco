@@ -150,6 +150,81 @@ fn pad(cell: &str, width: usize) -> String {
     }
 }
 
+/// Formats a read-only swarm update (snapshot and/or message-board batch) for
+/// terminal display.
+#[must_use]
+pub fn format_swarm_update(
+    snapshot: Option<&flyco_core::SwarmSnapshot>,
+    board_messages: &[flyco_core::SwarmBoardMessage],
+) -> String {
+    let mut sections = Vec::new();
+    if let Some(snapshot) = snapshot {
+        let mut lines = Vec::new();
+        if let Some(title) = &snapshot.title {
+            lines.push(format!("Swarm: {title}"));
+        } else if let Some(id) = &snapshot.swarm_id {
+            lines.push(format!("Swarm: {id}"));
+        }
+        if let Some(goal) = &snapshot.goal {
+            match &goal.line {
+                Some(line) => lines.push(format!("Goal: {} — {line}", goal.title)),
+                None => lines.push(format!("Goal: {}", goal.title)),
+            }
+        }
+        if !snapshot.threads.is_empty() {
+            let mut thread_lines = Vec::new();
+            for thread in &snapshot.threads {
+                let members = thread.tasks.join(", ");
+                if members.is_empty() {
+                    thread_lines.push(format!("  [{}] {}", thread.id, thread.title));
+                } else {
+                    thread_lines.push(format!("  [{}] {} ({members})", thread.id, thread.title));
+                }
+            }
+            lines.push(format!("Threads:\n{}", thread_lines.join("\n")));
+        }
+        if !snapshot.members.is_empty() {
+            let rows: Vec<Vec<String>> = snapshot
+                .members
+                .iter()
+                .map(|member| {
+                    let status = if member.killed {
+                        "killed".to_owned()
+                    } else {
+                        member
+                            .phase
+                            .as_deref()
+                            .or(member.state.as_deref())
+                            .unwrap_or("-")
+                            .to_owned()
+                    };
+                    vec![
+                        member.name.clone(),
+                        member.role.clone().unwrap_or_else(|| "-".to_owned()),
+                        member.model.clone().unwrap_or_else(|| "-".to_owned()),
+                        status,
+                    ]
+                })
+                .collect();
+            lines.push(table(&["MEMBER", "ROLE", "MODEL", "STATE"], &rows));
+        }
+        if !lines.is_empty() {
+            sections.push(lines.join("\n"));
+        }
+    }
+    if !board_messages.is_empty() {
+        let board: Vec<String> = board_messages
+            .iter()
+            .map(|msg| {
+                let suffix = if msg.truncated { " [truncated]" } else { "" };
+                format!("#{} {}: {}{suffix}", msg.seq, msg.agent, msg.text)
+            })
+            .collect();
+        sections.push(board.join("\n"));
+    }
+    sections.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +239,54 @@ mod tests {
             ],
         );
         assert_eq!(text, "ID        STATE\nabc       active\nlonger-id paused");
+    }
+
+    #[test]
+    fn formats_swarm_snapshot_and_board_messages() {
+        let snapshot = flyco_core::SwarmSnapshot {
+            swarm_id: Some("sw-1".to_owned()),
+            title: Some("Release".to_owned()),
+            goal: Some(flyco_core::SwarmGoal {
+                title: "Ship 412".to_owned(),
+                line: Some("All gates green".to_owned()),
+            }),
+            threads: vec![flyco_core::SwarmThread {
+                id: "t1".to_owned(),
+                title: "Daemon".to_owned(),
+                goal: None,
+                tasks: vec!["worker".to_owned()],
+            }],
+            tasks: std::collections::BTreeMap::new(),
+            members: vec![flyco_core::SwarmMember {
+                name: "worker".to_owned(),
+                role: Some("worker".to_owned()),
+                model: Some("Gemini 4 Neon (High)".to_owned()),
+                workspace_mode: Some("share".to_owned()),
+                state: Some("running".to_owned()),
+                phase: Some("working".to_owned()),
+                last_read_seq: Some(3),
+                killed: false,
+            }],
+        };
+        let messages = vec![flyco_core::SwarmBoardMessage {
+            seq: 4,
+            agent: "worker".to_owned(),
+            text: "@coordinator done".to_owned(),
+            time: None,
+            kind: None,
+            truncated: true,
+        }];
+        let rendered = format_swarm_update(Some(&snapshot), &messages);
+        assert!(rendered.contains("Swarm: Release"), "{rendered}");
+        assert!(
+            rendered.contains("Goal: Ship 412 — All gates green"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[t1] Daemon (worker)"), "{rendered}");
+        assert!(rendered.contains("worker"), "{rendered}");
+        assert!(
+            rendered.contains("#4 worker: @coordinator done [truncated]"),
+            "{rendered}"
+        );
     }
 }

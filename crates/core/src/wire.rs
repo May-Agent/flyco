@@ -28,6 +28,7 @@ use crate::harness::{HarnessEvent, UsageReport};
 use crate::id::{ApprovalId, SessionId, ShellRunId, WorkdirRequestId};
 use crate::repo::{BranchName, RepoSlug};
 use crate::session::SessionState;
+use crate::swarm::{SwarmBoardMessage, SwarmSnapshot};
 use crate::workdir::{WorkdirReply, WorkdirRequest};
 
 /// One rolling window of the harness plan's rate limit.
@@ -657,6 +658,20 @@ pub enum DaemonToControl {
         stage: ProvisioningStage,
         /// When it was reached, seconds since the Unix epoch.
         at_unix: u64,
+    },
+    /// Read-only Antigravity swarm state and message-board batch.
+    ///
+    /// Coalesced in `flycod` so rapid file updates and board bursts ride a
+    /// single bounded frame rather than one frame per file write or message.
+    SwarmUpdated {
+        /// Latest snapshot of swarm metadata, goal, threads, tasks, and roster.
+        /// Omitted when only new board lines arrived since the previous frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot: Option<SwarmSnapshot>,
+        /// Newly observed `board.jsonl` lines in ascending `seq` order, capped
+        /// at [`crate::swarm::SWARM_BOARD_BATCH_MAX`] per frame.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        board_messages: Vec<SwarmBoardMessage>,
     },
 }
 
@@ -1559,6 +1574,20 @@ pub enum ClientEvent {
         /// Whether the session may have a desktop now.
         enabled: bool,
     },
+    /// Read-only Antigravity swarm state and message-board batch.
+    ///
+    /// Recorded in the session room's event log so late-joining browsers and
+    /// catch-up replays reconstruct the latest swarm snapshot and message
+    /// board in order without extra polling routes.
+    SwarmUpdated {
+        /// Latest snapshot of swarm metadata, goal, threads, tasks, and roster,
+        /// present when the snapshot changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot: Option<SwarmSnapshot>,
+        /// Newly observed `board.jsonl` messages in ascending `seq` order.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        board_messages: Vec<SwarmBoardMessage>,
+    },
 }
 
 impl ClientEvent {
@@ -1616,6 +1645,13 @@ impl ClientEvent {
                 Some(Self::DesktopState { status, detail })
             }
             DaemonToControl::DesktopActive => Some(Self::DesktopActive),
+            DaemonToControl::SwarmUpdated {
+                snapshot,
+                board_messages,
+            } => Some(Self::SwarmUpdated {
+                snapshot,
+                board_messages,
+            }),
         }
     }
 }
@@ -1657,6 +1693,7 @@ mod tests {
     use crate::machine::BillingMinimum;
     use crate::money::Usd;
     use crate::session::SessionState;
+    use crate::swarm::{SwarmBoardMessage, SwarmSnapshot};
     use crate::workdir::{
         DirectoryEntry, DirectoryListing, EntryKind, FileChange, FileContent, FileDiff,
         WorkdirDiff, WorkdirRefusal, WorkdirReply, WorkdirRequest,
@@ -1711,6 +1748,48 @@ mod tests {
                 argument_hint: None,
             },
         ]
+    }
+
+    fn sample_swarm_snapshot() -> SwarmSnapshot {
+        SwarmSnapshot {
+            swarm_id: Some("swarm-1".to_owned()),
+            title: Some("Release checks".to_owned()),
+            goal: Some(crate::swarm::SwarmGoal {
+                title: "Verify release".to_owned(),
+                line: Some("Run tests and audit artifacts".to_owned()),
+            }),
+            threads: vec![crate::swarm::SwarmThread {
+                id: "t-1".to_owned(),
+                title: "Checks".to_owned(),
+                goal: Some("Green workspace".to_owned()),
+                tasks: vec!["verifier".to_owned()],
+            }],
+            tasks: std::collections::BTreeMap::from([(
+                "verifier".to_owned(),
+                "Run workspace test gates".to_owned(),
+            )]),
+            members: vec![crate::swarm::SwarmMember {
+                name: "verifier".to_owned(),
+                role: Some("worker".to_owned()),
+                model: Some("Gemini 4 Neon (High)".to_owned()),
+                workspace_mode: Some("inherit".to_owned()),
+                state: Some("running".to_owned()),
+                phase: Some("working".to_owned()),
+                last_read_seq: Some(4),
+                killed: false,
+            }],
+        }
+    }
+
+    fn sample_swarm_board() -> Vec<SwarmBoardMessage> {
+        vec![SwarmBoardMessage {
+            seq: 5,
+            agent: "verifier".to_owned(),
+            text: "@coordinator all checks green".to_owned(),
+            time: Some("2026-11-24T13:55:00Z".to_owned()),
+            kind: Some("message".to_owned()),
+            truncated: false,
+        }]
     }
 
     fn payload() -> ApprovalPayload {
@@ -1783,6 +1862,10 @@ mod tests {
                 detail: Some("Xvfb is not installed on this image".to_owned()),
             },
             DaemonToControl::DesktopActive,
+            DaemonToControl::SwarmUpdated {
+                snapshot: Some(sample_swarm_snapshot()),
+                board_messages: sample_swarm_board(),
+            },
             DaemonToControl::WorkdirReply {
                 id: WorkdirRequestId::generate(),
                 reply: WorkdirReply::Entries {
@@ -2089,6 +2172,10 @@ mod tests {
             ClientEvent::ProvisioningStage {
                 stage: ProvisioningStage::Booting,
                 at_unix: 1_800_000_000,
+            },
+            ClientEvent::SwarmUpdated {
+                snapshot: Some(sample_swarm_snapshot()),
+                board_messages: sample_swarm_board(),
             },
         ]
         .into_iter()
