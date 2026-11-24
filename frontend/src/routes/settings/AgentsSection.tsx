@@ -39,6 +39,7 @@ const HARNESSES: readonly { kind: HarnessKind; label: string; runsOn: string }[]
   },
   { kind: "codex", label: "Codex", runsOn: "Runs on your ChatGPT subscription, or an OpenAI API key." },
   { kind: "devin", label: "Devin", runsOn: "Runs on your Devin account, signed in or with a token." },
+  { kind: "antigravity", label: "Antigravity", runsOn: "Runs on a Gemini API key." },
 ];
 
 /** How often the clock this page reads against moves. */

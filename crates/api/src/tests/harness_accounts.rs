@@ -191,7 +191,7 @@ mod linking {
     use flyco_core::{
         HarnessAccountView, HarnessCredentialInput, HarnessKind, LinkHarnessAccount, Problem,
     };
-    use flyco_provider::{CodexCredential, HarnessCredential};
+    use flyco_provider::{AntigravityCredential, CodexCredential, HarnessCredential};
     use skyzen_services::{Db, Kv};
     use skyzen_test::TestContext;
 
@@ -238,6 +238,13 @@ mod linking {
                 HarnessKind::Codex,
                 "sk-openai-test",
             ),
+            (
+                HarnessCredentialInput::AntigravityApiKey {
+                    key: "AIzaSy-antigravity-test".to_owned(),
+                },
+                HarnessKind::Antigravity,
+                "AIzaSy-antigravity-test",
+            ),
         ] {
             let response = client
                 .post("/v1/harness-accounts")
@@ -275,6 +282,51 @@ mod linking {
             .expect("encode the account list");
         assert!(!body.contains("sk-ant"));
         assert!(!body.contains("sk-openai"));
+        assert!(!body.contains("AIzaSy"));
+    }
+
+    #[skyzen::test]
+    async fn an_antigravity_api_key_unseals_for_daemon_provisioning(
+        ctx: TestContext,
+        kv: Kv,
+        db: Db,
+    ) {
+        let router = migrated_router(&db).await;
+        let user = seed_user(&db).await;
+        let token = session::issue(&kv, user.id).await.expect("issue a session");
+        let client = ctx.client(router);
+
+        let response = client
+            .post("/v1/harness-accounts")
+            .bearer(&token)
+            .json(&request(HarnessCredentialInput::AntigravityApiKey {
+                key: "AIzaSy-provisioned-key".to_owned(),
+            }))
+            .send()
+            .await;
+        response.assert_status(201);
+        let view: HarnessAccountView = response.json();
+        assert_eq!(view.harness, HarnessKind::Antigravity);
+        assert_eq!(
+            view.models,
+            flyco_core::builtin_models(HarnessKind::Antigravity)
+        );
+
+        let stored = crate::harness_accounts::credential(
+            &db,
+            &test_config(),
+            &test_vendors(),
+            user.id,
+            HarnessKind::Antigravity,
+        )
+        .await
+        .expect("unseal antigravity credential");
+        assert_eq!(
+            stored,
+            HarnessCredential::Antigravity(AntigravityCredential::ApiKey {
+                key: "AIzaSy-provisioned-key".to_owned(),
+            })
+        );
     }
 
     #[skyzen::test]

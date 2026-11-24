@@ -590,13 +590,13 @@ const LLM_USAGE: S["LlmUsageView"][] = [
 ];
 
 const FEATURES: S["HarnessFeature"][] = [
-  { feature: "usage_display", claude_code: "supported", codex: "supported", devin: "not_applicable" },
-  { feature: "context_window_display", claude_code: "supported", codex: "planned", devin: "not_applicable" },
-  { feature: "auto_mode", claude_code: "supported", codex: "harness_limitation", devin: "not_applicable" },
-  { feature: "compact", claude_code: "supported", codex: "supported", devin: "not_applicable" },
-  { feature: "skills", claude_code: "supported", codex: "supported", devin: "disabled" },
-  { feature: "mcp", claude_code: "supported", codex: "supported", devin: "planned" },
-  { feature: "computer_control", claude_code: "takeover", codex: "phase2", devin: "not_applicable" },
+  { feature: "usage_display", claude_code: "supported", codex: "supported", devin: "not_applicable", antigravity: "not_applicable" },
+  { feature: "context_window_display", claude_code: "supported", codex: "planned", devin: "not_applicable", antigravity: "not_applicable" },
+  { feature: "auto_mode", claude_code: "supported", codex: "harness_limitation", devin: "not_applicable", antigravity: "not_applicable" },
+  { feature: "compact", claude_code: "supported", codex: "supported", devin: "not_applicable", antigravity: "not_applicable" },
+  { feature: "skills", claude_code: "supported", codex: "supported", devin: "disabled", antigravity: "supported" },
+  { feature: "mcp", claude_code: "supported", codex: "supported", devin: "planned", antigravity: "supported" },
+  { feature: "computer_control", claude_code: "takeover", codex: "phase2", devin: "not_applicable", antigravity: "not_applicable" },
 ];
 
 const HOSTS: S["HostView"][] = [

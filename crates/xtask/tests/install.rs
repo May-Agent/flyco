@@ -217,6 +217,22 @@ fn the_session_installer_pins_and_verifies_native_harnesses_without_sidecar_or_u
         "native codex CLI carries pinned sha256 digests: {script}"
     );
     assert!(
+        script.contains("agy_version="),
+        "native agy CLI version is pinned: {script}"
+    );
+    assert!(
+        script.contains("agy_sha256_x64=") && script.contains("agy_sha256_aarch64="),
+        "native agy CLI carries pinned sha256 digests: {script}"
+    );
+    assert!(
+        script.contains("$install_root/agy"),
+        "native agy binary is installed and verified: {script}"
+    );
+    assert!(
+        script.contains("/var/lib/flyco/antigravity"),
+        "antigravity state and managed config dirs are prepared: {script}"
+    );
+    assert!(
         script.contains("bun_version="),
         "bun version is pinned: {script}"
     );

@@ -163,10 +163,15 @@ pub async fn harnesses(api: &Api, mode: out::Mode) -> Outcome<()> {
                         format!("{:?}", feature.feature),
                         format!("{:?}", feature.claude_code),
                         format!("{:?}", feature.codex),
+                        format!("{:?}", feature.devin),
+                        format!("{:?}", feature.antigravity),
                     ]
                 })
                 .collect();
-            text.push_str(&out::table(&["FEATURE", "CLAUDE", "CODEX"], &rows));
+            text.push_str(&out::table(
+                &["FEATURE", "CLAUDE", "CODEX", "DEVIN", "ANTIGRAVITY"],
+                &rows,
+            ));
             out::print(&text)
         }
     }

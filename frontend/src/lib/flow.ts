@@ -118,7 +118,12 @@ export interface FlowAnswers {
 export const NO_ANSWERS: FlowAnswers = {
   agents: {},
   linking: null,
-  routes: { claude_code: "sign-in", codex: "sign-in", devin: "sign-in" },
+  routes: {
+    claude_code: "sign-in",
+    codex: "sign-in",
+    devin: "sign-in",
+    antigravity: "api-key",
+  },
   claudeAttempt: null,
   devinAttempt: null,
   compute: null,
@@ -147,6 +152,7 @@ export const EVERY_AGENT: readonly HarnessKind[] = [
   "claude_code",
   "codex",
   "devin",
+  "antigravity",
 ];
 
 /** Which stages this flow walks, where it is, and what it has been told. */
@@ -233,6 +239,9 @@ export function stageOf(page: Page): Stage {
  * sign-in is open, the key page behind *Use an API key instead*.
  */
 function agentPages(answers: FlowAnswers, agent: HarnessKind): Page[] {
+  if (agent === "antigravity") {
+    return [{ id: "api-key", agent }];
+  }
   const signIn: Page =
     agent === "claude_code"
       ? { id: "claude-sign-in" }
@@ -489,7 +498,10 @@ export function finishLink(
     linking: null,
     claudeAttempt: null,
     devinAttempt: null,
-    routes: { ...state.answers.routes, [agent]: "sign-in" },
+    routes: {
+      ...state.answers.routes,
+      [agent]: agent === "antigravity" ? "api-key" : "sign-in",
+    },
   };
   const next: FlowState = {
     ...state,

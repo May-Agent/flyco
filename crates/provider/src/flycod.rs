@@ -43,6 +43,20 @@ pub const CLAUDE_BIN: &str = "/usr/local/bin/claude";
 /// Where the session image and installer put the native `codex` CLI binary.
 pub const CODEX_BIN: &str = "/usr/local/bin/codex";
 
+/// Where the session image and installer put the native Antigravity (`agy`) CLI binary.
+pub const AGY_BIN: &str = "/usr/local/bin/agy";
+
+/// The isolated `--gemini-dir` a provisioned Antigravity (`agy acp`) runs under.
+///
+/// Antigravity stores managed MCP configuration under `<dir>/config/mcp_config.json`,
+/// global skills under `<dir>/config/skills/`, and CLI runtime state (including
+/// `brain/<session_id>/.system_generated/swarm/`) under `<dir>/<app_data_dir>/`.
+pub const ANTIGRAVITY_GEMINI_DIR: &str = "/var/lib/flyco/antigravity";
+
+/// The relative `--app-data-dir` name passed to `agy acp`, resolving to
+/// `/var/lib/flyco/antigravity/antigravity-cli/`.
+pub const ANTIGRAVITY_APP_DATA_DIR: &str = "antigravity-cli";
+
 /// The isolated `CLAUDE_CONFIG_DIR` an injected credential runs under.
 pub const CLAUDE_CONFIG_DIR: &str = "/var/lib/flyco/claude";
 
@@ -202,6 +216,38 @@ impl fmt::Debug for DevinCredential {
     }
 }
 
+/// How the supervised Antigravity (`agy`) agent authenticates on a provisioned
+/// machine.
+///
+/// Driven over ACP through `agy acp --stdio --disable-telemetry`: an API key
+/// sets `modelProvider = "gemini"` in `settings.json`, exports
+/// `GEMINI_API_KEY` into the `agy acp` subprocess environment, and runs the
+/// `gemini-api-key` ACP auth method. [`Inherit`](Self::Inherit) is the
+/// developer-machine mode — the agent uses whatever login the host carries.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AntigravityCredential {
+    /// No credential injected.
+    Inherit,
+    /// A Gemini API key used via `agy acp`'s `gemini-api-key` auth method.
+    ApiKey {
+        /// Value for `GEMINI_API_KEY`.
+        key: String,
+    },
+}
+
+impl fmt::Debug for AntigravityCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mode = match self {
+            Self::Inherit => "inherit",
+            Self::ApiKey { .. } => "api_key",
+        };
+        f.debug_struct("AntigravityCredential")
+            .field("mode", &mode)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The credential a provisioned machine's harness runs under.
 ///
 /// Tagged by harness rather than carried beside a separate `harness` field:
@@ -216,6 +262,8 @@ pub enum HarnessCredential {
     Codex(CodexCredential),
     /// Devin's credential.
     Devin(DevinCredential),
+    /// Antigravity's credential.
+    Antigravity(AntigravityCredential),
 }
 
 impl fmt::Debug for HarnessCredential {
@@ -233,6 +281,10 @@ impl fmt::Debug for HarnessCredential {
                 .debug_tuple("HarnessCredential::Devin")
                 .field(credential)
                 .finish(),
+            Self::Antigravity(credential) => f
+                .debug_tuple("HarnessCredential::Antigravity")
+                .field(credential)
+                .finish(),
         }
     }
 }
@@ -245,6 +297,7 @@ impl HarnessCredential {
             Self::ClaudeCode(_) => HarnessKind::ClaudeCode,
             Self::Codex(_) => HarnessKind::Codex,
             Self::Devin(_) => HarnessKind::Devin,
+            Self::Antigravity(_) => HarnessKind::Antigravity,
         }
     }
 
@@ -255,6 +308,7 @@ impl HarnessCredential {
             HarnessKind::ClaudeCode => Self::ClaudeCode(ClaudeCredential::Inherit),
             HarnessKind::Codex => Self::Codex(CodexCredential::Inherit),
             HarnessKind::Devin => Self::Devin(DevinCredential::Inherit),
+            HarnessKind::Antigravity => Self::Antigravity(AntigravityCredential::Inherit),
         }
     }
 }
@@ -407,7 +461,11 @@ struct Acp<'a> {
     program: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     args: Vec<&'static str>,
-    env: BTreeMap<&'static str, &'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_method: Option<&'static str>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    mcp_via_files: bool,
+    env: BTreeMap<&'static str, String>,
     files: Vec<AcpFile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<&'a str>,
@@ -764,6 +822,82 @@ fn devin_credentials_toml(credential: &DevinCredential) -> Option<String> {
     }
 }
 
+/// `mcp_config.json`, as Antigravity reads it at `<gemini-dir>/config/mcp_config.json`.
+///
+/// Stdio servers carry `command`/`args`/`env`; Streamable HTTP servers carry
+/// `serverUrl`/`headers` per Antigravity's documented MCP schema.
+#[derive(Debug, Serialize)]
+struct AntigravityMcpFile {
+    #[serde(rename = "mcpServers")]
+    mcp_servers: BTreeMap<String, AntigravityMcpServer>,
+}
+
+/// One `mcpServers` entry of Antigravity's `mcp_config.json`.
+#[derive(Debug, Serialize)]
+struct AntigravityMcpServer {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    args: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    env: BTreeMap<String, String>,
+    #[serde(rename = "serverUrl", skip_serializing_if = "Option::is_none")]
+    server_url: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    headers: BTreeMap<String, String>,
+}
+
+/// One registered server as Antigravity's `mcp_config.json` spells it.
+fn antigravity_mcp(config: &McpServerConfig) -> AntigravityMcpServer {
+    match config {
+        McpServerConfig::Stdio { command, args, env } => AntigravityMcpServer {
+            command: Some(command.clone()),
+            args: args.clone(),
+            env: env
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.value.clone()))
+                .collect(),
+            server_url: None,
+            headers: BTreeMap::new(),
+        },
+        McpServerConfig::Http { url, headers } => AntigravityMcpServer {
+            command: None,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            server_url: Some(url.clone()),
+            headers: headers
+                .iter()
+                .map(|header| (header.name.clone(), header.value.clone()))
+                .collect(),
+        },
+    }
+}
+
+/// The contents of Antigravity's `<gemini-dir>/config/mcp_config.json`.
+fn antigravity_mcp_config_json(mounts: &[McpServerMount]) -> String {
+    let file = AntigravityMcpFile {
+        mcp_servers: registry(mounts)
+            .iter()
+            .map(|(name, config)| (name.clone(), antigravity_mcp(config)))
+            .collect(),
+    };
+    serde_json::to_string_pretty(&file).expect("AntigravityMcpFile serializes")
+}
+
+/// The contents of Antigravity's `<gemini-dir>/<app-data-dir>/settings.json`
+/// when authenticating with a Gemini API key.
+fn antigravity_settings_json(credential: &AntigravityCredential) -> Option<String> {
+    match credential {
+        AntigravityCredential::Inherit => None,
+        AntigravityCredential::ApiKey { .. } => Some(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "modelProvider": "gemini",
+            }))
+            .expect("Antigravity settings serialize"),
+        ),
+    }
+}
+
 /// The contents of Devin's `mcp_config.json` for one session.
 fn devin_mcp_config_json(mounts: &[McpServerMount]) -> String {
     let file = DevinMcpFile {
@@ -844,6 +978,29 @@ fn devin_modes() -> BTreeMap<PermissionMode, AcpMode> {
     ])
 }
 
+/// How flyco's permission modes reach Antigravity (`agy acp`).
+///
+/// `agy acp` exposes `default`, `accept-edits`, and `plan` under Gemini API-key
+/// authentication (`auto` requires a personal Google account plus the OS
+/// terminal sandbox, and `bypass` is not a session mode — `BypassPermissions`
+/// passes `--dangerously-skip-permissions` at launch instead). `Auto` therefore
+/// maps to `accept-edits` so default sessions auto-approve workspace edits while
+/// routing commands through flyco's approval UI, and `DontAsk` shares `plan`'s
+/// read-only floor.
+fn antigravity_modes() -> BTreeMap<PermissionMode, AcpMode> {
+    BTreeMap::from([
+        (PermissionMode::Default, AcpMode::mode("default")),
+        (PermissionMode::AcceptEdits, AcpMode::mode("accept-edits")),
+        (PermissionMode::Plan, AcpMode::mode("plan")),
+        (PermissionMode::Auto, AcpMode::mode("accept-edits")),
+        (
+            PermissionMode::BypassPermissions,
+            AcpMode::mode("accept-edits"),
+        ),
+        (PermissionMode::DontAsk, AcpMode::mode("plan")),
+    ])
+}
+
 /// The `[acp]` table a Codex session is rendered into.
 fn codex_acp<'a>(
     credential: &CodexCredential,
@@ -866,7 +1023,9 @@ fn codex_acp<'a>(
         in_process: Some("codex"),
         program: CODEX_BIN,
         args: Vec::new(),
-        env: BTreeMap::from([("CODEX_HOME", CODEX_HOME)]),
+        auth_method: None,
+        mcp_via_files: false,
+        env: BTreeMap::from([("CODEX_HOME", CODEX_HOME.to_owned())]),
         files,
         model: Some(model),
         effort,
@@ -899,8 +1058,8 @@ fn devin_acp<'a>(
     let data = PathBuf::from(DEVIN_DATA_HOME);
     let config = PathBuf::from(DEVIN_CONFIG_HOME);
     let env = BTreeMap::from([
-        ("XDG_DATA_HOME", DEVIN_DATA_HOME),
-        ("XDG_CONFIG_HOME", DEVIN_CONFIG_HOME),
+        ("XDG_DATA_HOME", DEVIN_DATA_HOME.to_owned()),
+        ("XDG_CONFIG_HOME", DEVIN_CONFIG_HOME.to_owned()),
     ]);
     let mut files = vec![AcpFile {
         path: config.join("devin/mcp_config.json"),
@@ -915,6 +1074,8 @@ fn devin_acp<'a>(
         in_process: None,
         program: "devin",
         args: vec!["acp"],
+        auth_method: None,
+        mcp_via_files: false,
         env,
         files,
         model: Some(model),
@@ -938,6 +1099,76 @@ fn devin_acp<'a>(
                 ("XDG_DATA_HOME", DEVIN_DATA_HOME),
                 ("XDG_CONFIG_HOME", DEVIN_CONFIG_HOME),
             ]),
+        }),
+    }
+}
+
+/// The `[acp]` table an Antigravity (`agy acp`) session is rendered into.
+fn antigravity_acp<'a>(
+    credential: &AntigravityCredential,
+    model: &'a str,
+    effort: Option<&'a str>,
+    permission_mode: PermissionMode,
+    mounts: &[McpServerMount],
+) -> Acp<'a> {
+    let gemini_dir = PathBuf::from(ANTIGRAVITY_GEMINI_DIR);
+    let mut env = BTreeMap::new();
+    let auth_method = match credential {
+        AntigravityCredential::Inherit => None,
+        AntigravityCredential::ApiKey { key } => {
+            env.insert("GEMINI_API_KEY", key.clone());
+            Some("gemini-api-key")
+        }
+    };
+    let mut files = vec![AcpFile {
+        path: gemini_dir.join("config/mcp_config.json"),
+        contents: antigravity_mcp_config_json(mounts),
+    }];
+    files.extend(antigravity_settings_json(credential).map(|contents| {
+        AcpFile {
+            path: gemini_dir
+                .join(ANTIGRAVITY_APP_DATA_DIR)
+                .join("settings.json"),
+            contents,
+        }
+    }));
+    let mut args = vec![
+        "acp",
+        "--stdio",
+        "--disable-telemetry",
+        "--gemini-dir",
+        ANTIGRAVITY_GEMINI_DIR,
+        "--app-data-dir",
+        ANTIGRAVITY_APP_DATA_DIR,
+    ];
+    if permission_mode == PermissionMode::BypassPermissions {
+        args.push("--dangerously-skip-permissions");
+    }
+    Acp {
+        agent: "antigravity",
+        in_process: None,
+        program: AGY_BIN,
+        args,
+        auth_method,
+        // Antigravity reads its managed MCP registry (stdio + Streamable HTTP)
+        // directly from `<gemini-dir>/config/mcp_config.json` and does not
+        // advertise `mcpCapabilities.http` in `initialize`.
+        mcp_via_files: true,
+        env,
+        files,
+        model: Some(model),
+        effort,
+        model_option: "model",
+        effort_option: Some("thought_level"),
+        fused_effort_tails: &[],
+        permission_mode,
+        modes: antigravity_modes(),
+        methods: AcpMethods::default(),
+        tui: Some(AcpTui {
+            program: AGY_BIN,
+            args: Vec::new(),
+            resume_args: vec!["--resume", "{session}"],
+            env: BTreeMap::new(),
         }),
     }
 }
@@ -1012,11 +1243,21 @@ pub fn render(bootstrap: &DaemonBootstrap) -> Result<String, RenderError> {
                 &bootstrap.mcp_servers,
             )),
         ),
+        HarnessCredential::Antigravity(credential) => (
+            None,
+            Some(antigravity_acp(
+                credential,
+                model,
+                effort,
+                bootstrap.permission_mode,
+                &bootstrap.mcp_servers,
+            )),
+        ),
     };
 
     let driver = match bootstrap.auth.harness() {
         HarnessKind::ClaudeCode => DriverKind::ClaudeCode,
-        HarnessKind::Codex | HarnessKind::Devin => DriverKind::Acp,
+        HarnessKind::Codex | HarnessKind::Devin | HarnessKind::Antigravity => DriverKind::Acp,
     };
     let document = Document {
         session: bootstrap.session,
@@ -1245,6 +1486,39 @@ mod tests {
     }
 
     #[test]
+    fn an_antigravity_session_is_the_same_acp_table_pointed_at_agy() {
+        let rendered = render(&bootstrap(HarnessCredential::Antigravity(
+            super::AntigravityCredential::ApiKey {
+                key: "AIzaSy-test-key".to_owned(),
+            },
+        )))
+        .expect("render");
+
+        assert!(rendered.contains("harness = \"acp\""), "{rendered}");
+        assert!(rendered.contains(r#"agent = "antigravity""#), "{rendered}");
+        assert!(
+            rendered.contains(r#"program = "/usr/local/bin/agy""#),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(r#"auth_method = "gemini-api-key""#),
+            "{rendered}"
+        );
+        assert!(rendered.contains("mcp_via_files = true"), "{rendered}");
+        assert!(
+            rendered.contains(r#"effort_option = "thought_level""#),
+            "{rendered}"
+        );
+        assert!(rendered.contains("GEMINI_API_KEY"), "{rendered}");
+        assert!(rendered.contains("AIzaSy-test-key"), "{rendered}");
+        assert!(rendered.contains("settings.json"), "{rendered}");
+        assert!(rendered.contains("modelProvider"), "{rendered}");
+        assert!(rendered.contains("mcp_config.json"), "{rendered}");
+        assert!(rendered.contains("serverUrl"), "{rendered}");
+        assert!(!rendered.contains("[claude]"), "{rendered}");
+    }
+
+    #[test]
     fn a_credential_decides_the_harness_the_daemon_drives() {
         assert_eq!(
             HarnessCredential::Codex(CodexCredential::Inherit).harness(),
@@ -1253,6 +1527,10 @@ mod tests {
         assert_eq!(
             HarnessCredential::inherit(HarnessKind::ClaudeCode).harness(),
             HarnessKind::ClaudeCode
+        );
+        assert_eq!(
+            HarnessCredential::inherit(HarnessKind::Antigravity).harness(),
+            HarnessKind::Antigravity
         );
     }
 

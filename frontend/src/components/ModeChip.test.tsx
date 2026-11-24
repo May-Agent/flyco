@@ -42,14 +42,19 @@ describe("ModeChip", () => {
     ).toBe("true");
   });
 
-  it("offers Codex no dontAsk row — it is plan's mapping under another name", () => {
-    const { getByRole, queryAllByRole } = mount({ modes: modesFor("codex") });
+  it("offers Codex and Antigravity no dontAsk row — it is plan's mapping under another name", () => {
+    for (const harness of ["codex", "antigravity"] as const) {
+      const { getByRole, queryAllByRole, unmount } = mount({
+        modes: modesFor(harness),
+      });
 
-    getByRole("button", { name: /Auto/ }).click();
+      getByRole("button", { name: /Auto/ }).click();
 
-    const options = queryAllByRole("option");
-    expect(options).toHaveLength(5);
-    expect(options.some((option) => option.textContent?.includes("Don't ask"))).toBe(false);
+      const options = queryAllByRole("option");
+      expect(options).toHaveLength(5);
+      expect(options.some((option) => option.textContent?.includes("Don't ask"))).toBe(false);
+      unmount();
+    }
   });
 
   it("commits the choice and closes", () => {

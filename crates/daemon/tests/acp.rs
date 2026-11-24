@@ -79,6 +79,8 @@ fn config() -> AcpConfig {
         in_process: None,
         program: script("fake-acp-agent.py"),
         args: Vec::new(),
+        auth_method: None,
+        mcp_via_files: false,
         env: BTreeMap::new(),
         files: Vec::new(),
         model: None,
@@ -133,10 +135,56 @@ async fn start_with(
         .start(StartRequest {
             workdir: scratch.join("work"),
             resume_session_id,
+            additional_directories: Vec::new(),
         })
         .await
         .expect("the driver must start against the stand-in agent");
     (started.session, started.outputs)
+}
+
+#[tokio::test]
+async fn an_agent_with_auth_method_mcp_via_files_and_additional_directories_starts() {
+    let scratch = Scratch::new("requireauth-mcpviafiles-nohttp-requireextradirs");
+    let mut cfg = config();
+    cfg.auth_method = Some("gemini-api-key".to_owned());
+    cfg.mcp_via_files = true;
+    let extra = scratch.join("extra-repo");
+    std::fs::create_dir_all(&extra).expect("create extra dir");
+
+    let mount = Mount::new(
+        FlycoServer::of_socket(Path::new("/var/lib/flyco/run/mcp.sock"))
+            .expect("this test binary has a path"),
+        vec![flyco_core::McpServerMount {
+            name: "deepwiki".to_owned(),
+            config: flyco_core::McpServerConfig::Http {
+                url: "https://mcp.deepwiki.com/mcp".to_owned(),
+                headers: Vec::new(),
+            },
+        }],
+        false,
+    );
+    let harness = AcpHarness::new(cfg, mount);
+    let started = harness
+        .start(StartRequest {
+            workdir: scratch.join("work"),
+            resume_session_id: None,
+            additional_directories: vec![extra],
+        })
+        .await
+        .expect("authenticate, mcp_via_files, and additionalDirectories must all succeed");
+    let mut outputs = started.outputs;
+    let _ = next(&mut outputs, "started").await;
+    let SessionOutput::Capabilities { capabilities } = next(&mut outputs, "capabilities").await
+    else {
+        panic!("expected capabilities");
+    };
+    assert!(
+        capabilities
+            .iter()
+            .any(|cap| cap == "acp:additional_directories"),
+        "missing acp:additional_directories in {capabilities:?}"
+    );
+    started.session.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -151,6 +199,7 @@ async fn a_session_opened_without_flycos_tools_never_becomes_a_session() {
         .start(StartRequest {
             workdir: scratch.join("work"),
             resume_session_id: None,
+            additional_directories: Vec::new(),
         })
         .await
         .expect_err("a session whose agent cannot read its budget must not open");
@@ -935,6 +984,7 @@ mod in_process {
             .start(StartRequest {
                 workdir: scratch.join("work"),
                 resume_session_id: None,
+                additional_directories: Vec::new(),
             })
             .await
             .expect("in-process Claude starts");
@@ -1187,6 +1237,8 @@ mod in_process {
             in_process: Some(InProcessAgent::Codex),
             program: std::path::PathBuf::from("/usr/local/bin/codex"),
             args: Vec::new(),
+            auth_method: None,
+            mcp_via_files: false,
             env: BTreeMap::new(),
             files: Vec::new(),
             model: None,
@@ -1235,6 +1287,7 @@ mod in_process {
             .start(StartRequest {
                 workdir: scratch.join("work"),
                 resume_session_id: None,
+                additional_directories: Vec::new(),
             })
             .await
             .expect("in-process Codex starts");

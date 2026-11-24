@@ -98,4 +98,24 @@ describe("the composer's agent chip", () => {
     expect(picker.textContent).toContain("lexo@flyco.dev");
     expect(picker.textContent).toContain("team@flyco.dev");
   });
+
+  it("renders Antigravity when linked in readiness", async () => {
+    readiness = {
+      ...singleAccount,
+      harness: () => [
+        {
+          id: "harness-ag",
+          harness: "antigravity",
+          label: "Gemini API key",
+          linked_at_unix: 1_787_000_000,
+          expires_at_unix: null,
+          models: [],
+          usage: { state: "unmetered" as const },
+        },
+      ],
+    };
+    const { findByRole } = mount();
+
+    expect(await findByRole("button", { name: /Antigravity/ })).toBeInTheDocument();
+  });
 });

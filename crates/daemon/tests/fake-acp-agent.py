@@ -138,6 +138,7 @@ def main() -> None:
     # The `session/prompt` request id while a turn is in flight; its answer
     # is sent when the turn ends, not when the request arrives.
     prompt_id = None
+    authenticated_method = None
 
     while True:
         msg = recv()
@@ -148,8 +149,12 @@ def main() -> None:
         if method == "initialize":
             capabilities = {
                 "loadSession": True,
-                "mcpCapabilities": {"http": True},
-                "sessionCapabilities": {"resume": {}, "close": {}},
+                "mcpCapabilities": {"http": "nohttp" not in os.getcwd()},
+                "sessionCapabilities": {
+                    "resume": {},
+                    "close": {},
+                    "additionalDirectories": {},
+                },
             }
             if "refuseload" in os.getcwd():
                 # Load is the only continuation offered, and it fails.
@@ -167,7 +172,41 @@ def main() -> None:
                     },
                 }
             )
+        elif method == "authenticate":
+            authenticated_method = msg.get("params", {}).get("methodId")
+            send({"id": msg["id"], "result": {}})
         elif method == "session/new":
+            params = msg.get("params", {})
+            if "requireauth" in os.getcwd() and authenticated_method != "gemini-api-key":
+                send(
+                    {
+                        "id": msg["id"],
+                        "error": {"code": -32000, "message": "authenticate not called"},
+                    }
+                )
+                continue
+            if "mcpviafiles" in os.getcwd() and params.get("mcpServers"):
+                send(
+                    {
+                        "id": msg["id"],
+                        "error": {
+                            "code": -32602,
+                            "message": "mcpServers must be empty when mcp_via_files is enabled",
+                        },
+                    }
+                )
+                continue
+            if "requireextradirs" in os.getcwd() and not params.get("additionalDirectories"):
+                send(
+                    {
+                        "id": msg["id"],
+                        "error": {
+                            "code": -32602,
+                            "message": "expected additionalDirectories in session/new",
+                        },
+                    }
+                )
+                continue
             send(
                 {
                     "id": msg["id"],

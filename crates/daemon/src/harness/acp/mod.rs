@@ -346,7 +346,8 @@ impl Harness for AcpHarness {
                     codex_connector,
                 )
                 .await?;
-                (config, connected, true, None, false, None)
+                let pass_mcp_to_session = !config.mcp_via_files;
+                (config, connected, pass_mcp_to_session, None, false, None)
             }
             Backend::Claude {
                 config: claude_cfg,
@@ -513,6 +514,8 @@ fn claude_acp_driver_config(claude: &ClaudeConfig) -> AcpConfig {
             .clone()
             .unwrap_or_else(|| PathBuf::from(flyco_provider::flycod::CLAUDE_BIN)),
         args: Vec::new(),
+        auth_method: None,
+        mcp_via_files: false,
         env: BTreeMap::new(),
         files: Vec::new(),
         model: claude.model.clone(),
@@ -909,7 +912,19 @@ async fn connect_acp(
         "the ACP agent completed its handshake"
     );
 
-    if let Err(error) = verify_mcp_transports(&client, &mount.acp_servers()) {
+    if let Some(method) = &config.auth_method
+        && let Err(source) = client.authenticate(method.as_str()).await
+    {
+        connection_task.abort();
+        return Err(AcpError::Agent {
+            context: format!("rejected `authenticate` ({method})"),
+            source,
+        });
+    }
+
+    if !config.mcp_via_files
+        && let Err(error) = verify_mcp_transports(&client, &mount.acp_servers())
+    {
         connection_task.abort();
         return Err(error);
     }
@@ -928,6 +943,17 @@ fn v1_session_cap(client: &Client, key: &str) -> bool {
         .as_ref()
         .and_then(|s| s.extra.get(key))
         .is_some_and(|v| v.is_object() || v.as_bool().unwrap_or(false))
+}
+
+/// Whether the agent supports `additionalDirectories` on session lifecycle calls.
+fn supports_additional_directories(client: &Client) -> bool {
+    client.protocol_version() >= 2
+        || client
+            .agent_capabilities()
+            .session
+            .as_ref()
+            .is_some_and(|s| s.additional_directories.is_some())
+        || v1_session_cap(client, "additionalDirectories")
 }
 
 /// What a session-open call settled, before the driver task exists.
@@ -953,6 +979,7 @@ async fn open_session(
     let is_v2 = client.protocol_version() >= 2;
     let can_resume = is_v2 || v1_session_cap(client, "resume");
     let can_load = is_v2 || v1_session_cap(client, "loadSession");
+    let can_add_dirs = supports_additional_directories(client);
 
     let (session, notice) = match &request.resume_session_id {
         Some(id) if can_resume => {
@@ -962,10 +989,15 @@ async fn open_session(
             for server in mcp_servers {
                 builder = builder.mcp_server(server.clone());
             }
+            if can_add_dirs && !request.additional_directories.is_empty() {
+                builder =
+                    builder.additional_directories(request.additional_directories.iter().cloned());
+            }
             match builder.open().await {
                 Ok(session) => (session, None),
                 Err(source) => {
-                    let fresh = new_conversation(client, mcp_servers, request).await?;
+                    let fresh =
+                        new_conversation(client, mcp_servers, request, can_add_dirs).await?;
                     (
                         fresh,
                         Some(restarted_fresh(config, "session/resume", &source)),
@@ -980,10 +1012,15 @@ async fn open_session(
             for server in mcp_servers {
                 builder = builder.mcp_server(server.clone());
             }
+            if can_add_dirs && !request.additional_directories.is_empty() {
+                builder =
+                    builder.additional_directories(request.additional_directories.iter().cloned());
+            }
             match builder.open().await {
                 Ok(session) => (session, None),
                 Err(source) => {
-                    let fresh = new_conversation(client, mcp_servers, request).await?;
+                    let fresh =
+                        new_conversation(client, mcp_servers, request, can_add_dirs).await?;
                     (
                         fresh,
                         Some(restarted_fresh(config, "session/load", &source)),
@@ -992,11 +1029,11 @@ async fn open_session(
             }
         }
         Some(_) => {
-            let fresh = new_conversation(client, mcp_servers, request).await?;
+            let fresh = new_conversation(client, mcp_servers, request, can_add_dirs).await?;
             (fresh, Some(uncontinuable(config)))
         }
         None => {
-            let fresh = new_conversation(client, mcp_servers, request).await?;
+            let fresh = new_conversation(client, mcp_servers, request, can_add_dirs).await?;
             (fresh, None)
         }
     };
@@ -1009,16 +1046,18 @@ async fn new_conversation(
     client: &Client,
     mcp_servers: &[McpServer],
     request: &StartRequest,
+    can_add_dirs: bool,
 ) -> Result<ClientSession, AcpError> {
-    client
+    let mut builder = client
         .new_session(&request.workdir)
-        .mcp_servers(mcp_servers.iter().cloned())
-        .open()
-        .await
-        .map_err(|source| AcpError::Agent {
-            context: "rejected `session/new`".to_owned(),
-            source,
-        })
+        .mcp_servers(mcp_servers.iter().cloned());
+    if can_add_dirs && !request.additional_directories.is_empty() {
+        builder = builder.additional_directories(request.additional_directories.iter().cloned());
+    }
+    builder.open().await.map_err(|source| AcpError::Agent {
+        context: "rejected `session/new`".to_owned(),
+        source,
+    })
 }
 
 fn restarted_fresh(config: &AcpConfig, method: &str, source: &ClientError) -> String {
@@ -1053,6 +1092,7 @@ fn describe_opened(client: &Client, session: ClientSession, notice: Option<Strin
     let resume = is_v2 || v1_session_cap(client, "resume");
     let close = is_v2 || v1_session_cap(client, "close");
     let list = is_v2 || v1_session_cap(client, "list");
+    let additional_directories = supports_additional_directories(client);
     let mcp_http = caps
         .session
         .as_ref()
@@ -1070,6 +1110,7 @@ fn describe_opened(client: &Client, session: ClientSession, notice: Option<Strin
         (resume, "acp:resume"),
         (close, "acp:close"),
         (list, "acp:list"),
+        (additional_directories, "acp:additional_directories"),
         (has_modes, "acp:modes"),
         (!state.config_options.is_empty(), "acp:config_options"),
         (mcp_http, "acp:mcp_http"),
@@ -1255,7 +1296,8 @@ async fn materialize_files(config: &AcpConfig, agent: Option<&AgentUser>) -> Res
             } else if !managed_policy
                 && let Some(user) = agent
                 && user.needs_uid_switch()
-                && parent.starts_with(flyco_provider::flycod::DEVIN_DATA_HOME)
+                && (parent.starts_with(flyco_provider::flycod::DEVIN_DATA_HOME)
+                    || parent.starts_with(flyco_provider::flycod::ANTIGRAVITY_GEMINI_DIR))
             {
                 chown_path(parent, Some(user.uid), Some(user.gid)).map_err(|error| {
                     AcpError::File {

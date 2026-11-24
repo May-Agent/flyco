@@ -34,6 +34,9 @@ pub struct StartRequest {
     pub workdir: PathBuf,
     /// A harness-native session id to resume, for cross-host History.
     pub resume_session_id: Option<String>,
+    /// Extra workspace directories to expose to ACP agents that advertise
+    /// `additionalDirectories` (such as multi-repo checkouts under `workdir`).
+    pub additional_directories: Vec<PathBuf>,
 }
 
 /// The user's answer to a [`SessionOutput::ApprovalRequest`].

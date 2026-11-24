@@ -1737,9 +1737,9 @@ async fn compact_session(
 ///
 /// What the usage panel's "detailed breakdown" asks for: a control request
 /// the daemon answers out of band —
-/// the Claude sidecar's `get_context_usage`, or the window gauge a Codex
-/// session already holds — never a message to the model. The answer
-/// arrives on the session relay as a `context_usage` harness event.
+/// Claude's `_claude/context_usage`, or the window gauge an ACP session
+/// already holds — never a message to the model. The answer arrives on the
+/// session relay as a `context_usage` harness event.
 #[skyzen::openapi]
 async fn context_session(
     State(user): State<CurrentUser>,

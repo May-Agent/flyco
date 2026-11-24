@@ -474,6 +474,11 @@ export interface paths {
         /**
          * Links a harness credential, replacing the credential for that harness.
          * @description Links a harness credential, replacing the credential for that harness.
+         *
+         *     Cost per call: 1 D1 write (`INSERT ... ON CONFLICT DO UPDATE`), 2 D1 reads
+         *     (model list and stored credential for [`usage`]), 0 KV/DO/R2 ops, and 0–1
+         *     vendor subrequests (1 for Devin `/v3/self` identity validation or Claude
+         *     subscription plan usage; 0 for API-key harnesses such as Antigravity).
          */
         post: operations["flyco_api::harness_accounts::link_harness_account"];
         delete?: never;
@@ -1939,9 +1944,9 @@ export interface paths {
          *
          *     What the usage panel's "detailed breakdown" asks for: a control request
          *     the daemon answers out of band —
-         *     the Claude sidecar's `get_context_usage`, or the window gauge a Codex
-         *     session already holds — never a message to the model. The answer
-         *     arrives on the session relay as a `context_usage` harness event.
+         *     Claude's `_claude/context_usage`, or the window gauge an ACP session
+         *     already holds — never a message to the model. The answer arrives on the
+         *     session relay as a `context_usage` harness event.
          */
         post: operations["flyco_api::app::context_session"];
         delete?: never;
@@ -4812,6 +4817,11 @@ export interface components {
             key: string;
             /** @enum {string} */
             kind: "devin_api_key";
+        } | {
+            /** @description Value for `GEMINI_API_KEY`. */
+            key: string;
+            /** @enum {string} */
+            kind: "antigravity_api_key";
         };
         /**
          * @description A normalized event extracted from either harness's native stream.
@@ -4892,6 +4902,8 @@ export interface components {
         };
         /** @description One row of the per-harness feature matrix. */
         HarnessFeature: {
+            /** @description Status on Antigravity. */
+            antigravity: components["schemas"]["Availability"];
             /** @description Status on Claude Code. */
             claude_code: components["schemas"]["Availability"];
             /** @description Status on Codex. */
@@ -4907,12 +4919,12 @@ export interface components {
          *
          *     This is the *product* vocabulary — what a session row names, what an
          *     account is linked to, what the picker offers. How each one is driven
-         *     is [`DriverKind`]'s question: every harness but Claude Code reaches
-         *     its agent over ACP, so a Codex session and a Devin session are the
-         *     same daemon machinery pointed at a different program.
+         *     is [`DriverKind`]'s question: every harness reaches its agent through
+         *     the unified ACP driver — Claude Code and Codex via in-process ACP hosts,
+         *     and Devin and Antigravity as ACP subprocesses.
          * @enum {string}
          */
-        HarnessKind: "claude_code" | "codex" | "devin";
+        HarnessKind: "claude_code" | "codex" | "devin" | "antigravity";
         /**
          * @description One thing a session's daemon saw happen to the harness account driving
          *     it, as `POST /v1/sessions/{id}/harness-observations` records it.
@@ -5232,7 +5244,7 @@ export interface components {
              */
             minutes?: number | null;
         };
-        /** @description Request to link a Claude Code, Codex, or Devin account. */
+        /** @description Request to link a Claude Code, Codex, Devin, or Antigravity account. */
         LinkHarnessAccount: {
             /** @description Authentication material, tagged with the mode that consumes it. */
             credential: components["schemas"]["HarnessCredentialInput"];
@@ -5811,19 +5823,17 @@ export interface components {
         /**
          * @description The permission mode a session runs under.
          *
-         *     Spelled the way the Claude Agent SDK spells its `PermissionMode` union,
-         *     in `camelCase`, so the sidecar passes the value straight into `query`'s
-         *     `permissionMode` option. Every mode other than [`Self::Default`] narrows
-         *     what reaches flyco's approval UI, because an auto-approved tool never
-         *     calls back.
+         *     Spelled in `camelCase` matching Claude Code's permission-mode union so
+         *     every boundary shares one canonical vocabulary. Every mode other than
+         *     [`Self::Default`] narrows what reaches flyco's approval UI, because an
+         *     auto-approved tool never calls back.
          *
          *     It lives in the domain model rather than in the daemon because it
          *     crosses every boundary flyco has: the control plane stores it on the
          *     session row and writes it into the `flycod` configuration it provisions
-         *     onto a machine, the daemon reads that configuration back and applies a
-         *     change to the running harness — `setPermissionMode` on Claude's live
-         *     query, `approvalPolicy`/`sandboxPolicy` overrides on Codex's next
-         *     `turn/start`.
+         *     onto a machine, and the daemon reads that configuration back and applies
+         *     mode changes to the running ACP session via `session/set_mode` and
+         *     `session/set_config_option`.
          * @enum {string}
          */
         PermissionMode: "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk" | "auto";
@@ -8544,6 +8554,8 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
+                        /** @description Status on Antigravity. */
+                        antigravity: components["schemas"]["Availability"];
                         /** @description Status on Claude Code. */
                         claude_code: components["schemas"]["Availability"];
                         /** @description Status on Codex. */

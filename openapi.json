@@ -1339,7 +1339,7 @@
       },
       "post": {
         "summary": "Links a harness credential, replacing the credential for that harness.",
-        "description": "Links a harness credential, replacing the credential for that harness.",
+        "description": "Links a harness credential, replacing the credential for that harness.\n\nCost per call: 1 D1 write (`INSERT ... ON CONFLICT DO UPDATE`), 2 D1 reads\n(model list and stored credential for [`usage`]), 0 KV/DO/R2 ops, and 0–1\nvendor subrequests (1 for Devin `/v3/self` identity validation or Claude\nsubscription plan usage; 0 for API-key harnesses such as Antigravity).",
         "operationId": "flyco_api::harness_accounts::link_harness_account",
         "requestBody": {
           "description": "Extractor arguments",
@@ -1347,7 +1347,7 @@
             "application/json": {
               "schema": {
                 "type": "object",
-                "description": "Request to link a Claude Code, Codex, or Devin account.",
+                "description": "Request to link a Claude Code, Codex, Devin, or Antigravity account.",
                 "required": [
                   "credential"
                 ],
@@ -1879,9 +1879,14 @@
                       "feature",
                       "claude_code",
                       "codex",
-                      "devin"
+                      "devin",
+                      "antigravity"
                     ],
                     "properties": {
+                      "antigravity": {
+                        "$ref": "#/components/schemas/Availability",
+                        "description": "Status on Antigravity."
+                      },
                       "claude_code": {
                         "$ref": "#/components/schemas/Availability",
                         "description": "Status on Claude Code."
@@ -6713,7 +6718,7 @@
     "/v1/sessions/{id}/context": {
       "post": {
         "summary": "Reports what a session's context window is spent on.",
-        "description": "Reports what a session's context window is spent on.\n\nWhat the usage panel's \"detailed breakdown\" asks for: a control request\nthe daemon answers out of band —\nthe Claude sidecar's `get_context_usage`, or the window gauge a Codex\nsession already holds — never a message to the model. The answer\narrives on the session relay as a `context_usage` harness event.",
+        "description": "Reports what a session's context window is spent on.\n\nWhat the usage panel's \"detailed breakdown\" asks for: a control request\nthe daemon answers out of band —\nClaude's `_claude/context_usage`, or the window gauge an ACP session\nalready holds — never a message to the model. The answer arrives on the\nsession relay as a `context_usage` harness event.",
         "operationId": "flyco_api::app::context_session",
         "parameters": [
           {
@@ -12390,6 +12395,26 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "A Gemini API key used by Antigravity CLI (`gemini-api-key` auth method).",
+            "required": [
+              "key",
+              "kind"
+            ],
+            "properties": {
+              "key": {
+                "type": "string",
+                "description": "Value for `GEMINI_API_KEY`."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "antigravity_api_key"
+                ]
+              }
+            }
           }
         ],
         "description": "A credential accepted when linking a Claude Code or Codex account.\n\nEach variant determines its harness, so the wire format cannot pair a\nClaude credential with Codex or vice versa. Secret fields are deliberately\nomitted from [`Debug`](core::fmt::Debug)."
@@ -12660,9 +12685,14 @@
           "feature",
           "claude_code",
           "codex",
-          "devin"
+          "devin",
+          "antigravity"
         ],
         "properties": {
+          "antigravity": {
+            "$ref": "#/components/schemas/Availability",
+            "description": "Status on Antigravity."
+          },
           "claude_code": {
             "$ref": "#/components/schemas/Availability",
             "description": "Status on Claude Code."
@@ -12683,11 +12713,12 @@
       },
       "HarnessKind": {
         "type": "string",
-        "description": "The coding harness driving a session. Flyco supports exactly these\nand never builds its own.\n\nThis is the *product* vocabulary — what a session row names, what an\naccount is linked to, what the picker offers. How each one is driven\nis [`DriverKind`]'s question: every harness but Claude Code reaches\nits agent over ACP, so a Codex session and a Devin session are the\nsame daemon machinery pointed at a different program.",
+        "description": "The coding harness driving a session. Flyco supports exactly these\nand never builds its own.\n\nThis is the *product* vocabulary — what a session row names, what an\naccount is linked to, what the picker offers. How each one is driven\nis [`DriverKind`]'s question: every harness reaches its agent through\nthe unified ACP driver — Claude Code and Codex via in-process ACP hosts,\nand Devin and Antigravity as ACP subprocesses.",
         "enum": [
           "claude_code",
           "codex",
-          "devin"
+          "devin",
+          "antigravity"
         ]
       },
       "HarnessObservation": {
@@ -13155,7 +13186,7 @@
       },
       "LinkHarnessAccount": {
         "type": "object",
-        "description": "Request to link a Claude Code, Codex, or Devin account.",
+        "description": "Request to link a Claude Code, Codex, Devin, or Antigravity account.",
         "required": [
           "credential"
         ],
@@ -14078,7 +14109,7 @@
       },
       "PermissionMode": {
         "type": "string",
-        "description": "The permission mode a session runs under.\n\nSpelled the way the Claude Agent SDK spells its `PermissionMode` union,\nin `camelCase`, so the sidecar passes the value straight into `query`'s\n`permissionMode` option. Every mode other than [`Self::Default`] narrows\nwhat reaches flyco's approval UI, because an auto-approved tool never\ncalls back.\n\nIt lives in the domain model rather than in the daemon because it\ncrosses every boundary flyco has: the control plane stores it on the\nsession row and writes it into the `flycod` configuration it provisions\nonto a machine, the daemon reads that configuration back and applies a\nchange to the running harness — `setPermissionMode` on Claude's live\nquery, `approvalPolicy`/`sandboxPolicy` overrides on Codex's next\n`turn/start`.",
+        "description": "The permission mode a session runs under.\n\nSpelled in `camelCase` matching Claude Code's permission-mode union so\nevery boundary shares one canonical vocabulary. Every mode other than\n[`Self::Default`] narrows what reaches flyco's approval UI, because an\nauto-approved tool never calls back.\n\nIt lives in the domain model rather than in the daemon because it\ncrosses every boundary flyco has: the control plane stores it on the\nsession row and writes it into the `flycod` configuration it provisions\nonto a machine, and the daemon reads that configuration back and applies\nmode changes to the running ACP session via `session/set_mode` and\n`session/set_config_option`.",
         "enum": [
           "default",
           "acceptEdits",

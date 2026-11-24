@@ -63,7 +63,9 @@ use flyco_core::{BranchName, MachineId, MachineOrigin, PermissionMode, RepoSlug,
 use serde::{Deserialize, Serialize};
 
 pub use clock::{MonotonicClock, SystemClock, SystemWallClock, WallClock};
-pub use flycod::{ClaudeCredential, CodexCredential, DevinCredential, HarnessCredential};
+pub use flycod::{
+    AntigravityCredential, ClaudeCredential, CodexCredential, DevinCredential, HarnessCredential,
+};
 pub use http::{HttpError, HttpRequest, HttpResponse, HttpTransport, LiveTransport};
 
 /// Which capacity market a running machine actually holds.

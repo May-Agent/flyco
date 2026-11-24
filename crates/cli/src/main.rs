@@ -84,6 +84,16 @@ async fn dispatch(cli: Cli) -> Outcome<Exit> {
         Some(Command::Devin { repo, spec }) => {
             human::launch(&api, flyco_core::HarnessKind::Devin, repo, &spec, mode).await
         }
+        Some(Command::Antigravity { repo, spec }) => {
+            human::launch(
+                &api,
+                flyco_core::HarnessKind::Antigravity,
+                repo,
+                &spec,
+                mode,
+            )
+            .await
+        }
         Some(Command::Handoff {
             from,
             session,

@@ -703,29 +703,41 @@ async fn drive_claude_code(
         )
         .with_agent(agent.clone())
     };
+    let additional_directories = config
+        .repos
+        .iter()
+        .map(|repo| repo.checkout_path(&config.workdir))
+        .collect();
     let started = harness
         .start(StartRequest {
             workdir: config.workdir.clone(),
             resume_session_id: config.resume_session_id.clone(),
+            additional_directories,
         })
         .await?;
     Box::pin(report(config, started, agent, desktop_socket)).await
 }
 
-/// Drives an ACP session — Codex, Devin, or any other agent the `[acp]`
-/// table names — reporting to a control plane if the configuration names
-/// one and to the terminal otherwise.
+/// Drives an ACP session — Codex, Devin, Antigravity, or any other agent the
+/// `[acp]` table names — reporting to a control plane if the configuration
+/// names one and to the terminal otherwise.
 async fn drive_acp(
     config: DaemonConfig,
     mount: Mount,
     agent: Option<AgentUser>,
     desktop_socket: PathBuf,
 ) -> Result<(), Failure> {
+    let additional_directories = config
+        .repos
+        .iter()
+        .map(|repo| repo.checkout_path(&config.workdir))
+        .collect();
     let harness = AcpHarness::new(config.acp().clone(), mount).with_agent(agent.clone());
     let started = harness
         .start(StartRequest {
             workdir: config.workdir.clone(),
             resume_session_id: config.resume_session_id.clone(),
+            additional_directories,
         })
         .await?;
     Box::pin(report(config, started, agent, desktop_socket)).await

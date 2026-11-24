@@ -87,12 +87,12 @@ const MODES: readonly ModeOption[] = [AUTO, ASK, PLAN, ACCEPT_EDITS, BYPASS, DON
 /**
  * The modes a harness's picker offers, in menu order.
  *
- * Codex expresses every mode as an approval/sandbox pair and Devin floors
- * it to `plan`, so for both `dontAsk` is a second row for `plan`'s
- * behavior and the list stops at five.
+ * Codex expresses every mode as an approval/sandbox pair, and Devin and
+ * Antigravity floor `dontAsk` to `plan`, so for those three `dontAsk` is a
+ * second row for `plan`'s behavior and the list stops at five.
  */
 export function modesFor(harness: HarnessKind): ModeOption[] {
-  if (harness === "codex" || harness === "devin") {
+  if (harness === "codex" || harness === "devin" || harness === "antigravity") {
     return MODES.filter((mode) => mode.id !== "dontAsk");
   }
   return [...MODES];

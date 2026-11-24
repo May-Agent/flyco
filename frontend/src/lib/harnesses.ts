@@ -5,4 +5,5 @@ export const HARNESS_LABEL: Record<HarnessKind, string> = {
   claude_code: "Claude Code",
   codex: "Codex",
   devin: "Devin",
+  antigravity: "Antigravity",
 };
