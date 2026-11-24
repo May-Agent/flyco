@@ -1725,7 +1725,7 @@ async fn the_job_body_is_the_documented_shape() {
     assert_eq!(
         container["image"],
         format!(
-            "ghcr.io/lexoliu/flyco-session:wire-{}",
+            "ghcr.io/may-agent/flyco-session:wire-{}",
             flyco_core::WIRE_PROTOCOL_VERSION
         )
     );

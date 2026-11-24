@@ -1158,7 +1158,7 @@ async fn provisioning_a_container_creates_the_job_then_runs_it() {
     assert_eq!(
         container["image"],
         format!(
-            "ghcr.io/lexoliu/flyco-session:wire-{}",
+            "ghcr.io/may-agent/flyco-session:wire-{}",
             flyco_core::WIRE_PROTOCOL_VERSION
         ),
         "pinned to this control plane's wire protocol, never `latest`"

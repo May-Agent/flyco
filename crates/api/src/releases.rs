@@ -1,11 +1,11 @@
 //! Public execution-plane release artifacts.
 //!
-//! The source repository is private, so GitHub release URLs cannot bootstrap
-//! an unauthenticated VM. Large binaries also cannot ride inside the Worker:
-//! the free Worker bundle limit is smaller than one `flycod` build. They live
-//! in the deployment's R2 bucket and this module exposes only the objects
-//! [`flyco_core::release`] names — the same table `cargo xtask publish-flycod`
-//! writes, so the allowlist and the publisher cannot drift apart.
+//! Large binaries cannot ride inside the Worker: the free Worker bundle limit
+//! is smaller than one `flycod` build. They live in the deployment's R2 bucket
+//! so every channel serves the exact artifacts its wire protocol expects, and
+//! this module exposes only the objects [`flyco_core::release`] names — the
+//! same table `cargo xtask publish-flycod` writes, so the allowlist and the
+//! publisher cannot drift apart.
 
 use flyco_core::release;
 use skyzen_services::{Storage, StorageError};

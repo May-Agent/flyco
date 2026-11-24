@@ -65,10 +65,10 @@ const UPLOAD_TOOLS: [RequiredTool; 1] = [RequiredTool {
     install: "npm install --global wrangler",
 }];
 
-/// How the registry is logged into when a push is refused: the same GitHub
-/// account the repository lives under, with the one scope a package push
-/// needs.
-const REGISTRY_LOGIN: &str = "gh auth refresh --hostname github.com --scopes write:packages && gh auth token | docker login ghcr.io --username lexoliu --password-stdin";
+/// How the registry is logged into when a push is refused: any GitHub account
+/// with package write access to the `May-Agent` organization, with the one
+/// scope a package push needs.
+const REGISTRY_LOGIN: &str = "gh auth refresh --hostname github.com --scopes write:packages && gh auth token | docker login ghcr.io --username \"$(gh api user --jq .login)\" --password-stdin";
 
 /// Builds and publishes the `flycod` release artifacts.
 #[derive(Debug, Parser)]

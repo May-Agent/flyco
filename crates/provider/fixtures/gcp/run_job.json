@@ -16,7 +16,7 @@
     "template": {
       "containers": [
         {
-          "image": "ghcr.io/lexoliu/flyco-session:wire-11",
+          "image": "ghcr.io/may-agent/flyco-session:wire-11",
           "env": [
             {
               "name": "FLYCO_DAEMON_CONFIG",

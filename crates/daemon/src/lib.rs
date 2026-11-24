@@ -56,7 +56,7 @@
 //! `flycod mcp` is a second process, launched by the harness rather than by
 //! the machine, speaking MCP over its own stdio.
 //!
-//! [`flyco_api`]: https://github.com/lexoliu/flyco/tree/main/crates/api
+//! [`flyco_api`]: https://github.com/May-Agent/flyco/tree/main/crates/api
 
 pub mod codespace;
 pub mod config;

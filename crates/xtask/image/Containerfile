@@ -8,6 +8,7 @@
 # binaries are bind-mounted into the install step rather than copied, so
 # neither ends up in a layer of the image.
 FROM ubuntu:24.04
+LABEL org.opencontainers.image.source="https://github.com/May-Agent/flyco"
 ARG TARGETARCH
 RUN --mount=type=bind,source=flycod.sh,target=/tmp/flycod.sh \
     --mount=type=bind,source=flycod-linux-x86_64,target=/tmp/bin/amd64 \

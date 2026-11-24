@@ -812,14 +812,14 @@ mod tests {
         assert_eq!(
             channel.image_tags(9, false),
             vec![
-                "ghcr.io/lexoliu/flyco-session:dev".to_owned(),
-                "ghcr.io/lexoliu/flyco-session:wire-9".to_owned(),
-                "ghcr.io/lexoliu/flyco-session:latest".to_owned(),
+                "ghcr.io/may-agent/flyco-session:dev".to_owned(),
+                "ghcr.io/may-agent/flyco-session:wire-9".to_owned(),
+                "ghcr.io/may-agent/flyco-session:latest".to_owned(),
             ]
         );
         assert_eq!(
             channel.image_tags(9, true),
-            vec!["ghcr.io/lexoliu/flyco-session:wire-9".to_owned()]
+            vec!["ghcr.io/may-agent/flyco-session:wire-9".to_owned()]
         );
     }
 
@@ -858,7 +858,7 @@ mod tests {
         assert!(
             mismatch
                 .args
-                .contains(&"ghcr.io/lexoliu/flyco-session:wire-9".to_owned())
+                .contains(&"ghcr.io/may-agent/flyco-session:wire-9".to_owned())
         );
 
         let loaded = Invocation::image_build(channel, stage, 9, false, false);
@@ -898,10 +898,10 @@ mod tests {
 
     #[test]
     fn the_smoke_test_asks_the_daemon_inside_the_image_its_version() {
-        let smoke = Invocation::image_smoke("ghcr.io/lexoliu/flyco-session:dev");
+        let smoke = Invocation::image_smoke("ghcr.io/may-agent/flyco-session:dev");
         assert_eq!(
             smoke.to_string(),
-            "docker run --rm --entrypoint /usr/local/bin/flycod 'ghcr.io/lexoliu/flyco-session:dev' --version"
+            "docker run --rm --entrypoint /usr/local/bin/flycod 'ghcr.io/may-agent/flyco-session:dev' --version"
         );
     }
 

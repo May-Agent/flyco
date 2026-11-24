@@ -20,7 +20,7 @@
     "containerDefinitions": [
       {
         "name": "session",
-        "image": "ghcr.io/lexoliu/flyco-session:wire-9",
+        "image": "ghcr.io/may-agent/flyco-session:wire-9",
         "essential": true,
         "stopTimeout": 120,
         "cpu": 0,

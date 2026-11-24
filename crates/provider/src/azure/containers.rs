@@ -894,7 +894,7 @@ mod tests {
     #[test]
     fn the_container_is_pinned_to_the_wire_this_control_plane_speaks() {
         let image = release::session_image_for_wire_protocol();
-        assert!(image.starts_with("ghcr.io/lexoliu/flyco-session:wire-"));
+        assert!(image.starts_with("ghcr.io/may-agent/flyco-session:wire-"));
         assert!(!image.ends_with(":latest"));
 
         let rendered = serde_json::to_value(template(Size::OFFERED[2])).expect("serialize");
