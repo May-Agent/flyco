@@ -9,22 +9,22 @@
 
 use core::time::Duration;
 
+use rand::RngExt as _;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
-use zenwave::{Client as _, Method, ResponseExt as _, sse::SseStream};
+use zenwave::{Client as _, Method, ResponseExt as _};
 
 use crate::{Exit, Failure};
 
 /// How many times a retryable `GET` is sent after the first.
 const GET_ATTEMPTS: u32 = 3;
 
-/// The backoff ladder a retry climbs when the server named no `Retry-After`.
-const RETRY_BACKOFF: [Duration; GET_ATTEMPTS as usize] = [
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-];
+/// Floor of the `GET` retry backoff ladder.
+const GET_BACKOFF_MIN: Duration = Duration::from_millis(500);
+
+/// Ceiling of the `GET` retry backoff ladder.
+const GET_BACKOFF_MAX: Duration = Duration::from_secs(2);
 
 /// The longest a single request may take before the transport gives up.
 ///
@@ -40,6 +40,27 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// inside a `GET` retry.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 
+/// Capped exponential backoff with full jitter (`crates/daemon/src/control/wire.rs`).
+#[must_use]
+pub(crate) fn backoff(min: Duration, max: Duration, attempt: u32) -> Duration {
+    let ceiling = min.saturating_mul(1_u32 << attempt.min(6)).min(max);
+    let max_ms = u64::try_from(ceiling.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1);
+    let jittered = rand::rng().random_range(1..=max_ms);
+    Duration::from_millis(jittered)
+}
+
+/// Whether an RFC 9457 problem body names a daily/row budget exhaustion that
+/// must stop immediately without retrying.
+#[must_use]
+pub(crate) fn is_budget_exhausted_body(body: &str) -> bool {
+    serde_json::from_str::<flyco_core::Problem>(body).is_ok_and(|problem| {
+        problem.kind.ends_with("/request-budget-exhausted")
+            || problem.kind.ends_with("/row-budget-exhausted")
+    })
+}
+
 /// A bearer-token-authenticated handle on the control plane.
 #[derive(Debug, Clone)]
 pub struct Api {
@@ -50,7 +71,7 @@ pub struct Api {
 /// The verbs the client speaks, so `send` can tell a `GET` worth retrying
 /// from everything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verb {
+pub(crate) enum Verb {
     Get,
     Post,
     Put,
@@ -133,15 +154,24 @@ impl Api {
         self.request(Verb::Post, path, Some(body), headers).await
     }
 
-    /// `POST path` with no body, accepting whatever the route answers.
+    /// `POST path` with no body, accepting an empty `202`/`204` or any `2xx`
+    /// status without decoding JSON.
     ///
     /// # Errors
-    /// Returns [`Failure`](crate::Failure) when the request cannot be sent,
-    /// the answer is a problem document, or the body does not decode.
+    /// Returns [`Failure`](crate::Failure) when the request cannot be sent or
+    /// the answer is a problem document.
     pub async fn post_empty(&self, path: &str) -> crate::Outcome<()> {
-        self.request::<(), serde_json::Value>(Verb::Post, path, None, &[])
-            .await?;
-        Ok(())
+        self.request_empty::<()>(Verb::Post, path, None, &[]).await
+    }
+
+    /// `POST path` with a JSON body, accepting an empty `202`/`204` or any
+    /// `2xx` status without decoding JSON.
+    ///
+    /// # Errors
+    /// Returns [`Failure`](crate::Failure) when the request cannot be sent or
+    /// the answer is a problem document.
+    pub async fn post_json_empty<B: Serialize>(&self, path: &str, body: &B) -> crate::Outcome<()> {
+        self.request_empty(Verb::Post, path, Some(body), &[]).await
     }
 
     /// `PATCH path` with a JSON body, decoding the JSON answer.
@@ -170,6 +200,16 @@ impl Api {
         self.request(Verb::Put, path, Some(body), &[]).await
     }
 
+    /// `PUT path` with a JSON body, accepting any `2xx` status without
+    /// decoding JSON.
+    ///
+    /// # Errors
+    /// Returns [`Failure`](crate::Failure) when the request cannot be sent or
+    /// the answer is a problem document.
+    pub async fn put_json_empty<B: Serialize>(&self, path: &str, body: &B) -> crate::Outcome<()> {
+        self.request_empty(Verb::Put, path, Some(body), &[]).await
+    }
+
     /// `PUT path` with an opaque byte body, answering no document.
     ///
     /// The handoff uploads are the callers: a patch is not JSON and the
@@ -190,7 +230,7 @@ impl Api {
         let response = with_timeout(async move { builder.bytes_body(body).await })
             .await
             .map_err(|error| refused_or_transport("PUT", path, error))?;
-        refused(path, response.status().as_u16(), response).await
+        refused("PUT", path, response.status().as_u16(), response).await
     }
 
     /// `PUT path` streaming a file as the body — the transcript upload's
@@ -215,18 +255,17 @@ impl Api {
         let response = with_timeout(async move { builder.await })
             .await
             .map_err(|error| refused_or_transport("PUT", path, error))?;
-        refused(path, response.status().as_u16(), response).await
+        refused("PUT", path, response.status().as_u16(), response).await
     }
 
-    /// `DELETE path`.
+    /// `DELETE path`, accepting an empty `204` or any `2xx` status.
     ///
     /// # Errors
-    /// Returns [`Failure`](crate::Failure) when the request cannot be sent,
-    /// the answer is a problem document, or the body does not decode.
+    /// Returns [`Failure`](crate::Failure) when the request cannot be sent or
+    /// the answer is a problem document.
     pub async fn delete(&self, path: &str) -> crate::Outcome<()> {
-        self.request::<(), serde_json::Value>(Verb::Delete, path, None, &[])
-            .await?;
-        Ok(())
+        self.request_empty::<()>(Verb::Delete, path, None, &[])
+            .await
     }
 
     /// `GET path` and answer with the status code alone.
@@ -236,8 +275,7 @@ impl Api {
     /// code and the body both.
     ///
     /// # Errors
-    /// Returns [`Failure`](crate::Failure) when the request cannot be sent,
-    /// the answer is a problem document, or the body does not decode.
+    /// Returns [`Failure`](crate::Failure) when the request cannot be sent.
     pub async fn poll(&self, path: &str) -> crate::Outcome<zenwave::Response> {
         let url = self.url(path)?;
         let mut client = zenwave::client();
@@ -252,16 +290,15 @@ impl Api {
             .map_err(|error| refused_or_transport("GET", path, error))
     }
 
-    /// `GET path` as an SSE stream.
+    /// `GET path` as a raw SSE response body.
     ///
     /// The response's status is checked before the body is handed over —
-    /// zenwave's `into_sse` would otherwise happily parse a problem
-    /// document as event data.
+    /// an SSE parser would otherwise parse a problem document as event data.
     ///
     /// # Errors
-    /// Returns [`Failure`](crate::Failure) when the request cannot be sent,
-    /// the answer is a problem document, or the body does not decode.
-    pub async fn sse(&self, path: &str) -> crate::Outcome<SseStream> {
+    /// Returns [`Failure`](crate::Failure) when the request cannot be sent or
+    /// the answer is a problem document.
+    pub async fn sse(&self, path: &str) -> crate::Outcome<zenwave::Body> {
         let url = self.url(path)?;
         let mut client = zenwave::client();
         let mut builder = client
@@ -279,10 +316,22 @@ impl Api {
             let body = response.into_string().await.unwrap_or_default();
             return Err(problem("GET", path, status, body.as_str(), wait));
         }
-        Ok(response.into_sse())
+        Ok(response.into_body())
     }
 
-    /// One request, retried when the verb allows it and the failure says to.
+    /// Sends a request without reading or decoding a response body.
+    async fn request_empty<B: Serialize>(
+        &self,
+        verb: Verb,
+        path: &str,
+        body: Option<&B>,
+        headers: &[(&str, &str)],
+    ) -> crate::Outcome<()> {
+        self.send_retried(verb, path, body, headers).await?;
+        Ok(())
+    }
+
+    /// One request, decoding a JSON body on success.
     async fn request<B: Serialize, T: DeserializeOwned>(
         &self,
         verb: Verb,
@@ -290,17 +339,27 @@ impl Api {
         body: Option<&B>,
         headers: &[(&str, &str)],
     ) -> crate::Outcome<T> {
+        let response = self.send_retried(verb, path, body, headers).await?;
+        response
+            .into_json::<T>()
+            .await
+            .map_err(|error| transport(verb_name(verb), path, error).with_transient(false))
+    }
+
+    /// One request, retried when the verb allows it and the failure says to.
+    async fn send_retried<B: Serialize>(
+        &self,
+        verb: Verb,
+        path: &str,
+        body: Option<&B>,
+        headers: &[(&str, &str)],
+    ) -> crate::Outcome<zenwave::Response> {
         let url = self.url(path)?;
         let mut attempt = 0;
         loop {
             attempt += 1;
             match self.send(verb, &url, body, headers).await {
-                Ok(response) => {
-                    return response
-                        .into_json::<T>()
-                        .await
-                        .map_err(|error| transport(verb_name(verb), path, error));
-                }
+                Ok(response) => return Ok(response),
                 Err(error) => {
                     let retryable = verb.safe() && attempt <= GET_ATTEMPTS;
                     let Some(wait) = retry_wait(&error, retryable, attempt) else {
@@ -359,7 +418,7 @@ const fn verb_name(verb: Verb) -> &'static str {
 /// What a failed request's answer says about trying again.
 #[derive(Debug, Clone, Copy)]
 enum Retry {
-    /// The failure is final — a 4xx, a body that did not decode.
+    /// The failure is final — a 4xx, budget exhaustion, or a body that did not decode.
     Never,
     /// Retryable, and the server named no wait: climb the backoff ladder.
     Default,
@@ -377,28 +436,37 @@ fn retry_wait(error: &zenwave::Error, retryable: bool, attempt: u32) -> Option<D
     }
     match retry_after(error) {
         Retry::After(named) if named <= MAX_RETRY_AFTER => Some(named),
-        Retry::Default => Some(RETRY_BACKOFF[(attempt - 1) as usize]),
+        Retry::Default => Some(backoff(GET_BACKOFF_MIN, GET_BACKOFF_MAX, attempt - 1)),
         _ => None,
     }
 }
 
 /// The wait a failed request asked for, if the failure is one worth
-/// waiting out: `429` and `5xx` honor `Retry-After`, and a transport or
-/// timeout failure retries on the default ladder.
+/// waiting out: `429` (except budget exhaustion) and `5xx` honor `Retry-After`,
+/// and a transport, I/O, or timeout failure retries on the default ladder.
 fn retry_after(error: &zenwave::Error) -> Retry {
     match error {
         zenwave::Error::Http {
             status, response, ..
         } => {
+            if response
+                .body_text
+                .as_deref()
+                .is_some_and(is_budget_exhausted_body)
+            {
+                return Retry::Never;
+            }
             let retryable = status.as_u16() == 429 || status.is_server_error();
             if !retryable {
                 return Retry::Never;
             }
             named_wait(&response.response).map_or(Retry::Default, Retry::After)
         }
-        zenwave::Error::Transport(_) | zenwave::Error::Tls(_) | zenwave::Error::Timeout => {
-            Retry::Default
-        }
+        zenwave::Error::Transport(_)
+        | zenwave::Error::Tls(_)
+        | zenwave::Error::Timeout
+        | zenwave::Error::Io(_)
+        | zenwave::Error::Proxy(_) => Retry::Default,
         _ => Retry::Never,
     }
 }
@@ -406,7 +474,7 @@ fn retry_after(error: &zenwave::Error) -> Retry {
 /// The `Retry-After` seconds a response named, if it named a number —
 /// the header is also allowed to be an HTTP date, which this control
 /// plane never sends.
-fn named_wait(response: &zenwave::Response) -> Option<Duration> {
+pub(crate) fn named_wait(response: &zenwave::Response) -> Option<Duration> {
     response
         .headers()
         .get("retry-after")
@@ -428,13 +496,18 @@ fn refused_wait(response: &zenwave::Response, status: u16) -> Option<Duration> {
 
 /// The status check the raw-body paths share: a success is `()`, anything
 /// else is a problem document to repeat.
-async fn refused(path: &str, status: u16, response: zenwave::Response) -> crate::Outcome<()> {
+async fn refused(
+    verb: &'static str,
+    path: &str,
+    status: u16,
+    response: zenwave::Response,
+) -> crate::Outcome<()> {
     if (200..300).contains(&status) {
         return Ok(());
     }
     let wait = refused_wait(&response, status);
     let body = response.into_string().await.unwrap_or_default();
-    Err(problem("PUT", path, status, &body, wait))
+    Err(problem(verb, path, status, &body, wait))
 }
 
 /// A transport-level failure: nothing was answered, so there is no problem
@@ -457,10 +530,18 @@ fn refused_or_transport(verb: &'static str, path: &str, error: zenwave::Error) -
         let wait = refused_wait(&response.response, status.as_u16());
         return problem(verb, path, status.as_u16(), body, wait);
     }
-    transport(verb, path, error)
+    let is_transient = matches!(
+        &error,
+        zenwave::Error::Transport(_)
+            | zenwave::Error::Tls(_)
+            | zenwave::Error::Timeout
+            | zenwave::Error::Io(_)
+            | zenwave::Error::Proxy(_)
+    );
+    transport(verb, path, error).with_transient(is_transient)
 }
 
-fn problem(
+pub(crate) fn problem(
     verb: &str,
     path: &str,
     status: u16,
@@ -472,22 +553,76 @@ fn problem(
         404 | 409 | 410 => Exit::NotFoundOrConflict,
         _ => Exit::Problem,
     };
+    let budget_exhausted = is_budget_exhausted_body(body);
+    let transient = !budget_exhausted && (500..600).contains(&status);
     let text = if body.trim().is_empty() {
         format!("{verb} {path}: HTTP {status}")
     } else {
         body.trim().to_owned()
     };
     Failure::refused(code, text, retry_after)
+        .with_transient(transient)
+        .with_budget_exhausted(budget_exhausted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    async fn serve_responses(responses: Vec<String>) -> (Url, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let port = listener.local_addr().expect("port").port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&count);
+        let responses = Arc::new(responses);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let idx = counter.fetch_add(1, Ordering::SeqCst);
+                let answer = responses
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| responses.last().cloned().expect("non-empty"));
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => request.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    let _ = socket.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        (
+            Url::parse(&format!("http://127.0.0.1:{port}")).expect("url"),
+            count,
+        )
+    }
+
+    fn empty_status(status: u16, reason: &str) -> String {
+        format!("HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+    }
 
     /// A `429` failure carrying `Retry-After: <secs>`.
-    fn rate_limited(secs: u64) -> zenwave::Error {
+    fn rate_limited(secs: u64, kind: &str) -> zenwave::Error {
         let status = zenwave::StatusCode::TOO_MANY_REQUESTS;
-        let mut response = zenwave::Response::new(zenwave::Body::from_bytes("{}"));
+        let body = serde_json::json!({
+            "type": format!("https://flyco.dev/problems/{kind}"),
+            "title": kind,
+            "status": 429,
+            "detail": kind,
+        })
+        .to_string();
+        let mut response = zenwave::Response::new(zenwave::Body::from_bytes(body.clone()));
         *response.status_mut() = status;
         response.headers_mut().insert(
             "retry-after",
@@ -499,19 +634,154 @@ mod tests {
             message: "too many requests".to_owned(),
             response: Box::new(zenwave::error::HttpErrorResponse {
                 response,
-                body_text: None,
+                body_text: Some(body),
             }),
         }
     }
 
     /// A `Retry-After` past [`MAX_RETRY_AFTER`] is the daily budget spent:
     /// `retry_wait` treats it like a final failure — `None`, never a
-    /// sleep — while a wait inside the cap is honored verbatim.
+    /// sleep — while a wait inside the cap for `rate-limited` is honored verbatim.
+    /// `request-budget-exhausted` and `row-budget-exhausted` stop immediately even
+    /// when `Retry-After` is small (e.g. near UTC midnight).
     #[test]
-    fn retry_after_over_the_cap_is_never_retried() {
-        let over = rate_limited(MAX_RETRY_AFTER.as_secs() + 1);
+    fn retry_after_over_the_cap_or_budget_exhausted_is_never_retried() {
+        let over = rate_limited(MAX_RETRY_AFTER.as_secs() + 1, "rate-limited");
         assert!(retry_wait(&over, true, 1).is_none());
-        let under = rate_limited(30);
+        let under = rate_limited(30, "rate-limited");
         assert_eq!(retry_wait(&under, true, 1), Some(Duration::from_secs(30)));
+        let exhausted = rate_limited(5, "request-budget-exhausted");
+        assert!(retry_wait(&exhausted, true, 1).is_none());
+        let row_exhausted = rate_limited(5, "row-budget-exhausted");
+        assert!(retry_wait(&row_exhausted, true, 1).is_none());
+    }
+
+    #[test]
+    fn io_errors_are_retryable_on_get() {
+        let err = zenwave::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        let wait = retry_wait(&err, true, 1).expect("Io errors retry");
+        assert!(wait >= Duration::from_millis(1) && wait <= GET_BACKOFF_MIN);
+    }
+
+    #[test]
+    fn backoff_is_capped_and_jittered() {
+        let samples: Vec<Duration> = (0..64)
+            .map(|_| backoff(Duration::from_millis(500), Duration::from_secs(2), 5))
+            .collect();
+        for sample in &samples {
+            assert!(*sample >= Duration::from_millis(1));
+            assert!(*sample <= Duration::from_secs(2));
+        }
+        let first = samples[0];
+        assert!(samples.iter().any(|s| *s != first), "jitter should vary");
+    }
+
+    #[tokio::test]
+    async fn empty_202_and_204_responses_succeed_without_json_decoding() {
+        let (base, count) = serve_responses(vec![
+            empty_status(202, "Accepted"),
+            empty_status(204, "No Content"),
+            empty_status(202, "Accepted"),
+            empty_status(204, "No Content"),
+            empty_status(204, "No Content"),
+        ])
+        .await;
+        let api = Api::new(base, None);
+        api.post_empty("/v1/sessions/s/machine/stop")
+            .await
+            .expect("post_empty 202");
+        api.post_empty("/v1/sessions/s/interrupt")
+            .await
+            .expect("post_empty 204");
+        api.post_json_empty(
+            "/v1/sessions/s/messages",
+            &serde_json::json!({"text": "hi"}),
+        )
+        .await
+        .expect("post_json_empty 202");
+        api.post_json_empty("/v1/sessions/s/handoff/complete", &serde_json::json!({}))
+            .await
+            .expect("post_json_empty 204");
+        api.delete("/v1/api-keys/k").await.expect("delete 204");
+        assert_eq!(count.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn empty_helpers_still_surface_problem_responses() {
+        let body = serde_json::json!({
+            "type": "https://flyco.dev/problems/request-budget-exhausted",
+            "title": "request budget exhausted",
+            "status": 429,
+            "detail": "daily limit reached",
+        })
+        .to_string();
+        let resp = format!(
+            "HTTP/1.1 429 Too Many Requests\r\n\
+             content-type: application/problem+json\r\n\
+             retry-after: 15\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base, _) = serve_responses(vec![resp]).await;
+        let api = Api::new(base, None);
+        let failure = api
+            .post_empty("/v1/sessions/s/machine/stop")
+            .await
+            .expect_err("429 should fail");
+        assert_eq!(failure.code, Exit::Problem);
+        assert!(failure.is_budget_exhausted());
+        assert!(!failure.is_transient());
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(15)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn get_retries_503() {
+        let problem_503 =
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                .to_owned();
+        let ok_200 = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 8\r\nconnection: close\r\n\r\n{\"ok\":1}".to_owned();
+        let (base, count) = serve_responses(vec![problem_503, ok_200]).await;
+        let task = tokio::spawn(async move {
+            let api = Api::new(base, None);
+            api.get::<serde_json::Value>("/v1/me").await
+        });
+        for _ in 0..200 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(50)).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        let value = task.await.expect("join").expect("retries 503");
+        assert_eq!(value["ok"], 1);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn get_stops_immediately_on_budget_exhausted() {
+        let body = serde_json::json!({
+            "type": "https://flyco.dev/problems/request-budget-exhausted",
+            "title": "request budget exhausted",
+            "status": 429,
+            "detail": "wait",
+        })
+        .to_string();
+        let exhausted = format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/problem+json\r\nretry-after: 5\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (base, count) = serve_responses(vec![exhausted]).await;
+        let api = Api::new(base, None);
+        let err = api
+            .get::<serde_json::Value>("/v1/me")
+            .await
+            .expect_err("budget exhausted stops immediately");
+        assert!(err.is_budget_exhausted(), "{}", err.text);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 }

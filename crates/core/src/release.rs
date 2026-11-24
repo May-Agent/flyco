@@ -60,6 +60,21 @@ impl PublishedObject {
             self.name.to_owned()
         }
     }
+
+    /// Content-addressed key below `releases/<channel>/` for a versioned
+    /// binary, pinning a specific SHA-256 digest across edge-cache windows.
+    #[must_use]
+    pub fn versioned_digest_key(&self, sha256: &str) -> String {
+        if self.versioned {
+            format!(
+                "wire-{}/{sha256}/{}",
+                crate::WIRE_PROTOCOL_VERSION,
+                self.name
+            )
+        } else {
+            self.name.to_owned()
+        }
+    }
 }
 
 /// Media type of an executable the installer downloads and runs.

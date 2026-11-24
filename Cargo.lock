@@ -2366,10 +2366,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dialoguer",
+ "eventsource-stream",
  "flyco-core",
+ "futures-core",
  "futures-util",
  "hex",
  "open",
+ "rand 0.10.4",
  "rustix",
  "serde",
  "serde_json",

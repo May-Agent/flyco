@@ -92,14 +92,33 @@ async fn public_config(State(config): State<ApiConfig>) -> Json<PublicConfig> {
     })
 }
 
-/// Serves one allowlisted execution-plane binary or checksum from R2.
-async fn get_release_artifact(params: Params, storage: Storage) -> Outcome<Response> {
-    read_release_artifact(&params, &storage).await.into()
+/// Optional content-address query on `/install/{artifact}`.
+#[derive(Debug, Default, Deserialize, skyzen::ToSchema)]
+struct ReleaseArtifactQuery {
+    /// 64-hex SHA-256 digest pinning a versioned binary across edge-cache windows.
+    sha256: Option<String>,
 }
 
-async fn read_release_artifact(params: &Params, storage: &Storage) -> Result<Response, ApiError> {
+/// Serves one allowlisted execution-plane binary or checksum from R2.
+///
+/// Costs one R2 `get` per cache miss.
+async fn get_release_artifact(
+    params: Params,
+    Query(query): Query<ReleaseArtifactQuery>,
+    storage: Storage,
+) -> Outcome<Response> {
+    read_release_artifact(&params, query.sha256.as_deref(), &storage)
+        .await
+        .into()
+}
+
+async fn read_release_artifact(
+    params: &Params,
+    sha256: Option<&str>,
+    storage: &Storage,
+) -> Result<Response, ApiError> {
     let name = path_segment(params, "artifact")?;
-    let artifact = releases::get(storage, &name)
+    let artifact = releases::get_with_digest(storage, &name, sha256)
         .await?
         .ok_or(ApiError::ReleaseArtifactNotFound)?;
     let mut response = Response::new(skyzen::Body::from(artifact.body));
@@ -107,9 +126,14 @@ async fn read_release_artifact(params: &Params, storage: &Storage) -> Result<Res
         skyzen::header::CONTENT_TYPE,
         skyzen::header::HeaderValue::from_static(artifact.content_type),
     );
+    let cache_control = if sha256.is_some() {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=60"
+    };
     response.headers_mut().insert(
         skyzen::header::CACHE_CONTROL,
-        skyzen::header::HeaderValue::from_static("public, max-age=60"),
+        skyzen::header::HeaderValue::from_static(cache_control),
     );
     Ok(response)
 }

@@ -139,6 +139,8 @@ pub async fn create(
         false,
         "--prompt",
     )?;
+    let mut spec = spec.clone();
+    spec.resolve_runtime(api).await?;
     let request = spec.to_request(harness, prompt)?;
     let headers: &[(&str, &str)] = match &spec.idempotency_key {
         Some(key) => &[("Idempotency-Key", key.as_str())],
@@ -177,12 +179,11 @@ pub async fn send(
     stdin_flag: bool,
 ) -> Outcome<()> {
     let text = resolve_text(text, file, stdin_flag, "--message or --file or --stdin")?;
-    api.post::<SendMessage, serde_json::Value>(
+    api.post_json_empty(
         &format!("/v1/sessions/{id}/messages"),
         &SendMessage { text },
     )
-    .await?;
-    Ok(())
+    .await
 }
 
 /// `session exec` — `!cmd` sugared: post the command, follow the session's
@@ -199,8 +200,9 @@ pub async fn exec(api: &Api, id: &str, command: &[String]) -> Outcome<Exit> {
 
     // Subscribe *before* posting: the run's identity arrives as a
     // `ShellCommand` echo on the same stream its output will.
-    let mut follow = Follow::new(api, session);
-    api.post::<flyco_core::RunShell, serde_json::Value>(
+    let mut follow = Follow::live(api, session);
+    follow.connect().await?;
+    api.post_json_empty(
         &format!("/v1/sessions/{id}/shell"),
         &flyco_core::RunShell {
             command: text.clone(),
@@ -339,7 +341,7 @@ pub async fn wait(
         }
     }
 
-    let mut follow = Follow::new(api, session);
+    let mut follow = Follow::live(api, session);
     let watch = async {
         loop {
             let item = follow.next().await?;
@@ -760,7 +762,7 @@ pub async fn set_env(api: &Api, id: &SessionId, env: &[String]) -> Outcome<()> {
     }
     let mut document: EnvDocument = api.get(&format!("/v1/sessions/{id}/env")).await?;
     merge_pairs(&mut document, env)?;
-    api.put::<UpdateEnv, serde_json::Value>(
+    api.put_json_empty(
         &format!("/v1/sessions/{id}/env"),
         &UpdateEnv {
             entries: document.entries,
@@ -859,5 +861,99 @@ fn humantime(duration: core::time::Duration) -> String {
         s if s >= 3600 => format!("{}h{}m", s / 3600, s % 3600 / 60),
         s if s >= 60 => format!("{}m{}s", s / 60, s % 60),
         s => format!("{s}s"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[tokio::test]
+    async fn exec_connects_live_sse_before_posting_shell_and_accepts_202() {
+        let session = SessionId::generate();
+        let run = flyco_core::ShellRunId::generate();
+        let cmd_event = flyco_core::wire::SessionEvent {
+            session,
+            seq: Some(42),
+            at_unix: 0,
+            event: ClientEvent::ShellCommand {
+                run,
+                command: "echo hi".to_owned(),
+            },
+        };
+        let exit_event = flyco_core::wire::SessionEvent {
+            session,
+            seq: Some(43),
+            at_unix: 0,
+            event: ClientEvent::ShellExited {
+                run,
+                outcome: ShellOutcome::Exited { code: 7 },
+                truncated: false,
+            },
+        };
+        let sse_payload = format!(
+            "id: 10\ndata: {}\n\nid: 11\ndata: {}\n\n",
+            serde_json::to_string(&cmd_event).expect("cmd json"),
+            serde_json::to_string(&exit_event).expect("exit json"),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("port").port();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_log = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let seen_log = Arc::clone(&seen_log);
+                let sse_payload = sse_payload.clone();
+                tokio::spawn(async move {
+                    let mut req = Vec::new();
+                    let mut buf = [0_u8; 1024];
+                    while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let line = String::from_utf8_lossy(&req)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned();
+                    seen_log.lock().expect("log").push(line.clone());
+                    let resp = if line.starts_with("GET /v1/events") {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse_payload}",
+                            sse_payload.len()
+                        )
+                    } else {
+                        "HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_owned()
+                    };
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let base = url::Url::parse(&format!("http://127.0.0.1:{port}")).expect("url");
+        let api = Api::new(base, None);
+        let status = exec(
+            &api,
+            &session.to_string(),
+            &["echo".to_owned(), "hi".to_owned()],
+        )
+        .await
+        .expect("exec succeeds on empty 202");
+        assert_eq!(status, Exit::Remote(7));
+
+        let requests = seen.lock().expect("log").clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1/events?session="));
+        assert!(!requests[0].contains("after="));
+        assert!(requests[1].starts_with("POST /v1/sessions/"));
+        assert!(requests[1].contains("/shell"));
     }
 }

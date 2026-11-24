@@ -44,21 +44,41 @@ jobs:
           deadline=$(( $(date +%s) + 3300 ))
           while :; do
             {
-              gh api "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
+              gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${HEAD_SHA}/check-runs?per_page=100" \
                 --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
               if [ -n "${MERGE_SHA:-}" ] && [ "${MERGE_SHA}" != "null" ]; then
-                gh api "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs?per_page=100" \
+                gh api --paginate "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs?per_page=100" \
                   --jq '.check_runs[] | [.name, (.conclusion // "pending")] | @tsv'
               fi
-            } 2>/dev/null | grep -v '^PR source gate\b' > checks.tsv || true
+            } > raw_checks.tsv
+            grep -v $'^PR source gate\t' raw_checks.tsv > checks.tsv || true
 
-            if grep -E '\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
+            if [ ! -s checks.tsv ]; then
+              if [ "$(date +%s)" -gt "${deadline}" ]; then
+                echo "::error::timed out after 55 minutes waiting for checks on this pull request to register"
+                exit 1
+              fi
+              echo "waiting for checks on this pull request to register..."
+              sleep 30
+              continue
+            fi
+
+            if grep -E $'\t(failure|cancelled|timed_out|action_required|startup_failure|stale)$' checks.tsv; then
               echo "::error::a check on this pull request did not pass (see list above)"
+              exit 1
+            fi
+            if grep -Ev $'\t(success|skipped|neutral|pending)$' checks.tsv; then
+              echo "::error::a check on this pull request ended with an unexpected conclusion (see list above)"
               exit 1
             fi
             pending=$(grep -c $'\tpending$' checks.tsv || true)
             if [ "${pending}" -eq 0 ]; then
-              echo "all checks on this pull request have passed"
+              passing=$(grep -c $'\tsuccess$' checks.tsv || true)
+              if [ "${passing}" -eq 0 ]; then
+                echo "::error::no passing checks found on this pull request"
+                exit 1
+              fi
+              echo "all ${passing} passing check(s) on this pull request have succeeded"
               exit 0
             fi
             if [ "$(date +%s)" -gt "${deadline}" ]; then
