@@ -11,11 +11,14 @@
 //! binary. [`SidecarAssets`] excludes it, and a test asserts that it does.
 
 use std::io::ErrorKind;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use rust_embed::Embed;
 use tokio::process::{Child, Command};
+
+use crate::privilege::AgentUser;
 
 /// The sidecar's TypeScript sources, lockfile, and manifest.
 ///
@@ -144,22 +147,36 @@ pub async fn prepare(config: &SidecarConfig) -> Result<(), SidecarError> {
     Ok(())
 }
 
-/// Spawns the sidecar with its stdio piped.
+/// Spawns the sidecar with its stdio piped, dropping privileges to `agent`
+/// when present.
 ///
 /// # Errors
 ///
 /// Returns [`SidecarError`] if Bun cannot be started.
 pub fn spawn(config: &SidecarConfig) -> Result<Child, SidecarError> {
+    spawn_as(config, None)
+}
+
+/// Spawns the sidecar with its stdio piped, optionally dropping privileges to
+/// `agent` before `exec`.
+///
+/// # Errors
+///
+/// Returns [`SidecarError`] if Bun cannot be started.
+pub fn spawn_as(config: &SidecarConfig, agent: Option<&AgentUser>) -> Result<Child, SidecarError> {
     tracing::info!(dir = ?config.dir, "starting the Claude Code sidecar");
-    Command::new(&config.bun)
-        .arg("run")
+    let mut cmd = Command::new(&config.bun);
+    cmd.arg("run")
         .arg("sidecar.ts")
         .current_dir(&config.dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    if let Some(user) = agent {
+        user.apply_tokio_command(&mut cmd, std::iter::empty::<(&str, &str)>());
+    }
+    cmd.spawn()
         .map_err(|source| classify_spawn(&config.bun, source))
 }
 
@@ -191,6 +208,12 @@ async fn write_if_changed(path: &Path, contents: &[u8]) -> Result<(), SidecarErr
             })?;
     }
     tokio::fs::write(path, contents)
+        .await
+        .map_err(|source| SidecarError::Materialize {
+            path: path.to_owned(),
+            source,
+        })?;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
         .await
         .map_err(|source| SidecarError::Materialize {
             path: path.to_owned(),

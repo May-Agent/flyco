@@ -35,26 +35,29 @@
 //! [`ApiError::LicenseBoundResizeNeedsApproval`]: https://github.com/lexoliu/flyco/blob/main/crates/api/src/error.rs
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use askama::Template as _;
 use flyco_core::wire::{ApprovalPayload, DesktopButton, DesktopInputEvent};
-use flyco_core::{MachineOrigin, SessionMachine};
+use flyco_core::{MachineCatalogEntry, MachineOrigin, SessionMachine};
 use rmcp::handler::server::common::{schema_for_empty_input, schema_for_input};
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
     JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
 };
 use rmcp::schemars::{self, JsonSchema};
-use rmcp::service::RequestContext;
+use rmcp::service::{Peer, RequestContext};
 use rmcp::{ErrorData, RoleServer, ServerHandler};
 use serde::Deserialize;
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::control::rest::{AgentApi, ControlApiError};
 use crate::desktop::ipc::{self, AgentReply, AgentRequest, IpcError};
 use crate::git::{GitError, GitWorkdir};
+use crate::mcp_broker::{RateLimitGuard, RateLimitStatus};
 use crate::notice::{
     BudgetStatus, MachineLine, MachineStatus, RepoPending, ResizeAccepted, ResizeDescription,
     ResizePending, ResizeRefusedDirty,
@@ -142,59 +145,71 @@ pub trait TreeStatus: Send + Sync {
     ) -> impl Future<Output = Result<Vec<(Option<String>, String)>, GitError>> + Send;
 }
 
-/// The session's checkouts as one-shot status readers.
+/// How long a fetched machine catalog stays cached before being refreshed.
 ///
-/// `flycod mcp` is a second process beside `flycod run` and shares none of
-/// the relay's state, so it answers "is the work safe to restart" by
-/// running `git status` itself, once per checkout.
-pub struct RepoTrees {
-    checkouts: Vec<(Option<String>, GitWorkdir)>,
-}
+/// The curated catalog for one session's account and region is effectively
+/// static over a session's lifetime; caching it avoids hitting the control
+/// plane on every `tools/list` and `machine_resize`.
+const CATALOG_TTL: Duration = Duration::from_secs(600);
 
-impl core::fmt::Debug for RepoTrees {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("RepoTrees")
-            .field(
-                "dirs",
-                &self
-                    .checkouts
-                    .iter()
-                    .map(|(dir, _)| dir)
-                    .collect::<Vec<_>>(),
-            )
-            .finish_non_exhaustive()
-    }
+/// The session's checkouts, discovered dynamically under `workdir`.
+///
+/// Discovering checkouts on demand rather than freezing boot-time config
+/// ensures repositories cloned mid-session via `AddRepo` are included in
+/// `machine_resize` dirty-tree checks.
+#[derive(Debug, Clone)]
+pub struct RepoTrees {
+    workdir: PathBuf,
 }
 
 impl RepoTrees {
-    /// One reader per configured `[[repos]]` entry — or the workspace root
-    /// alone, keyed `None`, when none are: the developer-machine shape,
-    /// where the root itself is the checkout.
+    /// Discovers checkouts under `workdir` whenever [`TreeStatus::status`] is
+    /// called: either `workdir` itself (the developer-machine shape, when
+    /// `workdir/.git` exists) or every direct child directory containing `.git`.
     #[must_use]
-    pub fn over(workdir: &std::path::Path, repos: &[crate::config::RepoConfig]) -> Self {
-        Self {
-            checkouts: if repos.is_empty() {
-                vec![(None, GitWorkdir::new(workdir.to_owned()))]
-            } else {
-                repos
-                    .iter()
-                    .map(|repo| {
-                        (
-                            Some(repo.dir.clone()),
-                            GitWorkdir::new(repo.checkout_path(workdir)),
-                        )
-                    })
-                    .collect()
-            },
+    pub const fn discover(workdir: PathBuf) -> Self {
+        Self { workdir }
+    }
+
+    async fn checkouts(&self) -> Result<Vec<(Option<String>, GitWorkdir)>, GitError> {
+        if crate::git::has_checkout(&self.workdir).await {
+            return Ok(vec![(None, GitWorkdir::new(self.workdir.clone()))]);
         }
+        let mut dirs = Vec::new();
+        let mut entries = match tokio::fs::read_dir(&self.workdir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(GitError::Spawn(error)),
+        };
+        while let Some(entry) = entries.next_entry().await.map_err(GitError::Spawn)? {
+            let path = entry.path();
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if name == ".git" {
+                continue;
+            }
+            let Ok(meta) = entry.metadata().await else {
+                continue;
+            };
+            if meta.is_dir() && crate::git::has_checkout(&path).await {
+                dirs.push((name, path));
+            }
+        }
+        dirs.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(dirs
+            .into_iter()
+            .map(|(name, path)| (Some(name), GitWorkdir::new(path)))
+            .collect())
     }
 }
 
 impl TreeStatus for RepoTrees {
     async fn status(&self) -> Result<Vec<(Option<String>, String)>, GitError> {
-        let mut statuses = Vec::with_capacity(self.checkouts.len());
-        for (dir, checkout) in &self.checkouts {
-            statuses.push((dir.clone(), checkout.read_status().await?));
+        let checkouts = self.checkouts().await?;
+        let mut statuses = Vec::with_capacity(checkouts.len());
+        for (dir, checkout) in checkouts {
+            statuses.push((dir, checkout.read_status().await?));
         }
         Ok(statuses)
     }
@@ -356,6 +371,9 @@ enum ToolFailure {
     /// The control plane could not be reached or refused the call.
     #[error(transparent)]
     ControlApi(#[from] ControlApiError),
+    /// The control plane rate-limited or exhausted this session's budget (`429`).
+    #[error("{}", .0.refusal_message())]
+    RateLimited(RateLimitStatus),
     /// The working tree could not be read.
     #[error(transparent)]
     Git(#[from] GitError),
@@ -396,19 +414,40 @@ impl From<ToolFailure> for ErrorData {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CachedCatalog {
+    entries: Vec<MachineCatalogEntry>,
+    spot: bool,
+    fetched_at: Instant,
+}
+
+/// Probes whether the desktop IPC socket at `path` currently has a live
+/// listener.
+pub async fn probe_desktop_socket(path: &Path) -> bool {
+    tokio::net::UnixStream::connect(path).await.is_ok()
+}
+
 /// flyco's tools, over one session's stdio.
 ///
 /// Generic over the control plane and the working tree so both can be
 /// replaced in a test; the shipped server is
-/// `FlycoTools<HttpControlApi, GitWorkdir>`.
+/// `FlycoTools<BrokerClient, RepoTrees>`.
 pub struct FlycoTools<A, T> {
     api: A,
     tree: T,
     origin: MachineOrigin,
-    /// The desktop's agent socket — `Some` when the session's
-    /// `computer_use` flag was on at provision, which is also what makes
-    /// the `computer_*` tools listed at all.
+    /// Path where the session's desktop IPC socket lives whenever computer
+    /// use is active. Probed dynamically so toggling `SetComputerUse`
+    /// mid-session exposes or hides the `computer_*` tools without restarting
+    /// `flycod mcp`.
     desktop: Option<PathBuf>,
+    /// Last desktop availability observed, used to emit
+    /// `notifications/tools/list_changed` on transitions.
+    last_desktop_live: Arc<AtomicBool>,
+    /// Cached machine catalog + boot-time spot flag.
+    catalog_cache: AsyncMutex<Option<CachedCatalog>>,
+    /// Local `429 Retry-After` and `request-budget-exhausted` cooldown guard.
+    rate_limit: RateLimitGuard,
 }
 
 impl<A, T> core::fmt::Debug for FlycoTools<A, T> {
@@ -423,38 +462,116 @@ impl<A, T> core::fmt::Debug for FlycoTools<A, T> {
 impl<A: AgentApi, T: TreeStatus + 'static> FlycoTools<A, T> {
     /// Builds the server for one session.
     ///
-    /// `origin` comes from the daemon's configuration because nothing else
+    /// `origin` comes from the daemon's broker bootstrap because nothing else
     /// on the machine knows it and it never changes: it says who decided
     /// this session would run on a machine of its own choosing.
     ///
-    /// `desktop` is the agent socket's path when the session was
-    /// provisioned with a screen; `None` leaves the `computer_*` tools
-    /// out of the listing entirely, so a session with no desktop offers
-    /// no tools that could only refuse.
-    pub const fn new(api: A, tree: T, origin: MachineOrigin, desktop: Option<PathBuf>) -> Self {
+    /// `desktop` is the path where the session's desktop IPC socket lives
+    /// whenever `computer_use` is enabled; `tools/list` probes it dynamically
+    /// so mid-session `SetComputerUse` toggles take effect immediately.
+    pub fn new(api: A, tree: T, origin: MachineOrigin, desktop: Option<PathBuf>) -> Self {
         Self {
             api,
             tree,
             origin,
             desktop,
+            last_desktop_live: Arc::new(AtomicBool::new(false)),
+            catalog_cache: AsyncMutex::new(None),
+            rate_limit: RateLimitGuard::new(),
         }
     }
 
-    /// The three tools, described against this session's own catalog.
+    /// Returns the desktop socket path and shared availability flag for
+    /// spawning [`spawn_desktop_watcher`].
+    #[must_use]
+    pub fn desktop_watcher_state(&self) -> Option<(PathBuf, Arc<AtomicBool>)> {
+        self.desktop
+            .as_ref()
+            .map(|path| (path.clone(), Arc::clone(&self.last_desktop_live)))
+    }
+
+    /// Checks whether the desktop IPC socket is currently reachable.
+    async fn desktop_available(&self) -> bool {
+        let Some(path) = &self.desktop else {
+            return false;
+        };
+        let live = probe_desktop_socket(path).await;
+        self.last_desktop_live.store(live, Ordering::Release);
+        live
+    }
+
+    /// Runs a control-plane call through the local `429` cooldown guard.
     ///
-    /// `machine_resize` names the types it will accept, with prices, so the
-    /// agent chooses from the curated list rather than from a memory of what
-    /// a cloud sells. That means reading the catalog to answer
-    /// `tools/list` — and it means a catalog that cannot be read fails the
-    /// listing rather than advertising a tool that cannot say what it does.
+    /// Returns `Ok(Ok(value))` on success, `Ok(Err(refusal))` when blocked by
+    /// an active or newly received `429` (`Retry-After` /
+    /// `request-budget-exhausted`), and `Err(ToolFailure::ControlApi(_))` for
+    /// non-429 control-plane errors.
+    async fn guarded_call<R, F>(
+        &self,
+        call: impl FnOnce() -> F,
+    ) -> Result<Result<R, CallToolResult>, ToolFailure>
+    where
+        F: Future<Output = Result<R, ControlApiError>>,
+    {
+        if let Some(blocked) = self.rate_limit.check() {
+            return Ok(Err(refusal(&blocked.refusal_message())));
+        }
+        match call().await {
+            Ok(value) => Ok(Ok(value)),
+            Err(error) => self.rate_limit.record_error(&error).map_or_else(
+                || Err(ToolFailure::ControlApi(error)),
+                |status| Ok(Err(refusal(&status.refusal_message()))),
+            ),
+        }
+    }
+
+    /// Returns the cached machine catalog and spot flag, fetching them once
+    /// per [`CATALOG_TTL`] window under the local `429` guard.
+    async fn cached_catalog(&self) -> Result<(Vec<MachineCatalogEntry>, bool), ToolFailure> {
+        let mut cache = self.catalog_cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.fetched_at.elapsed() < CATALOG_TTL
+        {
+            return Ok((cached.entries.clone(), cached.spot));
+        }
+        if let Some(blocked) = self.rate_limit.check() {
+            return Err(ToolFailure::RateLimited(blocked));
+        }
+        let machine = match self.api.agent_machine().await {
+            Ok(machine) => machine,
+            Err(error) => {
+                if let Some(status) = self.rate_limit.record_error(&error) {
+                    return Err(ToolFailure::RateLimited(status));
+                }
+                return Err(ToolFailure::ControlApi(error));
+            }
+        };
+        let entries = match self.api.agent_machine_catalog().await {
+            Ok(entries) => entries,
+            Err(error) => {
+                if let Some(status) = self.rate_limit.record_error(&error) {
+                    return Err(ToolFailure::RateLimited(status));
+                }
+                return Err(ToolFailure::ControlApi(error));
+            }
+        };
+        let spot = machine.machine.spot;
+        *cache = Some(CachedCatalog {
+            entries: entries.clone(),
+            spot,
+            fetched_at: Instant::now(),
+        });
+        drop(cache);
+        Ok((entries, spot))
+    }
+
+    /// The tools, described against this session's cached catalog and live
+    /// desktop availability.
     async fn tools(&self) -> Result<Vec<Tool>, ToolFailure> {
-        let machine = self.api.agent_machine().await?;
-        let catalog: Vec<SessionMachine> = self
-            .api
-            .agent_machine_catalog()
-            .await?
+        let (entries, spot) = self.cached_catalog().await?;
+        let catalog: Vec<SessionMachine> = entries
             .iter()
-            .map(|entry| SessionMachine::of(entry, machine.machine.spot))
+            .map(|entry| SessionMachine::of(entry, spot))
             .collect();
 
         let mut tools = vec![
@@ -479,7 +596,7 @@ impl<A: AgentApi, T: TreeStatus + 'static> FlycoTools<A, T> {
                 input_schema::<RepoAddInput>(REPO_ADD)?,
             ),
         ];
-        if self.desktop.is_some() {
+        if self.desktop_available().await {
             tools.extend([
                 tool(
                     COMPUTER_STATE,
@@ -549,12 +666,18 @@ impl<A: AgentApi, T: TreeStatus + 'static> FlycoTools<A, T> {
     }
 
     async fn machine_status(&self) -> Result<CallToolResult, ToolFailure> {
-        let view = self.api.agent_machine().await?;
+        let view = match self.guarded_call(|| self.api.agent_machine()).await? {
+            Ok(view) => view,
+            Err(refused) => return Ok(refused),
+        };
         Ok(answer(&MachineStatus::of(&view).render()?))
     }
 
     async fn budget_status(&self) -> Result<CallToolResult, ToolFailure> {
-        let budget = self.api.agent_budget().await?;
+        let budget = match self.guarded_call(|| self.api.agent_budget()).await? {
+            Ok(budget) => budget,
+            Err(refused) => return Ok(refused),
+        };
         Ok(answer(&BudgetStatus::of(&budget).render()?))
     }
 
@@ -565,8 +688,15 @@ impl<A: AgentApi, T: TreeStatus + 'static> FlycoTools<A, T> {
     /// restart on, and a type that bills a minimum on boot is the user's
     /// decision rather than the agent's.
     async fn machine_resize(&self, input: ResizeInput) -> Result<CallToolResult, ToolFailure> {
-        let current = self.api.agent_machine().await?;
-        let catalog = self.api.agent_machine_catalog().await?;
+        let (catalog, _cached_spot) = match self.cached_catalog().await {
+            Ok(pair) => pair,
+            Err(ToolFailure::RateLimited(status)) => return Ok(refusal(&status.refusal_message())),
+            Err(other) => return Err(other),
+        };
+        let current = match self.guarded_call(|| self.api.agent_machine()).await? {
+            Ok(current) => current,
+            Err(refused) => return Ok(refused),
+        };
         let Some(entry) = catalog
             .iter()
             .find(|entry| entry.machine_type == input.machine_type)
@@ -594,14 +724,20 @@ impl<A: AgentApi, T: TreeStatus + 'static> FlycoTools<A, T> {
         }
 
         if let Some(minimum) = wanted.minimum {
-            let id = self
-                .api
-                .raise_approval(ApprovalPayload::MachineResizeLicenseBound {
-                    machine_type: wanted.machine_type.clone(),
-                    minimum,
-                    reason: input.reason,
+            let id = match self
+                .guarded_call(|| {
+                    self.api
+                        .raise_approval(ApprovalPayload::MachineResizeLicenseBound {
+                            machine_type: wanted.machine_type.clone(),
+                            minimum,
+                            reason: input.reason,
+                        })
                 })
-                .await?;
+                .await?
+            {
+                Ok(id) => id,
+                Err(refused) => return Ok(refused),
+            };
             tracing::info!(
                 approval = %id,
                 machine_type = %wanted.machine_type,
@@ -619,7 +755,12 @@ impl<A: AgentApi, T: TreeStatus + 'static> FlycoTools<A, T> {
             ));
         }
 
-        self.api.resize_machine(&wanted.machine_type).await?;
+        if let Err(refused) = self
+            .guarded_call(|| self.api.resize_machine(&wanted.machine_type))
+            .await?
+        {
+            return Ok(refused);
+        }
         tracing::info!(
             machine_type = %wanted.machine_type,
             reason = %input.reason,
@@ -804,14 +945,19 @@ impl<A: AgentApi, T: TreeStatus + 'static> FlycoTools<A, T> {
                     })
             })
             .transpose()?;
-        let id = self
-            .api
-            .raise_approval(ApprovalPayload::RepoAdd {
-                repo: slug.as_str().to_owned(),
-                branch: branch.map(|branch| branch.as_str().to_owned()),
-                reason: input.reason,
+        let id = match self
+            .guarded_call(|| {
+                self.api.raise_approval(ApprovalPayload::RepoAdd {
+                    repo: slug.as_str().to_owned(),
+                    branch: branch.map(|branch| branch.as_str().to_owned()),
+                    reason: input.reason,
+                })
             })
-            .await?;
+            .await?
+        {
+            Ok(id) => id,
+            Err(refused) => return Ok(refused),
+        };
         tracing::info!(approval = %id, repo = %slug, "raised an approval to add a repository");
         Ok(answer(
             &RepoPending {
@@ -820,6 +966,53 @@ impl<A: AgentApi, T: TreeStatus + 'static> FlycoTools<A, T> {
             .render()?,
         ))
     }
+}
+
+/// Checks whether the desktop IPC socket availability changed since
+/// `last_live`, updating `last_live` and sending
+/// `notifications/tools/list_changed` when it toggled.
+pub async fn sync_desktop_list_changed(
+    desktop_socket: &Path,
+    last_live: &AtomicBool,
+    peer: &Peer<RoleServer>,
+) -> bool {
+    let live = probe_desktop_socket(desktop_socket).await;
+    let previous = last_live.swap(live, Ordering::AcqRel);
+    if live != previous {
+        tracing::info!(
+            desktop_live = live,
+            "desktop availability toggled; emitting notifications/tools/list_changed"
+        );
+        if let Err(error) = peer.notify_tool_list_changed().await {
+            tracing::debug!(%error, "could not notify peer of tool list change");
+        }
+        return true;
+    }
+    false
+}
+
+/// Watches local desktop IPC socket availability (no control-plane traffic)
+/// and emits `notifications/tools/list_changed` whenever computer use toggles.
+#[must_use]
+pub fn spawn_desktop_watcher(
+    desktop_socket: PathBuf,
+    last_live: Arc<AtomicBool>,
+    peer: Peer<RoleServer>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // First tick fires immediately; seed initial state without spurious
+        // notification before checking for subsequent transitions.
+        let initial = probe_desktop_socket(&desktop_socket).await;
+        last_live.store(initial, Ordering::Release);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let _ = sync_desktop_list_changed(&desktop_socket, &last_live, &peer).await;
+        }
+    })
 }
 
 /// One tool definition.
@@ -970,8 +1163,13 @@ fn refusal(text: &str) -> CallToolResult {
 
 impl<A: AgentApi, T: TreeStatus + 'static> ServerHandler for FlycoTools<A, T> {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("flyco", env!("CARGO_PKG_VERSION")))
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_server_info(Implementation::new("flyco", env!("CARGO_PKG_VERSION")))
     }
 
     async fn list_tools(
@@ -1424,14 +1622,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_with_a_desktop_lists_the_computer_tools() {
-        let listed = tools_with_desktop(
-            "",
-            MachineOrigin::Auto,
-            Some(PathBuf::from("/tmp/flycod-unbound.sock")),
-        )
-        .tools()
-        .await
-        .expect("list");
+        let desktop = FakeDesktop::answering(AgentReply::Done);
+        let listed = tools_with_desktop("", MachineOrigin::Auto, Some(desktop.path.clone()))
+            .tools()
+            .await
+            .expect("list");
         let names: Vec<&str> = listed.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(names.len(), 4 + COMPUTER_TOOLS.len());
         for name in COMPUTER_TOOLS {
@@ -1675,5 +1870,360 @@ mod tests {
             "a branch git would read as a flag is an argument error: {bad_branch:?}"
         );
         assert!(tools.api.approvals.lock().expect("not poisoned").is_empty());
+    }
+
+    #[tokio::test]
+    async fn repo_trees_dynamically_discovers_mid_session_add_repo_checkouts() {
+        let workdir =
+            std::env::temp_dir().join(format!("flycod-mcp-discover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workdir).expect("create workdir");
+        let trees = super::RepoTrees::discover(workdir.clone());
+
+        // Initially empty workspace -> no checkouts.
+        assert_eq!(
+            trees.status().await.expect("empty status"),
+            Vec::<(Option<String>, String)>::new()
+        );
+
+        // Simulate mid-session `AddRepo` creating a git checkout under workdir.
+        let repo_a = workdir.join("repo-a");
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo_a)
+            .status()
+            .expect("git init");
+        assert!(init.success());
+        std::fs::write(repo_a.join("dirty.txt"), "uncommitted\n").expect("write dirty file");
+
+        let statuses = trees.status().await.expect("discovered status");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].0.as_deref(), Some("repo-a"));
+        assert!(statuses[0].1.contains("dirty.txt"));
+
+        let _ = std::fs::remove_dir_all(&workdir);
+    }
+
+    #[tokio::test]
+    async fn desktop_tools_appear_and_disappear_dynamically_with_socket_availability() {
+        let socket_path = std::env::temp_dir().join(format!(
+            "flycod-dyn-{}-{}.sock",
+            std::process::id(),
+            SOCKETS.fetch_add(1, Ordering::Relaxed),
+        ));
+        let server = tools_with_desktop("", MachineOrigin::Auto, Some(socket_path.clone()));
+
+        // Before SetComputerUse binds the socket, computer_* tools are absent.
+        let before = server.tools().await.expect("list before desktop");
+        assert_eq!(before.len(), 4);
+
+        // Bind desktop socket -> computer_* tools appear on the very next tools/list.
+        let listener = UnixListener::bind(&socket_path).expect("bind desktop socket");
+        let during = server.tools().await.expect("list with desktop");
+        assert_eq!(during.len(), 4 + COMPUTER_TOOLS.len());
+
+        // Remove socket -> computer_* tools disappear again.
+        drop(listener);
+        let _ = std::fs::remove_file(&socket_path);
+        let after = server.tools().await.expect("list after desktop stops");
+        assert_eq!(after.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn catalog_is_cached_across_repeated_tools_list_and_resize() {
+        #[derive(Debug)]
+        struct CountingPlane {
+            machine_calls: AtomicUsize,
+            catalog_calls: AtomicUsize,
+        }
+
+        impl ApprovalRaiser for CountingPlane {
+            fn raise_approval(
+                &self,
+                _payload: ApprovalPayload,
+            ) -> impl Future<Output = Result<ApprovalId, ControlApiError>> + Send {
+                ready(Ok(ApprovalId::generate()))
+            }
+        }
+
+        impl AgentApi for CountingPlane {
+            fn agent_machine(
+                &self,
+            ) -> impl Future<Output = Result<AgentMachineView, ControlApiError>> + Send
+            {
+                self.machine_calls.fetch_add(1, Ordering::SeqCst);
+                ready(Ok(AgentMachineView {
+                    origin: MachineOrigin::Auto,
+                    machine: SessionMachine {
+                        machine_type: "m7i.xlarge".to_owned(),
+                        hourly: Some(Usd::from_cents(20)),
+                        spot: false,
+                        capacity: None,
+                        minimum: None,
+                    },
+                    state: MachineState::Running,
+                    region: "us-east-1".to_owned(),
+                }))
+            }
+
+            fn agent_machine_catalog(
+                &self,
+            ) -> impl Future<Output = Result<Vec<MachineCatalogEntry>, ControlApiError>> + Send
+            {
+                self.catalog_calls.fetch_add(1, Ordering::SeqCst);
+                ready(Ok(vec![entry("m7i.2xlarge", 40, None)]))
+            }
+
+            fn resize_machine(
+                &self,
+                _machine_type: &str,
+            ) -> impl Future<Output = Result<(), ControlApiError>> + Send {
+                ready(Ok(()))
+            }
+
+            fn agent_budget(
+                &self,
+            ) -> impl Future<Output = Result<BudgetView, ControlApiError>> + Send {
+                ready(Ok(BudgetView {
+                    limit: Usd::from_dollars(10),
+                    spent: Usd::from_dollars(1),
+                    remaining: Usd::from_dollars(9),
+                    stage: BudgetStage::Ok,
+                }))
+            }
+        }
+
+        let server = FlycoTools::new(
+            CountingPlane {
+                machine_calls: AtomicUsize::new(0),
+                catalog_calls: AtomicUsize::new(0),
+            },
+            FakeTree(""),
+            MachineOrigin::Auto,
+            None,
+        );
+
+        let _ = server.tools().await.expect("first tools/list");
+        let _ = server.tools().await.expect("second tools/list");
+        let _ = server
+            .machine_resize(resize("m7i.2xlarge", false))
+            .await
+            .expect("resize");
+
+        assert_eq!(
+            server.api.catalog_calls.load(Ordering::SeqCst),
+            1,
+            "static machine catalog must be fetched once and reused across tools/list and resize"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_429_returns_explicit_refusal_and_enforces_local_cooldown() {
+        use std::num::NonZeroU32;
+
+        #[derive(Debug)]
+        struct RateLimitedPlane {
+            calls: AtomicUsize,
+            kind: &'static str,
+            retry_after: u32,
+        }
+
+        impl ApprovalRaiser for RateLimitedPlane {
+            fn raise_approval(
+                &self,
+                _payload: ApprovalPayload,
+            ) -> impl Future<Output = Result<ApprovalId, ControlApiError>> + Send {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ready(Err(self.err()))
+            }
+        }
+
+        impl RateLimitedPlane {
+            fn err(&self) -> ControlApiError {
+                ControlApiError::Refused {
+                    method: "GET",
+                    path: "/v1/sessions/s/agent/budget".to_owned(),
+                    status: 429,
+                    title: "Too Many Requests".to_owned(),
+                    detail: "daily quota spent".to_owned(),
+                    kind: format!("https://flyco.dev/problems/{}", self.kind),
+                    retry_after_secs: NonZeroU32::new(self.retry_after),
+                }
+            }
+        }
+
+        impl AgentApi for RateLimitedPlane {
+            fn agent_machine(
+                &self,
+            ) -> impl Future<Output = Result<AgentMachineView, ControlApiError>> + Send
+            {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ready(Err(self.err()))
+            }
+
+            fn agent_machine_catalog(
+                &self,
+            ) -> impl Future<Output = Result<Vec<MachineCatalogEntry>, ControlApiError>> + Send
+            {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ready(Err(self.err()))
+            }
+
+            fn resize_machine(
+                &self,
+                _machine_type: &str,
+            ) -> impl Future<Output = Result<(), ControlApiError>> + Send {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ready(Err(self.err()))
+            }
+
+            fn agent_budget(
+                &self,
+            ) -> impl Future<Output = Result<BudgetView, ControlApiError>> + Send {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                ready(Err(self.err()))
+            }
+        }
+
+        let exhausted = FlycoTools::new(
+            RateLimitedPlane {
+                calls: AtomicUsize::new(0),
+                kind: "request-budget-exhausted",
+                retry_after: 3600,
+            },
+            FakeTree(""),
+            MachineOrigin::Auto,
+            None,
+        );
+
+        let first = exhausted
+            .budget_status()
+            .await
+            .expect("429 is returned as a structured refusal, not internal_error");
+        assert_eq!(first.is_error, Some(true));
+        let first_text = text(&first);
+        assert!(
+            first_text.contains("request-budget-exhausted"),
+            "{first_text}"
+        );
+        assert!(first_text.contains("Do not retry"), "{first_text}");
+
+        // Second call is refused locally without hitting the control plane again.
+        let second = exhausted
+            .machine_status()
+            .await
+            .expect("local cooldown refusal");
+        assert_eq!(second.is_error, Some(true));
+        assert!(text(&second).contains("request-budget-exhausted"));
+        assert_eq!(
+            exhausted.api.calls.load(Ordering::SeqCst),
+            1,
+            "local cooldown must block follow-up calls without hitting control plane"
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_toggle_emits_tools_list_changed_notification_over_mcp() {
+        use rmcp::ServiceExt as _;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "flycod-notify-{}-{}.sock",
+            std::process::id(),
+            SOCKETS.fetch_add(1, Ordering::Relaxed),
+        ));
+        let server = tools_with_desktop("", MachineOrigin::Auto, Some(socket_path.clone()));
+        let (desktop_socket, last_live) = server
+            .desktop_watcher_state()
+            .expect("watcher state present");
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move { server.serve(server_io).await });
+
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        let mut lines = BufReader::new(client_read).lines();
+
+        // Standard MCP initialize handshake (declaring listChanged support).
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.1.0" }
+            }
+        });
+        client_write
+            .write_all(format!("{init_req}\n").as_bytes())
+            .await
+            .expect("write init");
+        let init_resp = lines
+            .next_line()
+            .await
+            .expect("read init resp")
+            .expect("init line");
+        let init_json: serde_json::Value =
+            serde_json::from_str(&init_resp).expect("init response json");
+        assert_eq!(
+            init_json["result"]["capabilities"]["tools"]["listChanged"],
+            json!(true),
+            "server must advertise tools.listChanged capability: {init_json}"
+        );
+
+        let initialized = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        client_write
+            .write_all(format!("{initialized}\n").as_bytes())
+            .await
+            .expect("write initialized");
+
+        let running = server_task
+            .await
+            .expect("serve task")
+            .expect("server initialized");
+
+        // Bind desktop socket -> sync emits notifications/tools/list_changed.
+        let listener = UnixListener::bind(&socket_path).expect("bind desktop socket");
+        let toggled =
+            super::sync_desktop_list_changed(&desktop_socket, &last_live, running.peer()).await;
+        assert!(toggled, "binding desktop socket must trigger toggle");
+
+        let note = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("notification arrived in time")
+            .expect("read notification")
+            .expect("notification line");
+        let note_json: serde_json::Value = serde_json::from_str(&note).expect("notification json");
+        assert_eq!(
+            note_json["method"],
+            json!("notifications/tools/list_changed")
+        );
+
+        // Drop desktop socket -> sync emits notifications/tools/list_changed again.
+        drop(listener);
+        let _ = std::fs::remove_file(&socket_path);
+        let toggled_off =
+            super::sync_desktop_list_changed(&desktop_socket, &last_live, running.peer()).await;
+        assert!(toggled_off, "removing desktop socket must trigger toggle");
+
+        let note_off = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("off notification arrived")
+            .expect("read off notification")
+            .expect("off notification line");
+        let note_off_json: serde_json::Value =
+            serde_json::from_str(&note_off).expect("off notification json");
+        assert_eq!(
+            note_off_json["method"],
+            json!("notifications/tools/list_changed")
+        );
+
+        drop(lines);
+        drop(client_write);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), running.waiting())
+            .await
+            .expect("server shuts down on client EOF");
     }
 }

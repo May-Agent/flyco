@@ -12,6 +12,7 @@
 //! them, so they live once here.
 
 use std::io::{Read as _, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener as StdListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,6 +21,8 @@ use flyco_core::SessionId;
 use flyco_core::wire::DesktopInputEvent;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use serde::{Deserialize, Serialize};
+
+use crate::privilege::{AgentUser, chown_path, ensure_dir};
 
 /// How long a served connection may hold the supervisor's attention while
 /// reading the request line.
@@ -163,8 +166,34 @@ impl Listener {
     /// Returns [`IpcError::Io`] if the path cannot be bound or put in
     /// nonblocking mode.
     pub fn bind(path: &Path) -> Result<Self, IpcError> {
+        Self::bind_for(path, None)
+    }
+
+    /// Binds the agent socket and grants connect access to `agent` (`0660`,
+    /// group `agent.gid`) when running under dual-UID isolation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::Io`] if the path cannot be bound, permissioned, or
+    /// put in nonblocking mode.
+    pub fn bind_for(path: &Path, agent: Option<&AgentUser>) -> Result<Self, IpcError> {
+        if let Some(parent) = path.parent()
+            && parent == Path::new("/var/lib/flyco/run")
+        {
+            let dir_mode = if agent.is_some() { 0o750 } else { 0o700 };
+            ensure_dir(parent, dir_mode, agent, true).map_err(IpcError::Io)?;
+        }
         let _ = std::fs::remove_file(path);
         let socket = StdListener::bind(path).map_err(IpcError::Io)?;
+        let sock_mode = if agent.is_some() { 0o660 } else { 0o600 };
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(sock_mode))
+            .map_err(IpcError::Io)?;
+        if let Some(user) = agent
+            && user.needs_uid_switch()
+        {
+            chown_path(path, None, Some(user.gid))
+                .map_err(|error| IpcError::Io(std::io::Error::other(error)))?;
+        }
         socket.set_nonblocking(true).map_err(IpcError::Io)?;
         Ok(Self {
             socket,

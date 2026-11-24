@@ -14,8 +14,12 @@ RUN --mount=type=bind,source=flycod.sh,target=/tmp/flycod.sh \
     --mount=type=bind,source=flycod-linux-aarch64,target=/tmp/bin/arm64 \
     sh /tmp/flycod.sh image "/tmp/bin/${TARGETARCH}"
 COPY --chmod=0755 flyco-session /usr/local/bin/flyco-session
-USER flyco
+# Run the daemon entrypoint as root so it exclusively owns `0600`
+# `/etc/flycod/config.toml` and non-agent-writable managed policy directories,
+# while `flycod run` drops privileges to the unprivileged `flyco` user for
+# every harness, `!` shell, PTY, and virtual desktop process.
+USER root
 WORKDIR /srv/flyco/work
-ENV HOME=/home/flyco
+ENV HOME=/var/lib/flyco/daemon-home
 ENV PATH=/home/flyco/.bun/bin:/usr/local/bin:/usr/bin:/bin
 ENTRYPOINT ["/usr/local/bin/flyco-session"]

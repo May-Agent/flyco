@@ -23,6 +23,7 @@ use x11rb::rust_connection::RustConnection;
 
 use crate::config::ComputerConfig;
 use crate::desktop::keys;
+use crate::privilege::AgentUser;
 
 /// How long Xvfb has to claim a display before bring-up is abandoned.
 const DISPLAY_DEADLINE: Duration = Duration::from_secs(10);
@@ -134,7 +135,7 @@ impl Display {
     /// so nothing probes `/tmp/.X11-unix` for a socket that is not ours.
     /// The deadline covers a cold container's font cache; a server that
     /// never writes is killed rather than waited on.
-    pub fn start(config: &ComputerConfig) -> Result<Self, DisplayError> {
+    pub fn start(config: &ComputerConfig, agent: Option<&AgentUser>) -> Result<Self, DisplayError> {
         // The display is an `Xvfb` the daemon spawns, and flycod only
         // publishes Linux binaries — on anything else there is no server
         // to spawn, and the honest answer is a sentence rather than an
@@ -147,8 +148,8 @@ impl Display {
         let (mut announced, log) = std::io::pipe().map_err(|error| DisplayError::Server {
             reason: format!("could not make the display pipe: {error}"),
         })?;
-        let mut server = Command::new("Xvfb")
-            .arg("-nolisten")
+        let mut cmd = Command::new("Xvfb");
+        cmd.arg("-nolisten")
             .arg("tcp")
             .arg("-displayfd")
             .arg("2")
@@ -160,11 +161,13 @@ impl Display {
             // rest is the server's diagnostics.
             .stderr(Stdio::from(log))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn()
-            .map_err(|error| DisplayError::Server {
-                reason: format!("could not spawn Xvfb: {error}"),
-            })?;
+            .stdout(Stdio::null());
+        if let Some(user) = agent {
+            user.apply_std_command(&mut cmd, std::iter::empty::<(&str, &str)>());
+        }
+        let mut server = cmd.spawn().map_err(|error| DisplayError::Server {
+            reason: format!("could not spawn Xvfb: {error}"),
+        })?;
 
         let number = match read_display_number(&mut announced, &mut server) {
             Ok(number) => number,
@@ -697,16 +700,22 @@ fn unpack(packed: u32, mask: u32) -> u8 {
 /// windows are decorated — so an absent WM is a log line, not a failure.
 /// The list is the small-WM world a session image might ship, in
 /// preference order.
-pub fn start_window_manager(display: &OsString) -> Option<Child> {
+pub fn start_window_manager(display: &OsString, agent: Option<&AgentUser>) -> Option<Child> {
     const CANDIDATES: &[&str] = &["openbox", "mutter", "xfwm4", "fluxbox", "twm"];
     for candidate in CANDIDATES {
-        match Command::new(candidate)
-            .env("DISPLAY", display)
-            .stdin(Stdio::null())
+        let mut cmd = Command::new(candidate);
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
+            .stderr(Stdio::null());
+        if let Some(user) = agent {
+            user.apply_std_command(
+                &mut cmd,
+                [(std::ffi::OsStr::new("DISPLAY"), display.as_os_str())],
+            );
+        } else {
+            cmd.env("DISPLAY", display);
+        }
+        match cmd.spawn() {
             Ok(child) => {
                 tracing::info!(wm = candidate, "a window manager is on the display");
                 return Some(child);

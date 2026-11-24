@@ -32,6 +32,8 @@ use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::privilege::AgentUser;
+
 /// How much of a pipe is read at a time.
 const CHUNK: usize = 4096;
 
@@ -118,6 +120,8 @@ pub struct Bash {
     timeout: Duration,
     /// How much output one run may put in the transcript.
     max_output_bytes: usize,
+    /// Unprivileged OS user to drop privileges to before `exec`, if any.
+    agent: Option<AgentUser>,
 }
 
 impl Bash {
@@ -134,7 +138,16 @@ impl Bash {
             workdir,
             timeout,
             max_output_bytes,
+            agent: None,
         }
+    }
+
+    /// Configures the unprivileged agent user that `!` shell commands drop
+    /// privileges to before `exec`.
+    #[must_use]
+    pub fn with_agent(mut self, agent: Option<AgentUser>) -> Self {
+        self.agent = agent;
+        self
     }
 }
 
@@ -303,6 +316,9 @@ fn spawn(bash: &Bash, command: &str) -> std::io::Result<tokio::process::Child> {
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
+    if let Some(agent) = &bash.agent {
+        agent.apply_tokio_command(&mut cmd, std::iter::empty::<(&str, &str)>());
+    }
     cmd.spawn()
 }
 

@@ -256,7 +256,7 @@ pub async fn bootstrap() -> Result<(), CodespaceError> {
 /// and the codespace's other users have no business reading it.
 fn write_config(path: &Path, contents: &str) -> Result<(), CodespaceError> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     let map_err = |source| CodespaceError::Write {
         path: CONFIG_PATH,
@@ -265,6 +265,12 @@ fn write_config(path: &Path, contents: &str) -> Result<(), CodespaceError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if let Some(directory) = path.parent() {
         std::fs::create_dir_all(directory).map_err(map_err)?;
+        // Only lock down the daemon's own config directory, never a shared
+        // temp directory used in unit tests.
+        if directory == Path::new("/etc/flycod") {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(map_err)?;
+        }
     }
     let file_name = path
         .file_name()
@@ -304,10 +310,12 @@ fn write_config(path: &Path, contents: &str) -> Result<(), CodespaceError> {
 /// lock itself and stands down when it is already held, so the cheap
 /// thing is to spawn and let the child say so in the log it shares.
 fn launch() -> Result<(), CodespaceError> {
+    use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::process::CommandExt as _;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(LOG_PATH)
         .map_err(|source| CodespaceError::Write {
             path: LOG_PATH,

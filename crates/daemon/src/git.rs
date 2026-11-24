@@ -35,6 +35,7 @@ use tokio::time::{Duration, Interval};
 use std::collections::BTreeMap;
 
 use crate::config::{GithubAccess, RepoConfig};
+use crate::privilege::{AgentUser, chown_tree};
 
 /// How often a live checkout is polled.
 pub const POLL: Duration = Duration::from_secs(5);
@@ -208,6 +209,8 @@ async fn authenticated(
         .to_owned();
     let output = Command::new("git")
         .current_dir(current_dir)
+        .arg("-c")
+        .arg("safe.directory=*")
         .arg("-c")
         .arg("credential.helper=")
         .arg("-c")
@@ -563,7 +566,13 @@ impl WorkingTree for GitWorkdir {
     async fn apply(&self, patch: &[u8]) -> Result<(), GitError> {
         let mut child = Command::new("git")
             .current_dir(&self.path)
-            .args(["apply", "--binary", "--whitespace=nowarn"])
+            .args([
+                "-c",
+                "safe.directory=*",
+                "apply",
+                "--binary",
+                "--whitespace=nowarn",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -632,6 +641,7 @@ pub struct GitRepos {
     workdirs: BTreeMap<Option<String>, GitWorkdir>,
     status_tx: mpsc::UnboundedSender<(Option<String>, String)>,
     status_rx: mpsc::UnboundedReceiver<(Option<String>, String)>,
+    agent: Option<AgentUser>,
 }
 
 impl core::fmt::Debug for GitRepos {
@@ -653,7 +663,16 @@ impl GitRepos {
             workdirs: BTreeMap::new(),
             status_tx,
             status_rx,
+            agent: None,
         }
+    }
+
+    /// Configures the unprivileged agent user that newly cloned checkouts are
+    /// chowned to after `AddRepo`.
+    #[must_use]
+    pub fn with_agent(mut self, agent: Option<AgentUser>) -> Self {
+        self.agent = agent;
+        self
     }
 
     /// Begins watching the checkout at `path` under the name `dir`.
@@ -694,8 +713,22 @@ impl WorkingSet for GitRepos {
         if self.workdirs.contains_key(&dir) {
             return Ok(false);
         }
-        clone_into(repo, access, &repo.checkout_path(&self.root)).await?;
-        self.watch(dir, repo.checkout_path(&self.root));
+        let checkout = repo.checkout_path(&self.root);
+        clone_into(repo, access, &checkout).await?;
+        if let Some(agent) = self.agent.clone() {
+            let owned_path = checkout.clone();
+            tokio::task::spawn_blocking(move || chown_tree(&owned_path, &agent))
+                .await
+                .map_err(|error| GitError::Failed {
+                    command: "chown".to_owned(),
+                    detail: error.to_string(),
+                })?
+                .map_err(|error| GitError::Failed {
+                    command: "chown".to_owned(),
+                    detail: error.to_string(),
+                })?;
+        }
+        self.watch(dir, checkout);
         Ok(true)
     }
 
@@ -865,7 +898,10 @@ pub(crate) async fn run_git(
         .unwrap_or("git")
         .to_owned();
     let mut process = Command::new("git");
-    process.current_dir(path).args(args);
+    process
+        .current_dir(path)
+        .args(["-c", "safe.directory=*"])
+        .args(args);
     for (name, value) in env {
         process.env(name, value);
     }

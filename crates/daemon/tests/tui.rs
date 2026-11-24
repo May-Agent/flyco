@@ -100,7 +100,7 @@ async fn a_claude_launch_names_the_sdk_binary_the_model_and_the_mode() {
         other => panic!("the OAuth bootstrap parses to an OAuth auth: {other:?}"),
     }
 
-    let tui = HarnessTui::resolve(&config).await;
+    let tui = HarnessTui::resolve(&config, None).await;
     let command = tui.command(false).await.expect("the launch resolves");
 
     let argv = args_of(&command);
@@ -178,7 +178,7 @@ async fn a_claude_resume_continues_or_names_the_session() {
 
     // No harness-native id recorded: re-entry is `--continue`, the CLI's
     // own "latest conversation" spelling.
-    let tui = HarnessTui::resolve(&config).await;
+    let tui = HarnessTui::resolve(&config, None).await;
     let argv = args_of(&tui.command(true).await.expect("the resume resolves"));
     assert!(argv.contains(&"--continue".to_owned()), "{argv:?}");
     assert!(!argv.contains(&"--resume".to_owned()), "{argv:?}");
@@ -188,7 +188,7 @@ async fn a_claude_resume_continues_or_names_the_session() {
     bootstrap.resume_session_id = Some("a-harness-session-id".to_owned());
     let mut config = parse(&bootstrap);
     config.sidecar.as_mut().expect("sidecar").dir = sidecar_with_claude(&root);
-    let tui = HarnessTui::resolve(&config).await;
+    let tui = HarnessTui::resolve(&config, None).await;
     let argv = args_of(&tui.command(true).await.expect("the resume resolves"));
     assert!(
         argv.windows(2)
@@ -208,7 +208,7 @@ async fn a_missing_claude_binary_is_an_error_not_a_guess() {
     )));
     config.sidecar.as_mut().expect("sidecar").dir = root.clone();
 
-    let tui = HarnessTui::resolve(&config).await;
+    let tui = HarnessTui::resolve(&config, None).await;
     let error = tui.command(false).await.expect_err("no binary, no launch");
     assert!(
         error.to_string().contains("no claude binary"),
@@ -227,7 +227,7 @@ async fn a_codex_launch_names_the_configured_tui_under_the_agents_environment() 
     let config = parse(&bootstrap);
     assert_eq!(config.harness, DriverKind::Acp);
 
-    let tui = HarnessTui::resolve(&config).await;
+    let tui = HarnessTui::resolve(&config, None).await;
     let command = tui.command(false).await.expect("the launch resolves");
     let argv = args_of(&command);
 
@@ -255,13 +255,13 @@ async fn a_codex_resume_names_the_thread_or_the_picker() {
 
     // Nothing recorded: the `{session}` placeholder is dropped, and bare
     // `codex resume` lands on the agent's own conversation picker.
-    let tui = HarnessTui::resolve(&config).await;
+    let tui = HarnessTui::resolve(&config, None).await;
     let argv = args_of(&tui.command(true).await.expect("the resume resolves"));
     assert_eq!(argv, ["codex", "resume"], "{argv:?}");
 
     bootstrap.resume_session_id = Some("a-codex-thread-id".to_owned());
     let config = parse(&bootstrap);
-    let tui = HarnessTui::resolve(&config).await;
+    let tui = HarnessTui::resolve(&config, None).await;
     let argv = args_of(&tui.command(true).await.expect("the resume resolves"));
     assert_eq!(argv, ["codex", "resume", "a-codex-thread-id"], "{argv:?}");
 }

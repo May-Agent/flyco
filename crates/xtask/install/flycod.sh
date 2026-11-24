@@ -178,18 +178,19 @@ install_session_runtime() {
 
   create_runtime_user /usr/bin/fish
 
-  # `/var/lib/flyco` itself is listed, not just its children: a codespace's
-  # postStart appends flycod.log there as the runtime user, and a parent
-  # `install -d` made implicitly would stay root-owned.
-  install -d -o "$runtime_user" -g "$runtime_group" /srv/flyco/work /var/lib/flyco /var/lib/flyco/transcripts /var/lib/flyco/sidecar /var/lib/flyco/claude /var/lib/flyco/codex /var/lib/flyco/devin /var/lib/flyco/devin-config
-  # Claude Code reads its managed policy from here and the daemon writes it
-  # on every start, so it exists before the unit does and belongs to the
-  # user the unit runs as.
-  install -d -o "$runtime_user" -g "$runtime_group" /etc/claude-code
-  # A codespace's postStart writes the configuration it fetched here, as
-  # the runtime user — the VM path writes it from cloud-init as root and
-  # never needed the directory to exist ahead of time.
-  install -d -o "$runtime_user" -g "$runtime_group" /etc/flycod
+  # Dual-UID directory layout:
+  # - Daemon-only secrets and state (`0700 root:root`): unreachable by the
+  #   unprivileged agent user (`flyco`).
+  # - Managed policy trees (`0755 root:root`): readable by the harnesses, never
+  #   writable or replaceable by the agent user.
+  # - Local Unix-socket runtime directory (`0750 root:flyco`): daemon binds the
+  #   MCP broker and desktop IPC sockets; agent connects.
+  # - Agent workspace and writable harness state (`flyco:flyco`).
+  install -d -o root -g root -m 0700 /etc/flycod /var/lib/flyco/transcripts /var/lib/flyco/daemon-home
+  install -d -o root -g root -m 0755 /var/lib/flyco /var/lib/flyco/sidecar /var/lib/flyco/codex /var/lib/flyco/devin-config /etc/claude-code
+  install -d -o root -g "$runtime_group" -m 0750 /var/lib/flyco/run
+  install -d -o "$runtime_user" -g "$runtime_group" -m 0755 /srv/flyco/work
+  install -d -o "$runtime_user" -g "$runtime_group" -m 0750 /var/lib/flyco/claude /var/lib/flyco/devin
 
   download https://github.com/oven-sh/bun/releases/latest/download/SHASUMS256.txt "$scratch/bun-sha256"
   case "$artifact" in
@@ -284,10 +285,11 @@ verify_session_runtime() {
 
 install_session() {
   install_session_runtime
-  # cloud-init wrote the configuration as root before this ran; the daemon
-  # runs as the runtime user and has to read it.
-  chgrp "$runtime_group" /etc/flycod/config.toml
-  chmod 0640 /etc/flycod/config.toml
+  # cloud-init wrote the configuration as root before this ran; keep it
+  # daemon-only (`0600 root:root`) so the unprivileged agent user (`flyco`)
+  # can never read `daemon_token`, `github.token`, or harness credentials.
+  chown root:root /etc/flycod/config.toml
+  chmod 0600 /etc/flycod/config.toml
   install_flycod
   install_unit flycod.service
   systemctl daemon-reload
@@ -296,12 +298,12 @@ install_session() {
 
 # A session container image. The daemon binary is a file the image build
 # has on hand, there is no systemd, and the configuration is not on disk
-# yet: the entrypoint writes it at start from the environment the platform
-# hands the container, so the directory it lands in belongs to the runtime
-# user the entrypoint runs as.
+# yet: the entrypoint writes it at start as the daemon principal (`root`,
+# `0600 /etc/flycod/config.toml`), and `flycod run` drops privileges to the
+# unprivileged `flyco` user whenever spawning harnesses, shells, or PTYs.
 install_image() {
   install_session_runtime
-  install -d -o "$runtime_user" -g "$runtime_group" -m 0750 /etc/flycod
+  install -d -o root -g root -m 0700 /etc/flycod
   install_flycod_from "$1"
   verify_session_runtime
 }

@@ -154,24 +154,24 @@ pub struct FlycoServer {
 }
 
 impl FlycoServer {
-    /// The command that serves this session's tools over stdio.
+    /// The command that serves this session's tools over stdio by talking to
+    /// `flycod run`'s local Unix-socket MCP broker.
     ///
-    /// `config` is the file `flycod run` was pointed at. The second process
-    /// shares nothing with this one but that file and the daemon token in
-    /// it, which is the whole point: every fact it reports comes from the
-    /// control plane rather than from this daemon's memory.
+    /// `socket` is the broker Unix socket owned by `flycod run` (`0660`,
+    /// daemon:agent). The MCP process never reads `/etc/flycod/config.toml`
+    /// and never holds `daemon_token`.
     ///
     /// # Errors
     ///
     /// Returns [`MountError::Executable`] if the running executable's path
     /// cannot be read.
-    pub fn of(config: &Path) -> Result<Self, MountError> {
+    pub fn of_socket(socket: &Path) -> Result<Self, MountError> {
         Ok(Self {
             program: std::env::current_exe().map_err(MountError::Executable)?,
             args: vec![
                 "mcp".to_owned(),
-                "--config".to_owned(),
-                config.to_string_lossy().into_owned(),
+                "--socket".to_owned(),
+                socket.to_string_lossy().into_owned(),
             ],
         })
     }
@@ -179,10 +179,10 @@ impl FlycoServer {
     /// Builds one from an explicit program, for a test that must not depend
     /// on where the test runner's binary lives.
     #[cfg(test)]
-    fn at(program: &str, config: &str) -> Self {
+    fn at(program: &str, socket: &str) -> Self {
         Self {
             program: PathBuf::from(program),
-            args: vec!["mcp".to_owned(), "--config".to_owned(), config.to_owned()],
+            args: vec!["mcp".to_owned(), "--socket".to_owned(), socket.to_owned()],
         }
     }
 
@@ -247,10 +247,19 @@ impl Mount {
     /// A [`BTreeMap`] because both harnesses key their configuration by
     /// server name, and because a document whose key order depended on a
     /// database's `ORDER BY` would be a file that changes for no reason.
+    /// Any user registration colliding with `"flyco"` (case-insensitively)
+    /// is skipped so flyco's built-in server can never be shadowed.
     fn servers(&self) -> BTreeMap<&str, Server<'_>> {
         let mut servers = BTreeMap::new();
         servers.insert(FLYCO, Server::Flyco(&self.flyco));
         for entry in &self.registered {
+            if entry.name.eq_ignore_ascii_case(FLYCO) {
+                tracing::warn!(
+                    name = %entry.name,
+                    "ignoring user-registered MCP server that collides with reserved `flyco` server"
+                );
+                continue;
+            }
             servers.insert(entry.name.as_str(), Server::Registered(&entry.config));
         }
         servers
@@ -274,23 +283,28 @@ impl Mount {
         })
     }
 
-    /// `managed-settings.json`: the allowlist, read from managed settings
-    /// and nowhere else.
+    /// `managed-settings.json`: the complete managed enterprise policy.
     ///
-    /// `allowManagedMcpServersOnly` is what makes it binding: without it a
-    /// user-level settings file could widen `allowedMcpServers`, and with
-    /// it the list below is the only one the CLI consults. A server the
-    /// agent adds by any other route is refused at connect time because it
-    /// matches no entry here.
+    /// Enforces exclusive MCP server allowlisting (`allowManagedMcpServersOnly`),
+    /// exclusive managed permission rules (`allowManagedPermissionRulesOnly`),
+    /// disabled sideload flags (`disableSideloadFlags`), disabled local
+    /// auto-memory (`autoMemoryEnabled: false`), absolute-path `permissions.deny`
+    /// rules that bind even under `auto` and `bypassPermissions`, and a
+    /// `PreToolUse` command hook backstop pointing at `flycod hook pre-tool-use`.
     #[must_use]
     pub fn claude_managed_settings(&self) -> String {
         json(&ManagedSettings {
             allow_managed_mcp_servers_only: true,
+            allow_managed_permission_rules_only: true,
+            disable_sideload_flags: true,
+            auto_memory_enabled: false,
             allowed_mcp_servers: self
                 .servers()
                 .into_values()
                 .map(Server::claude_allowlist_entry)
                 .collect(),
+            permissions: ManagedPermissions::flyco_defaults(),
+            hooks: ManagedHooks::pre_tool_use_backstop(&self.flyco.program()),
         })
     }
 
@@ -330,16 +344,26 @@ impl Mount {
             .collect()
     }
 
-    /// Writes Claude Code's two managed-policy files into `dir`.
+    /// Writes Claude Code's two managed-policy files into `dir` with daemon-only
+    /// write permissions (`0755` directory, `0644` files) so the unprivileged
+    /// agent user can read them but cannot modify or replace them.
     ///
     /// # Errors
     ///
     /// Returns [`MountError::Write`] if the directory or either file cannot
-    /// be written — which on a provisioned machine means flycod is not root,
-    /// and is a session that must not start rather than one that runs
+    /// be written — which on a provisioned machine means flycod cannot enforce
+    /// policy, and is a session that must not start rather than one that runs
     /// unenforced.
     pub async fn write_claude_managed(&self, dir: &Path) -> Result<(), MountError> {
+        use std::os::unix::fs::PermissionsExt as _;
+
         tokio::fs::create_dir_all(dir)
+            .await
+            .map_err(|source| MountError::Write {
+                path: dir.to_owned(),
+                source,
+            })?;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
             .await
             .map_err(|source| MountError::Write {
                 path: dir.to_owned(),
@@ -352,12 +376,18 @@ impl Mount {
             let path = dir.join(name);
             tokio::fs::write(&path, body)
                 .await
+                .map_err(|source| MountError::Write {
+                    path: path.clone(),
+                    source,
+                })?;
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .await
                 .map_err(|source| MountError::Write { path, source })?;
         }
         tracing::info!(
             dir = %dir.display(),
-            servers = self.registered.len() + 1,
-            "wrote Claude Code's managed MCP policy"
+            servers = self.servers().len(),
+            "wrote Claude Code's managed policy"
         );
         Ok(())
     }
@@ -513,17 +543,83 @@ struct ManagedMcp {
     mcp_servers: BTreeMap<String, ClaudeMcpServer>,
 }
 
-/// `managed-settings.json`, as far as MCP is concerned.
-///
-/// Deliberately not the whole settings document: the permission rules, the
-/// hooks and the memory switches this file also carries are their own
-/// takeovers, and a struct that claimed to render them would have to render
-/// them.
+/// Full managed `managed-settings.json` document enforced for Claude Code.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
 struct ManagedSettings {
     allow_managed_mcp_servers_only: bool,
+    allow_managed_permission_rules_only: bool,
+    disable_sideload_flags: bool,
+    auto_memory_enabled: bool,
     allowed_mcp_servers: Vec<AllowedMcpServer>,
+    permissions: ManagedPermissions,
+    hooks: ManagedHooks,
+}
+
+/// Absolute-path deny rules that bind even under `auto` and `bypassPermissions`.
+#[derive(Debug, Serialize)]
+struct ManagedPermissions {
+    deny: Vec<&'static str>,
+}
+
+impl ManagedPermissions {
+    fn flyco_defaults() -> Self {
+        Self {
+            deny: vec![
+                "Read(//etc/flycod/**)",
+                "Edit(//etc/flycod/**)",
+                "Write(//etc/flycod/**)",
+                "Read(//var/lib/flyco/transcripts/**)",
+                "Edit(//var/lib/flyco/transcripts/**)",
+                "Write(//var/lib/flyco/transcripts/**)",
+                "Edit(//etc/claude-code/**)",
+                "Write(//etc/claude-code/**)",
+                "Edit(//var/lib/flyco/codex/**)",
+                "Write(//var/lib/flyco/codex/**)",
+                "Edit(//var/lib/flyco/devin-config/**)",
+                "Write(//var/lib/flyco/devin-config/**)",
+                "Edit(//var/lib/flyco/sidecar/**)",
+                "Write(//var/lib/flyco/sidecar/**)",
+            ],
+        }
+    }
+}
+
+/// Managed Claude Code hooks section carrying the `PreToolUse` backstop.
+#[derive(Debug, Serialize)]
+struct ManagedHooks {
+    #[serde(rename = "PreToolUse")]
+    pre_tool_use: Vec<HookMatcher>,
+}
+
+impl ManagedHooks {
+    fn pre_tool_use_backstop(flycod_program: &str) -> Self {
+        Self {
+            pre_tool_use: vec![HookMatcher {
+                matcher: "Bash|Read|Edit|Write|MultiEdit|NotebookEdit",
+                hooks: vec![HookCommand {
+                    kind: "command",
+                    command: format!("{flycod_program} hook pre-tool-use"),
+                }],
+            }],
+        }
+    }
+}
+
+/// One `PreToolUse` matcher group.
+#[derive(Debug, Serialize)]
+struct HookMatcher {
+    matcher: &'static str,
+    hooks: Vec<HookCommand>,
+}
+
+/// One command hook entry inside a matcher group.
+#[derive(Debug, Serialize)]
+struct HookCommand {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    command: String,
 }
 
 /// One `allowedMcpServers` entry.
@@ -681,7 +777,7 @@ mod tests {
     use super::{FlycoServer, Mount, MountedServer, NotMounted, verify};
 
     const FLYCOD: &str = "/usr/local/bin/flycod";
-    const CONFIG: &str = "/etc/flyco/flycod.toml";
+    const SOCKET: &str = "/var/lib/flyco/run/mcp.sock";
 
     fn registered() -> Vec<McpServerMount> {
         vec![
@@ -713,11 +809,11 @@ mod tests {
     }
 
     fn alone() -> Mount {
-        Mount::new(FlycoServer::at(FLYCOD, CONFIG), Vec::new(), false)
+        Mount::new(FlycoServer::at(FLYCOD, SOCKET), Vec::new(), false)
     }
 
     fn with_servers() -> Mount {
-        Mount::new(FlycoServer::at(FLYCOD, CONFIG), registered(), false)
+        Mount::new(FlycoServer::at(FLYCOD, SOCKET), registered(), false)
     }
 
     #[test]
@@ -871,5 +967,71 @@ mod tests {
             }
         );
         assert!(error.to_string().contains("machine_status"));
+    }
+
+    #[test]
+    fn user_registered_flyco_server_cannot_overwrite_builtin_case_insensitively() {
+        let mut servers = registered();
+        servers.push(McpServerMount {
+            name: "flyco".to_owned(),
+            config: McpServerConfig::Http {
+                url: "https://attacker.example/mcp".to_owned(),
+                headers: Vec::new(),
+            },
+        });
+        servers.push(McpServerMount {
+            name: "FLYCO".to_owned(),
+            config: McpServerConfig::Http {
+                url: "https://attacker2.example/mcp".to_owned(),
+                headers: Vec::new(),
+            },
+        });
+        let mount = Mount::new(FlycoServer::at(FLYCOD, SOCKET), servers, false);
+
+        assert_eq!(
+            mount.claude_managed_mcp(),
+            with_servers().claude_managed_mcp(),
+            "colliding `flyco` / `FLYCO` registrations must be ignored"
+        );
+        assert_eq!(
+            mount.claude_managed_settings(),
+            with_servers().claude_managed_settings()
+        );
+        let acp_names: Vec<String> = mount
+            .acp_servers()
+            .iter()
+            .map(|server| server.name().to_owned())
+            .collect();
+        assert_eq!(acp_names, ["deepwiki", "flyco", "git"]);
+    }
+
+    #[tokio::test]
+    async fn write_claude_managed_sets_non_agent_writable_modes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir =
+            std::env::temp_dir().join(format!("flycod-managed-mode-{}", uuid::Uuid::new_v4()));
+        alone()
+            .write_claude_managed(&dir)
+            .await
+            .expect("write managed files");
+
+        assert_eq!(
+            std::fs::metadata(&dir)
+                .expect("dir meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        for file in [super::MANAGED_MCP, super::MANAGED_SETTINGS] {
+            let mode = std::fs::metadata(dir.join(file))
+                .expect("file meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o644, "{file} must be 0644");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

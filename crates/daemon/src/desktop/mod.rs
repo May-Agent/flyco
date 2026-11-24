@@ -44,6 +44,7 @@ use flyco_core::wire::{DesktopInputEvent, DesktopStatus};
 use tokio::sync::mpsc;
 
 use crate::config::ComputerConfig;
+use crate::privilege::AgentUser;
 
 /// How many desktop reports the pump may owe the room before the
 /// supervisor waits on it.
@@ -203,9 +204,21 @@ enum Supervision {
 /// control channel until the first [`Supervision::Enabled`] wakes it, so
 /// a desktop the session never gets costs one idle thread and nothing
 /// else.
+#[must_use]
 pub fn spawn(
     config: &ComputerConfig,
     session: SessionId,
+) -> (Desktop, mpsc::Receiver<DesktopEvent>) {
+    spawn_at(config, ipc::socket_path(session), None)
+}
+
+/// Spawns the desktop supervisor, binding its agent IPC socket at `socket_path`
+/// and running Xvfb + window manager under `agent` when present.
+#[must_use]
+pub fn spawn_at(
+    config: &ComputerConfig,
+    socket_path: std::path::PathBuf,
+    agent: Option<AgentUser>,
 ) -> (Desktop, mpsc::Receiver<DesktopEvent>) {
     let (control, supervised) = std::sync::mpsc::sync_channel(64);
     let (events, out) = mpsc::channel(EVENT_DEPTH);
@@ -214,8 +227,7 @@ pub fn spawn(
         .spawn({
             let config = config.clone();
             move || {
-                let socket_path = ipc::socket_path(session);
-                drive(&supervised, &events, &config, &socket_path);
+                drive(&supervised, &events, &config, &socket_path, agent.as_ref());
             }
         });
     if let Err(error) = spawn {
@@ -273,6 +285,7 @@ fn drive(
     events: &mpsc::Sender<DesktopEvent>,
     config: &ComputerConfig,
     socket_path: &Path,
+    agent: Option<&AgentUser>,
 ) {
     let mut supervisor = Supervisor {
         running: None,
@@ -284,7 +297,13 @@ fn drive(
         force_keyframe: false,
     };
     if config.enabled {
-        supervisor.apply(Supervision::Enabled(true), events, config, socket_path);
+        supervisor.apply(
+            Supervision::Enabled(true),
+            events,
+            config,
+            socket_path,
+            agent,
+        );
     }
     loop {
         // The wait is the shorter of "until the next frame is due" and
@@ -302,7 +321,7 @@ fn drive(
                     .min(SOCKET_SERVICE)
             });
         match control.recv_timeout(wait) {
-            Ok(order) => supervisor.apply(order, events, config, socket_path),
+            Ok(order) => supervisor.apply(order, events, config, socket_path, agent),
             Err(RecvTimeoutError::Timeout) => {}
             // Every sender is gone: the connection ended. The stack comes
             // down with the session.
@@ -344,11 +363,12 @@ impl Supervisor {
         events: &mpsc::Sender<DesktopEvent>,
         config: &ComputerConfig,
         socket_path: &Path,
+        agent: Option<&AgentUser>,
     ) {
         match order {
             Supervision::Enabled(true) if self.running.is_none() => {
                 Self::report(events, DesktopStatus::Starting, None);
-                match Running::start(config, socket_path) {
+                match Running::start(config, socket_path, agent) {
                     Ok(running) => {
                         self.running = Some(running);
                         Self::report(events, DesktopStatus::Ready, None);
@@ -425,13 +445,17 @@ impl Running {
     /// Brings the display stack up: Xvfb on a free display, the XTEST
     /// probe, the keymap, the encoder, the window manager, and the socket
     /// the agent knocks on.
-    fn start(config: &ComputerConfig, socket_path: &Path) -> Result<Self, x11::DisplayError> {
-        let display = x11::Display::start(config)?;
+    fn start(
+        config: &ComputerConfig,
+        socket_path: &Path,
+        agent: Option<&AgentUser>,
+    ) -> Result<Self, x11::DisplayError> {
+        let display = x11::Display::start(config, agent)?;
         let encoder = encode::Encoder::new(config).map_err(|reason| x11::DisplayError::Encode {
             reason: reason.to_string(),
         })?;
-        let wm = x11::start_window_manager(display.env_name());
-        let agent = ipc::Listener::bind(socket_path)
+        let wm = x11::start_window_manager(display.env_name(), agent);
+        let agent = ipc::Listener::bind_for(socket_path, agent)
             .map_err(|source| x11::DisplayError::AgentSocket { source })?;
         Ok(Self {
             display,

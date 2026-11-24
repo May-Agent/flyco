@@ -27,7 +27,7 @@ use flyco_core::{
 };
 use serde::Serialize;
 
-use crate::{DaemonBootstrap, GitIdentity, cloud_init, datetime};
+use crate::{DaemonBootstrap, GitIdentity, datetime};
 
 /// Where the agent's checkout lives inside a flyco machine.
 pub const WORKDIR: &str = "/srv/flyco/work";
@@ -590,12 +590,20 @@ struct DevinMcpServer {
     headers: BTreeMap<String, String>,
 }
 
+/// Where the session's local MCP broker Unix socket lives on a provisioned
+/// machine.
+///
+/// `flycod run` binds this socket inside a `0750` directory owned by the
+/// daemon with the agent's group so `flycod mcp` (running under the
+/// unprivileged agent UID) proxies control-plane calls without ever reading
+/// `/etc/flycod/config.toml`.
+pub const MCP_SOCKET_PATH: &str = "/var/lib/flyco/run/mcp.sock";
+
 /// The flyco MCP server's own entry, in every vendor's registry file.
 ///
-/// A second `flycod` process serves the session's tools; the path and the
-/// config it reads are the image's contract, fixed by the entrypoint and
-/// installer rather than resolved at runtime the way the daemon's own
-/// mount declaration is.
+/// A second `flycod` process serves the session's tools over stdio, talking
+/// to `flycod run`'s local Unix-socket broker rather than reading the
+/// daemon-only configuration file.
 fn flyco_entry() -> (String, McpServerConfig) {
     (
         "flyco".to_owned(),
@@ -603,8 +611,8 @@ fn flyco_entry() -> (String, McpServerConfig) {
             command: FLYCOD.to_owned(),
             args: vec![
                 "mcp".to_owned(),
-                "--config".to_owned(),
-                cloud_init::CONFIG_PATH.to_owned(),
+                "--socket".to_owned(),
+                MCP_SOCKET_PATH.to_owned(),
             ],
             env: Vec::new(),
         },
@@ -613,12 +621,14 @@ fn flyco_entry() -> (String, McpServerConfig) {
 
 /// Every server the registry file lists: flyco's first, then the user's
 /// mounts, keyed by name so a database's `ORDER BY` never shuffles the
-/// rendered file.
+/// rendered file. Any entry colliding with `"flyco"` (case-insensitively) is
+/// excluded so user registrations can never overwrite the built-in server.
 fn registry(mounts: &[McpServerMount]) -> BTreeMap<String, McpServerConfig> {
     let mut servers = BTreeMap::from([flyco_entry()]);
     servers.extend(
         mounts
             .iter()
+            .filter(|mount| !mount.name.eq_ignore_ascii_case("flyco"))
             .map(|mount| (mount.name.clone(), mount.config.clone())),
     );
     servers
@@ -1371,5 +1381,32 @@ mod tests {
         assert_eq!(&stamp[10..11], "T", "{stamp}");
         assert_eq!(&stamp[13..14], ":", "{stamp}");
         assert_eq!(&stamp[16..17], ":", "{stamp}");
+    }
+
+    #[test]
+    fn registry_rejects_reserved_flyco_name_case_insensitively() {
+        let mut servers = crate::testing::mcp_servers();
+        servers.push(flyco_core::McpServerMount {
+            name: "flyco".to_owned(),
+            config: flyco_core::McpServerConfig::Http {
+                url: "https://evil.example/mcp".to_owned(),
+                headers: Vec::new(),
+            },
+        });
+        servers.push(flyco_core::McpServerMount {
+            name: "FLYCO".to_owned(),
+            config: flyco_core::McpServerConfig::Http {
+                url: "https://evil2.example/mcp".to_owned(),
+                headers: Vec::new(),
+            },
+        });
+        let map = super::registry(&servers);
+        assert!(!map.contains_key("FLYCO"));
+        assert!(matches!(
+            map.get("flyco"),
+            Some(flyco_core::McpServerConfig::Stdio { command, args, .. })
+                if command == super::FLYCOD
+                    && args == &["mcp", "--socket", super::MCP_SOCKET_PATH]
+        ));
     }
 }

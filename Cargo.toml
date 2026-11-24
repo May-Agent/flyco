@@ -123,6 +123,9 @@ portable-pty = { version = "0.9", default-features = false }
 # `statvfs`, which is how an enrolled host measures the space left where
 # Podman keeps its containers.
 rustix = { version = "1", default-features = false, features = ["std", "fs", "event", "system", "termios"] }
+# POSIX user lookup, privilege drop (`setgroups`/`setgid`/`setuid`), PTY
+# session setup, and `chown` for dual-UID daemon/agent isolation.
+libc = { version = "0.2", default-features = false, features = ["std"] }
 # The official Rust MCP SDK, for flycod's local stdio server. Only the
 # server half and the stdio transport: the daemon is spoken *to* by the
 # harness it supervises and never speaks MCP itself, and `macros` is off

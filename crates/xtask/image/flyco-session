@@ -15,8 +15,14 @@ if [ -z "${FLYCO_DAEMON_CONFIG:-}" ]; then
   exit 78
 fi
 
-umask 077
-printf '%s' "$FLYCO_DAEMON_CONFIG" | base64 -d >"$config"
+# Write the daemon configuration strictly `0600` inside a subshell so the
+# restrictive umask is not inherited by `flycod` when writing `0755`/`0644`
+# managed policy files or `0660` broker sockets.
+(
+  umask 077
+  printf '%s' "$FLYCO_DAEMON_CONFIG" | base64 -d >"$config"
+)
+chmod 0600 "$config"
 unset FLYCO_DAEMON_CONFIG
 
-exec /usr/local/bin/flycod run --config "$config"
+exec /usr/local/bin/flycod run --config "$config" --agent-user flyco

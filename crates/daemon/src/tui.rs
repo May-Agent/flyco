@@ -14,6 +14,7 @@ use portable_pty::CommandBuilder;
 use serde::Serialize;
 
 use crate::config::{ClaudeAuth, DaemonConfig};
+use crate::privilege::{AgentUser, chown_path};
 
 /// Why a harness TUI cannot be launched.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -73,11 +74,17 @@ struct Credential<'a> {
 /// read true. `claude setup-token` mints a long-lived grant with no
 /// refresh token, so the entry cannot expire or refresh from the CLI's
 /// side.
-fn provision_oauth(dir: &Path, token: &str) -> Result<(), TuiError> {
+fn provision_oauth(dir: &Path, token: &str, agent: Option<&AgentUser>) -> Result<(), TuiError> {
     use std::io::Write as _;
 
     let io = |error: std::io::Error| TuiError::CredentialWrite(error.to_string());
     std::fs::create_dir_all(dir).map_err(io)?;
+    if let Some(user) = agent
+        && user.needs_uid_switch()
+    {
+        chown_path(dir, Some(user.uid), Some(user.gid))
+            .map_err(|error| TuiError::CredentialWrite(error.to_string()))?;
+    }
     let file = CredentialFile {
         claude_ai_oauth: Credential {
             access_token: token,
@@ -100,6 +107,11 @@ fn provision_oauth(dir: &Path, token: &str) -> Result<(), TuiError> {
         tmp.write_all(body.as_bytes())?;
         tmp.sync_all()?;
         drop(tmp);
+        if let Some(user) = agent
+            && user.needs_uid_switch()
+        {
+            chown_path(&tmp_path, Some(user.uid), Some(user.gid)).map_err(std::io::Error::other)?;
+        }
         std::fs::rename(&tmp_path, &path)?;
         Ok(())
     })();
@@ -124,6 +136,8 @@ pub struct HarnessTui {
     /// written fresh at every launch because the CLI removes the file on
     /// some failures.
     oauth_credential: Option<(PathBuf, String)>,
+    /// Unprivileged user that will own any freshly provisioned credential file.
+    agent: Option<AgentUser>,
 }
 
 impl core::fmt::Debug for HarnessTui {
@@ -161,10 +175,10 @@ impl HarnessTui {
     /// for Claude Code the SDK's bundled `claude` binary under the
     /// sidecar's `node_modules`, for ACP the `[acp.tui]` table — which an
     /// agent without a TUI simply does not have, and says so at launch.
-    pub async fn resolve(config: &DaemonConfig) -> Self {
+    pub async fn resolve(config: &DaemonConfig, agent: Option<AgentUser>) -> Self {
         match config.harness {
-            DriverKind::ClaudeCode => Self::claude(config).await,
-            DriverKind::Acp => Self::acp(config),
+            DriverKind::ClaudeCode => Self::claude(config, agent).await,
+            DriverKind::Acp => Self::acp(config, agent),
         }
     }
 
@@ -182,7 +196,8 @@ impl HarnessTui {
             Program::Claude(resolved) => resolved.clone()?,
         };
         if let Some((dir, token)) = self.oauth_credential.clone() {
-            tokio::task::spawn_blocking(move || provision_oauth(&dir, &token))
+            let agent = self.agent.clone();
+            tokio::task::spawn_blocking(move || provision_oauth(&dir, &token, agent.as_ref()))
                 .await
                 .map_err(|error| TuiError::CredentialWrite(error.to_string()))??;
         }
@@ -201,7 +216,7 @@ impl HarnessTui {
     /// The Claude Code TUI: the SDK's platform binary, the session's
     /// isolated config tree and credential, and the session's model and
     /// permission mode as flags.
-    async fn claude(config: &DaemonConfig) -> Self {
+    async fn claude(config: &DaemonConfig, agent: Option<AgentUser>) -> Self {
         let claude = config.claude();
         let sidecar = config.sidecar();
 
@@ -263,6 +278,7 @@ impl HarnessTui {
             resume_args,
             env,
             oauth_credential,
+            agent,
         }
     }
 
@@ -275,7 +291,7 @@ impl HarnessTui {
     /// here: each agent re-enters a conversation its own way, and a
     /// `{session}` placeholder in `resume_args` is filled with the
     /// harness-native session id when one is recorded.
-    fn acp(config: &DaemonConfig) -> Self {
+    fn acp(config: &DaemonConfig, agent: Option<AgentUser>) -> Self {
         let acp = config.acp();
         let Some(tui) = &acp.tui else {
             return Self {
@@ -284,6 +300,7 @@ impl HarnessTui {
                 resume_args: Vec::new(),
                 env: Vec::new(),
                 oauth_credential: None,
+                agent,
             };
         };
 
@@ -315,6 +332,7 @@ impl HarnessTui {
             resume_args: fill(&tui.resume_args),
             env,
             oauth_credential: None,
+            agent,
         }
     }
 }
@@ -330,6 +348,7 @@ impl HarnessTui {
             resume_args: Vec::new(),
             env: Vec::new(),
             oauth_credential: None,
+            agent: None,
         }
     }
 }
