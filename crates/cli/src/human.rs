@@ -1,36 +1,33 @@
-//! The human path: `flyco claude`, `flyco codex`, `flyco resume`, and the
-//! bare command's harness picker.
+//! The human path: `flyco claude`, `flyco codex`, `flyco devin`,
+//! `flyco antigravity`, `flyco resume`, and the bare command's harness picker.
 //!
-//! One orchestration for all of it: get the session onto a live machine,
-//! ask for its harness TUI, and hand the terminal to [`crate::bridge`].
-//! What differs is only how the session is named — created from a picker
-//! chain for `claude`/`codex`, named by id or picked for `resume`.
+//! One orchestration for all four harnesses: resolve any missing flags via
+//! interactive pickers, create or resume the session, and attach the local
+//! terminal to the control-plane ACP/SSE conversation interface via
+//! [`crate::interactive`].
 //!
-//! The path is TTY-only by definition: the bridge puts the local terminal
-//! in raw mode, so a pipe has nothing to bridge. The agent surface —
-//! `flyco run`, `flyco session …` — is the non-interactive one.
+//! The path is TTY-only by definition: interactive pickers and the live prompt
+//! require a terminal. The agent surface — `flyco run`, `flyco session …` — is
+//! the non-interactive one.
 
 use std::io::IsTerminal as _;
 
-use flyco_core::wire::ClientEvent;
 use flyco_core::{
-    CreateSession, HarnessKind, HarnessTui, MachineCatalog, MachineChoice, MachineDefault,
-    RepoSummary, SessionDetail, SessionState, SessionSummary,
+    CreateSession, HarnessKind, MachineCatalog, MachineChoice, MachineDefault, RepoSummary,
+    SessionDetail, SessionState, SessionSummary,
 };
 
-use crate::bridge::{self, Ended};
 use crate::cli::SessionSpec;
 use crate::client::Api;
-use crate::follow::Follow;
-use crate::session::exit_code;
+use crate::interactive;
 use crate::{Exit, Failure, Outcome, out, pick};
 
-/// `flyco claude` / `flyco codex`: create a session and bridge into its
-/// harness TUI.
+/// `flyco claude` / `flyco codex` / `flyco devin` / `flyco antigravity`:
+/// create a session and attach to its control-plane ACP/SSE stream.
 ///
 /// # Errors
-/// Returns [`Failure`](crate::Failure) when a request fails, the session cannot
-/// reach a machine, or the bridge fails.
+/// Returns [`Failure`](crate::Failure) when stdin/stdout is not a terminal, a
+/// request fails, or the interactive stream terminates with a fatal error.
 pub async fn launch(
     api: &Api,
     harness: HarnessKind,
@@ -49,42 +46,36 @@ pub async fn launch(
         .await?;
     let id = session.summary.id;
     crate::session::set_env(api, &id, &env).await?;
-    note(mode, &format!("session {id} — provisioning its machine"));
-    attach(api, id, HarnessTui { resume: false }, mode).await
+    interactive::attach(api, session, false, mode).await
 }
 
-/// `flyco resume [<id>|--last]`: re-enter a session's TUI, putting it back
-/// on a machine first when it was off one.
+/// `flyco resume [<id>|--last]`: re-attach to an existing session over the
+/// control-plane ACP/SSE stream, re-provisioning its machine first when away.
 ///
 /// # Errors
-/// Returns [`Failure`](crate::Failure) when a request fails, the session cannot
-/// reach a machine, or the bridge fails.
+/// Returns [`Failure`](crate::Failure) when stdin/stdout is not a terminal,
+/// the session cannot be found or resumed, or the interactive stream fails.
 pub async fn resume(api: &Api, id: Option<String>, last: bool, mode: out::Mode) -> Outcome<Exit> {
     require_terminal()?;
     let session = find_session(api, id, last).await?;
-    match session.state {
-        // Off its machine — interrupted, failed, archived: the resume
-        // route rebuilds it through provisioning.
-        state if state.is_resumable() => {
-            note(mode, "putting the session back on a machine");
-            crate::session::resume(api, &session.id.to_string(), mode).await?;
-        }
-        SessionState::Paused => {
-            return Err(Failure::problem(
-                Exit::Paused,
-                "the session is paused — resolve the pause, then resume",
-            ));
-        }
-        _ => {}
-    }
-    attach(api, session.id, HarnessTui { resume: true }, mode).await
+    let detail = if session.state.is_resumable() {
+        note(mode, "putting the session back on a machine");
+        api.post::<serde_json::Value, SessionDetail>(
+            &format!("/v1/sessions/{}/resume", session.id),
+            &serde_json::json!({}),
+        )
+        .await?
+    } else {
+        api.get(&format!("/v1/sessions/{}", session.id)).await?
+    };
+    interactive::attach(api, detail, true, mode).await
 }
 
 /// Bare `flyco`: the harness picker, then the launch flow.
 ///
 /// # Errors
-/// Returns [`Failure`](crate::Failure) when a request fails, the session cannot
-/// reach a machine, or the bridge fails.
+/// Returns [`Failure`](crate::Failure) when stdin/stdout is not a terminal, a
+/// request fails, or the interactive stream terminates with a fatal error.
 pub async fn pick_harness(api: &Api, mode: out::Mode) -> Outcome<Exit> {
     require_terminal()?;
     let harnesses = [
@@ -102,14 +93,22 @@ pub async fn pick_harness(api: &Api, mode: out::Mode) -> Outcome<Exit> {
     launch(api, harnesses[chosen], None, &SessionSpec::default(), mode).await
 }
 
-/// A TUI command with no terminal is a category error, not a missing
-/// flag: point at the pipe surface rather than asking a pipe questions.
+/// An interactive command with no terminal is a category error, not a missing
+/// flag: point at the non-interactive surface rather than asking a pipe
+/// questions.
 fn require_terminal() -> Outcome<()> {
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    require_terminal_streams(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    )
+}
+
+pub(crate) fn require_terminal_streams(stdin_is_tty: bool, stdout_is_tty: bool) -> Outcome<()> {
+    if stdin_is_tty && stdout_is_tty {
         return Ok(());
     }
     Err(Failure::usage(
-        "the TUI bridge needs a terminal — `flyco run` and `flyco session …` are the non-interactive surface",
+        "interactive sessions need a terminal — `flyco run` and `flyco session …` are the non-interactive surface",
     ))
 }
 
@@ -158,9 +157,9 @@ fn state_of(session: &SessionSummary) -> String {
 
 /// The picker chain for a new session — every step a flag can bypass.
 ///
-/// Order is the issue's: repo → branch → machine → spot → disk → budget →
-/// env → the goal. Each answer comes from `spec` when the flag was given
-/// and is asked for otherwise; nothing here ever runs off a TTY.
+/// Order is repo → branch → machine → spot → disk → budget → env → goal.
+/// Each answer comes from `spec` when the flag was given and is asked for
+/// otherwise; nothing here ever runs off a TTY.
 async fn resolve(
     api: &Api,
     harness: HarnessKind,
@@ -265,8 +264,6 @@ async fn pick_branch(api: &Api, repo: &str) -> Outcome<Option<String>> {
     if page.branches.is_empty() {
         return Ok(None);
     }
-    // "(default)" first: choosing it omits the branch rather than naming
-    // it, so a session follows the repo's default forever.
     let mut names: Vec<String> = vec!["(default)".to_owned()];
     names.extend(page.branches.iter().map(|branch| branch.name.to_string()));
     let chosen = pick::pick("Branch", &names, std::clone::Clone::clone)?;
@@ -293,7 +290,6 @@ pub(crate) async fn pick_machine(api: &Api, spec: &SessionSpec) -> Outcome<Machi
             "no machines in the catalog — link a provider account in flyco first",
         ));
     }
-    // The suggested machine first, so Enter does the right thing.
     let is_default = |entry: &flyco_core::MachineCatalogEntry| {
         default.as_ref().is_some_and(|d| {
             entry.account == Some(d.choice.provider_account)
@@ -311,7 +307,7 @@ pub(crate) async fn pick_machine(api: &Api, spec: &SessionSpec) -> Outcome<Machi
         );
         let price = crate::discover::pricing(entry);
         format!(
-            "{} · {} · {} · {}",
+            "{}  {}  {}  {}",
             entry.machine_type, entry.region, size, price
         )
     })?;
@@ -322,7 +318,7 @@ pub(crate) async fn pick_machine(api: &Api, spec: &SessionSpec) -> Outcome<Machi
     } else if spec.on_demand {
         false
     } else if entry.pricing.offers_spot() {
-        pick::confirm("Spot capacity (interruptible, cheaper)", true)?
+        pick::confirm("Spot capacity", true)?
     } else {
         false
     };
@@ -344,145 +340,25 @@ pub(crate) async fn pick_machine(api: &Api, spec: &SessionSpec) -> Outcome<Machi
     })
 }
 
-/// Get the session onto a machine, put its harness TUI in the foreground,
-/// and bridge the local terminal to it.
-///
-/// The stream opens before anything is posted so nothing the daemon emits
-/// in answer can race past it. The launch itself needs no wait: a command
-/// is a row the daemon's stream replays, so a machine still provisioning
-/// takes it on first attach and one already up takes it now — `ensure`
-/// semantics make a re-post harmless when the TUI already runs.
-async fn attach(
-    api: &Api,
-    id: flyco_core::SessionId,
-    tui: HarnessTui,
-    mode: out::Mode,
-) -> Outcome<Exit> {
-    let mut follow = Follow::live(api, id);
-    follow.connect().await?;
-
-    // Commands are refused on anything but `Active` — a provisioning
-    // session has no daemon to take them — so the launch waits for the
-    // state a daemon attach flips. An already-live session checks the row
-    // rather than waiting for an event that already happened.
-    let detail: SessionDetail = api.get(&format!("/v1/sessions/{id}")).await?;
-    if detail.summary.state != SessionState::Active {
-        loop {
-            let item = follow.next().await?;
-            let Some(event) = item.event() else { continue };
-            match event {
-                ClientEvent::SessionStateChanged {
-                    state: SessionState::Active,
-                } => break,
-                ClientEvent::SessionStateChanged {
-                    state: SessionState::Failed | SessionState::Archived,
-                } => {
-                    return Err(Failure::problem(
-                        Exit::Failed,
-                        "the session failed — it cannot take a terminal",
-                    ));
-                }
-                ClientEvent::SessionStateChanged {
-                    state: SessionState::Paused,
-                } => {
-                    return Err(Failure::problem(
-                        Exit::Paused,
-                        "the session paused — resolve the pause, then resume",
-                    ));
-                }
-                ClientEvent::ProvisioningStage { stage, .. } => {
-                    let label = serde_json::to_value(stage)
-                        .ok()
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                        .unwrap_or_else(|| format!("{stage:?}"));
-                    note(mode, &format!("provisioning: {label}"));
-                }
-                ClientEvent::MachineConnection { connected: false } => {
-                    note(mode, "machine disconnected — waiting for it back");
-                }
-                _ => {}
-            }
-        }
-    }
-
-    api.post_json_empty(&format!("/v1/sessions/{id}/terminal/harness"), &tui)
-        .await?;
-    // A resize is a repaint: a TUI already in the foreground answers it
-    // with a full screen, which is how an attach to a live-but-quiet
-    // session learns it is attached rather than hanging on output that was
-    // never coming.
-    bridge::send_resize(api, id).await?;
-    until_output(&mut follow, mode).await?;
-
-    match bridge::run(api, id, &mut follow).await? {
-        Ended::Exited(code) => {
-            note(mode, &format!("harness exited ({})", code_label(code)));
-            Ok(code.map_or(Exit::Ok, exit_code))
-        }
-        Ended::Detached => {
-            note(mode, &format!("detached — `flyco resume {id}` re-enters"));
-            Ok(Exit::Ok)
-        }
-        Ended::InputEnded => Ok(Exit::Ok),
-    }
-}
-
-/// Waits for the pane's first byte — the TUI is up and its screen is
-/// coming — or for the session to leave the states it can be waited in.
-async fn until_output(follow: &mut Follow<'_>, mode: out::Mode) -> Outcome<()> {
-    loop {
-        let item = follow.next().await?;
-        let Some(event) = item.event() else { continue };
-        match event {
-            ClientEvent::TerminalOutput { .. } => return Ok(()),
-            ClientEvent::TerminalExited { code } => {
-                return Err(Failure::problem(
-                    Exit::Failed,
-                    format!(
-                        "the harness exited before the bridge opened ({})",
-                        code_label(code)
-                    ),
-                ));
-            }
-            ClientEvent::SessionStateChanged {
-                state: SessionState::Failed | SessionState::Archived,
-            } => {
-                return Err(Failure::problem(
-                    Exit::Failed,
-                    "the session failed — it cannot take a terminal",
-                ));
-            }
-            ClientEvent::SessionStateChanged {
-                state: SessionState::Interrupted,
-            } => {
-                note(mode, "the machine was reclaimed — waiting for it back");
-            }
-            ClientEvent::SessionStateChanged {
-                state: SessionState::Paused,
-            } => {
-                return Err(Failure::problem(
-                    Exit::Paused,
-                    "the session paused — resolve the pause, then resume",
-                ));
-            }
-            ClientEvent::MachineConnection { connected: false } => {
-                note(mode, "machine disconnected — waiting for it back");
-            }
-            _ => {}
-        }
-    }
-}
-
-/// An exit code as prose, for the one place a number alone would read as
-/// noise.
-fn code_label(code: Option<i32>) -> String {
-    code.map_or_else(|| "no status".to_owned(), |code| format!("code {code}"))
-}
-
-/// A progress line on stderr — the TUI owns stdout once it starts, and
-/// JSON mode keeps stdout for documents alone.
+/// A progress line on stderr — JSON mode keeps stdout for documents alone.
 fn note(mode: out::Mode, text: &str) {
     if mode == out::Mode::Human {
         let _ = out::raw_err(format!("{text}\n").as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_tty_streams_are_rejected_with_usage_exit_code() {
+        assert!(require_terminal_streams(true, true).is_ok());
+        for (stdin, stdout) in [(false, true), (true, false), (false, false)] {
+            let err = require_terminal_streams(stdin, stdout)
+                .expect_err("non-TTY stream must fail with usage");
+            assert_eq!(err.code, Exit::Usage);
+            assert!(err.text.contains("flyco run"));
+        }
     }
 }

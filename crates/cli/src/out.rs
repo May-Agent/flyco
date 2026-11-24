@@ -83,8 +83,8 @@ pub fn raw_err(bytes: &[u8]) -> crate::Outcome<()> {
         .map_err(|error| Failure::transport(format!("stderr: {error}")))
 }
 
-/// Writes raw bytes — terminal output in the TUI bridge, where no newline
-/// is added and no encoding is touched.
+/// Writes raw bytes without adding a newline or altering encoding — relayed
+/// shell output and file contents.
 ///
 /// # Errors
 /// Returns [`Failure`](crate::Failure) when the value does not serialize or the write fails.
