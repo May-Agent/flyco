@@ -354,13 +354,44 @@ pub(crate) async fn link(
     // nowhere to keep one.
     let login_key = LoginKey::generate();
     let resource_group = clouds.prepare(&request.credentials, &login_key).await?;
+    let mut credentials = request.credentials;
+    if let ProviderCredentials::Codespaces {
+        token,
+        refresh_token,
+        token_expires_at_unix,
+        owner_id,
+        ..
+    } = &mut credentials
+        && crate::users::github_id(db, user).await? == Some(*owner_id)
+    {
+        // When a direct `POST /v1/providers` carries a renewable grant for the
+        // signed-in GitHub account, promote it to `users` and never persist a
+        // competing rotating `refresh_token` on `provider_accounts`.
+        if refresh_token.is_some() {
+            crate::users::store_github_grant(
+                db,
+                config,
+                user,
+                &crate::github::GithubGrant {
+                    token: crate::github::GithubToken {
+                        access_token: token.clone(),
+                    },
+                    refresh_token: refresh_token.clone(),
+                    expires_at_unix: *token_expires_at_unix,
+                },
+            )
+            .await?;
+        }
+        *refresh_token = None;
+        *token_expires_at_unix = None;
+    }
     let view = create_with(
         db,
         config,
         user,
         request.label,
         SealedSecrets {
-            credentials: &request.credentials,
+            credentials: &credentials,
             machine_login_key: &login_key,
         },
         resource_group,

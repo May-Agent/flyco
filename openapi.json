@@ -14799,7 +14799,7 @@
           },
           {
             "type": "object",
-            "description": "A GitHub account, for Codespaces.\n\nThe token is the user's own OAuth access token, granted `repo` and\n`codespace` by the link sign-in — the same credential flyco stores\nagainst the user record, kept here as well because a linked account\nmust carry everything its driver needs and the user's own token is\nwhat the Codespaces API is called with.",
+            "description": "A GitHub account, for Codespaces.\n\nWhen `owner_id` matches the signed-in flyco user's own GitHub account,\n`users` is the single owner of the OAuth grant and its rotating\n`refresh_token` (`refresh_token` and `token_expires_at_unix` stay\n`None` at rest on the provider row, and provisioning loads the live\ngrant from `users`). A separate `owner_id` linked via OAuth carries and\nrenews its own grant here.",
             "required": [
               "token",
               "env_repo",

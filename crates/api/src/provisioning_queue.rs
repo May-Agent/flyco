@@ -1870,13 +1870,13 @@ async fn checkouts(
     github: &impl GithubOauth,
     claim: &Claim,
 ) -> Result<(GitAccess, Vec<CheckoutSpec>), Provisioned> {
-    let token = users::github_token(db, config, github, claim.user)
+    let (identity, token) =
+        users::with_github_token(db, config, github, claim.user, |token| async move {
+            let identity = github.current_user(&token).await?;
+            Ok((identity, token))
+        })
         .await
         .map_err(Provisioned::from)?;
-    let identity = github
-        .current_user(&token)
-        .await
-        .map_err(|error| Provisioned::from(ApiError::from(error)))?;
     if !identity.grants_repo_scope() {
         return Err(Provisioned::from(ApiError::GithubTokenInsufficient {
             scope: REPO_SCOPE,

@@ -624,8 +624,13 @@ async fn resolve_repos(
         }
         slugs.push(slug);
     }
-    let token = users::github_token(db, config, github, user.id).await?;
-    if !github.current_user(&token).await?.grants_repo_scope() {
+    let (identity, token) =
+        users::with_github_token(db, config, github, user.id, |token| async move {
+            let identity = github.current_user(&token).await?;
+            Ok((identity, token))
+        })
+        .await?;
+    if !identity.grants_repo_scope() {
         return Err(ApiError::GithubTokenInsufficient {
             scope: REPO_SCOPE,
             repo: slugs[0].clone(),
@@ -2259,8 +2264,21 @@ async fn attach_repo(
         .repo
         .parse::<RepoSlug>()
         .map_err(|_| ApiError::InvalidRepo(selection.repo.clone()))?;
-    let token = users::github_token(db, config, github, user.id).await?;
-    let branch = resolve_branch(github, &token, &slug, selection.branch.as_deref()).await?;
+    let slug_ref = &slug;
+    let requested_branch = selection.branch.as_deref();
+    let branch = match requested_branch {
+        Some(_) => {
+            let token = users::github_token(db, config, github, user.id).await?;
+            resolve_branch(github, &token, &slug, requested_branch).await?
+        }
+        None => {
+            users::with_github_token(db, config, github, user.id, |token| {
+                use crate::github::GithubOauth as _;
+                async move { Ok(github.get_repo(&token, slug_ref).await?.default_branch) }
+            })
+            .await?
+        }
+    };
     let repo = session_repos::attach(db, id, &slug, &branch, RepoAddedBy::User).await?;
     announce_add_repo(rooms, db, id, &repo).await;
     sessions::find(db, user.id, id)
@@ -2741,8 +2759,21 @@ async fn settle_repo_add(
         .parse::<RepoSlug>()
         .map_err(|_| ApiError::InvalidRepo(repo.clone()))?;
     let owner = sessions::owner(db, session).await?;
-    let token = users::github_token(db, config, github, owner).await?;
-    let branch = resolve_branch(github, &token, &slug, branch.as_deref()).await?;
+    let slug_ref = &slug;
+    let requested_branch = branch.as_deref();
+    let branch = match requested_branch {
+        Some(_) => {
+            let token = users::github_token(db, config, github, owner).await?;
+            resolve_branch(github, &token, &slug, requested_branch).await?
+        }
+        None => {
+            users::with_github_token(db, config, github, owner, |token| {
+                use crate::github::GithubOauth as _;
+                async move { Ok(github.get_repo(&token, slug_ref).await?.default_branch) }
+            })
+            .await?
+        }
+    };
     let attached = session_repos::of_session(db, session).await?;
     if attached.iter().any(|existing| existing.slug == slug) {
         return Err(ApiError::RepoAlreadyAttached { repo: slug });

@@ -30,8 +30,8 @@ use core::str::FromStr as _;
 use std::collections::BTreeMap;
 
 use flyco_core::{
-    CatalogSkill, CurrentUser, InstallCatalogSkill, MarketplaceProblem, RepoSlug, SkillCatalog,
-    SkillView, UserId,
+    CatalogSkill, CurrentUser, InstallCatalogSkill, MarketplaceProblem, RepoSlug, RepoSummary,
+    SkillCatalog, SkillView, UserId,
 };
 use serde::{Deserialize, Serialize};
 use skyzen::routing::{CreateRouteNode, Route, RouteNode, Routes as _};
@@ -625,23 +625,9 @@ async fn read_marketplace(
     user: UserId,
     marketplace: &Marketplace,
 ) -> Result<Vec<StoredSkill>, ReadError> {
-    let token = users::github_token(db, config, github, user)
-        .await
-        .map_err(|error| ReadError::Auth(error.to_string()))?;
-
     let mut budget = SubrequestBudget::new(MAX_MARKETPLACE_SUBREQUESTS);
-
-    // Always verify repository access with the caller's token, even when a ref
-    // is pinned, so private/unreadable repositories fail fast on access check.
-    if !budget.try_spend() {
-        return Err(ReadError::Marketplace(
-            "marketplace subrequest budget exhausted".to_owned(),
-        ));
-    }
-    let repo_info = github
-        .get_repo(&token, &marketplace.repo)
-        .await
-        .map_err(ReadError::from_github)?;
+    let (token, repo_info) =
+        open_marketplace_repo(db, config, github, user, marketplace, &mut budget).await?;
     let git_ref = marketplace
         .git_ref
         .clone()
@@ -718,6 +704,51 @@ async fn read_marketplace(
     skills.sort_by(|left, right| (&left.name, &left.plugin).cmp(&(&right.name, &right.plugin)));
     skills.dedup_by(|left, right| left.name == right.name && left.plugin == right.plugin);
     Ok(skills)
+}
+
+async fn open_marketplace_repo(
+    db: &Db,
+    config: &ApiConfig,
+    github: &impl GithubOauth,
+    user: UserId,
+    marketplace: &Marketplace,
+    budget: &mut SubrequestBudget,
+) -> Result<(GithubToken, RepoSummary), ReadError> {
+    let mut token = users::github_token(db, config, github, user)
+        .await
+        .map_err(|error| ReadError::Auth(error.to_string()))?;
+
+    // Always verify repository access with the caller's token, even when a ref
+    // is pinned, so private/unreadable repositories fail fast on access check.
+    if !budget.try_spend() {
+        return Err(ReadError::Marketplace(
+            "marketplace subrequest budget exhausted".to_owned(),
+        ));
+    }
+    let repo_info = match github.get_repo(&token, &marketplace.repo).await {
+        Ok(info) => info,
+        Err(first @ crate::github::GithubError::Status { status: 401, .. }) => {
+            if let Some(fresh) = users::force_renew_github_token(db, config, github, user, &token)
+                .await
+                .map_err(|error| ReadError::Auth(error.to_string()))?
+            {
+                if !budget.try_spend() {
+                    return Err(ReadError::Marketplace(
+                        "marketplace subrequest budget exhausted".to_owned(),
+                    ));
+                }
+                token = fresh;
+                github
+                    .get_repo(&token, &marketplace.repo)
+                    .await
+                    .map_err(ReadError::from_github)?
+            } else {
+                return Err(ReadError::from_github(first));
+            }
+        }
+        Err(other) => return Err(ReadError::from_github(other)),
+    };
+    Ok((token, repo_info))
 }
 
 #[expect(
@@ -937,8 +968,14 @@ async fn install(
         name: request.name.trim().to_owned(),
     })?;
 
-    let token = users::github_token(db, config, github, user).await?;
-    let bundle = bundle(github, &token, &repo, &skill.git_ref, &skill.path).await?;
+    let repo_ref = &repo;
+    let git_ref_str = skill.git_ref.as_str();
+    let (tree, token) = users::with_github_token(db, config, github, user, |token| async move {
+        let tree = github.read_tree(&token, repo_ref, git_ref_str).await?;
+        Ok((tree, token))
+    })
+    .await?;
+    let bundle = bundle_from_tree(github, &token, &repo, &skill.git_ref, &skill.path, tree).await?;
 
     let installed = skills::store(db, storage, user, &skill.name, &bundle).await?;
     tracing::info!(
@@ -958,6 +995,7 @@ async fn install(
 /// bundle *is* the skill's directory — a machine unpacks it into one named
 /// by the row, and a second level would put `SKILL.md` one directory too
 /// deep.
+#[cfg(test)]
 async fn bundle(
     github: &impl GithubOauth,
     token: &GithubToken,
@@ -966,6 +1004,17 @@ async fn bundle(
     path: &str,
 ) -> Result<Vec<u8>, ApiError> {
     let tree = github.read_tree(token, repo, git_ref).await?;
+    bundle_from_tree(github, token, repo, git_ref, path, tree).await
+}
+
+async fn bundle_from_tree(
+    github: &impl GithubOauth,
+    token: &GithubToken,
+    repo: &RepoSlug,
+    git_ref: &str,
+    path: &str,
+    tree: crate::github::TreeListing,
+) -> Result<Vec<u8>, ApiError> {
     let prefix = format!("{path}/");
     let files: Vec<&crate::github::TreeEntry> = tree
         .entries

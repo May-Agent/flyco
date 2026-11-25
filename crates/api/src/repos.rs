@@ -73,9 +73,10 @@ async fn read(
     user: &CurrentUser,
     query: &RepoQuery,
 ) -> Result<Vec<RepoSummary>, ApiError> {
-    let token = users::github_token(db, config, github, user.id).await?;
-
-    let mut repos = github.list_repos(&token).await?;
+    let mut repos = users::with_github_token(db, config, github, user.id, |token| async move {
+        github.list_repos(&token).await
+    })
+    .await?;
     if let Some(needle) = query.q.as_ref().map(|q| q.trim().to_lowercase())
         && !needle.is_empty()
     {
@@ -117,13 +118,18 @@ async fn branches(
 ) -> Result<BranchPage, ApiError> {
     let slug = slug_from(params)?;
     let page = page_from(query)?;
-    let token = users::github_token(db, config, github, user.id).await?;
 
     // Asked for on every page rather than only the first: it is what marks
     // the default row, and a client paging forward must not have to remember
     // an answer the first page happened to carry.
-    let default_branch = github.get_repo(&token, &slug).await?.default_branch;
-    let listing = github.list_branches(&token, &slug, page).await?;
+    let slug_ref = &slug;
+    let (default_branch, listing) =
+        users::with_github_token(db, config, github, user.id, |token| async move {
+            let default_branch = github.get_repo(&token, slug_ref).await?.default_branch;
+            let listing = github.list_branches(&token, slug_ref, page).await?;
+            Ok((default_branch, listing))
+        })
+        .await?;
 
     let head = (page == FIRST_PAGE).then(|| BranchSummary {
         name: default_branch.clone(),

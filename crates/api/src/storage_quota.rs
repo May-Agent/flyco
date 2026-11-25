@@ -25,7 +25,10 @@ use crate::problem::Outcome;
 pub const DEFAULT_STORAGE_QUOTA_KEY: &str = "default_storage_quota_bytes";
 
 /// Which user-owned R2 object class an entry belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::Column,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum StorageCategory {
     /// Session transcript batches (`transcripts/`).
     Transcript,

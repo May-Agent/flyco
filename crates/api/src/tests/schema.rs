@@ -37,6 +37,11 @@ const CONSTRAINED: &[(&str, &str, &[&str])] = &[
     ("machines", "stopping_reason", StopReason::TOKENS),
     ("budget_signals", "signal", BudgetSignal::TOKENS),
     ("hosts", "state", HostState::TOKENS),
+    (
+        "user_storage_objects",
+        "category",
+        crate::storage_quota::StorageCategory::TOKENS,
+    ),
 ];
 
 /// One `CHECK (<column> IN ('a', 'b'))` found in a migration.
