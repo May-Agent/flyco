@@ -206,10 +206,10 @@ mod tests {
             "Models",
             vec![
                 entry("m1", "claude-opus-4-7", "Anthropic"),
-                entry("m2", "swe-2", "Devin"),
-                entry("m3", "swe-2-fast", "Devin"),
+                entry("m2", "swe-2-1", "Devin"),
+                entry("m3", "swe-2-1-lightning", "Devin"),
             ],
-            "swe-2",
+            "swe-2-1",
             "none",
         );
         assert_eq!(picker.visible_len(), 2);

@@ -20,7 +20,6 @@
 use flyco_core::{
     CurrentUser, HarnessAccountId, HarnessAccountView, HarnessCredentialInput, HarnessKind,
     LinkHarnessAccount, LlmUsageView, ModelOption, PlanUsage, UserId, builtin_models,
-    normalize_models,
 };
 use flyco_provider::{
     AntigravityCredential, ClaudeCredential, CodexCredential, DevinCredential, HarnessCredential,
@@ -288,18 +287,16 @@ impl HarnessAccountRow {
     }
 }
 
-/// The models an account offers: the stored list, or the built-in one,
-/// normalized into the picker's shape — a harness like Devin whose ids
-/// carry the effort is folded back into one row per model with the
-/// levels on it, the same fold the daemon undoes when it sends a choice.
+/// The models an account offers: the stored list, or the built-in one.
 fn parse_models(harness: HarnessKind, stored: Option<&str>) -> Result<Vec<ModelOption>, ApiError> {
-    let models = match stored {
-        Some(stored) => serde_json::from_str(stored).map_err(|_| {
-            ApiError::CorruptRecord("a stored harness model list could not be decoded")
-        })?,
-        None => builtin_models(harness),
-    };
-    Ok(normalize_models(harness, models))
+    stored.map_or_else(
+        || Ok(builtin_models(harness)),
+        |stored| {
+            serde_json::from_str(stored).map_err(|_| {
+                ApiError::CorruptRecord("a stored harness model list could not be decoded")
+            })
+        },
+    )
 }
 
 /// The models a session on the caller's account for `harness` may run on.

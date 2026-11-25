@@ -304,7 +304,6 @@ mod tests {
             effort: None,
             model_option: "model".to_owned(),
             effort_option: None,
-            fused_effort_tails: Vec::new(),
             permission_mode: PermissionMode::Default,
             modes: BTreeMap::new(),
             methods: AcpMethods::default(),

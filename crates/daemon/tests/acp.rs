@@ -87,7 +87,6 @@ fn config() -> AcpConfig {
         effort: None,
         model_option: "model".to_owned(),
         effort_option: Some("reasoning_effort".to_owned()),
-        fused_effort_tails: Vec::new(),
         permission_mode: PermissionMode::Auto,
         modes: BTreeMap::from([(
             PermissionMode::Auto,
@@ -1245,7 +1244,6 @@ mod in_process {
             effort: None,
             model_option: "model".to_owned(),
             effort_option: Some("reasoning_effort".to_owned()),
-            fused_effort_tails: Vec::new(),
             permission_mode: PermissionMode::Plan,
             modes: BTreeMap::from([(
                 PermissionMode::Plan,
