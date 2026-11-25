@@ -493,19 +493,33 @@ function ReposChip(props: {
   return (
     <Popover
       label="Repositories"
-      trigger={(attrs) => (
-        <button
-          id={attrs.id}
-          onClick={attrs.onClick}
-          aria-expanded={attrs.expanded()}
-          aria-haspopup="dialog"
-          type="button"
-          class={styles.repo}
-          title="The session's repositories"
-        >
-          {label()}
-        </button>
-      )}
+        trigger={(attrs) => (
+          <button
+            id={attrs.id}
+            onClick={attrs.onClick}
+            aria-expanded={attrs.expanded()}
+            aria-haspopup="dialog"
+            aria-label={label()}
+            type="button"
+            class={styles.repo}
+            title="The session's repositories"
+          >
+            <FolderGit2 size={12} aria-hidden="true" />
+            <Show when={primary()} fallback={<span>the repositories</span>}>
+              {(first) => (
+                <>
+                  <span>{first().slug}</span>
+                  <Show when={first().branch}>
+                    {(branch) => <span class={styles.repoBranchPill}>{branch()}</span>}
+                  </Show>
+                  <Show when={props.session.repos.length > 1}>
+                    <span>+{props.session.repos.length - 1}</span>
+                  </Show>
+                </>
+              )}
+            </Show>
+          </button>
+        )}
     >
       {(close) => (
         <div class={styles.popover}>
@@ -521,8 +535,10 @@ function ReposChip(props: {
                     {(branch) => <span class={styles.repoBranch}>{branch()}</span>}
                   </Show>
                   <span class={styles.repoMeta}>
-                    {index() === 0 ? "primary" : repo.dir}
-                    <Show when={repo.added_by === "agent"}> · added by agent</Show>
+                    <span>{index() === 0 ? "primary" : repo.dir}</span>
+                    <Show when={repo.added_by === "agent"}>
+                      <span class={styles.repoBranchPill}>agent</span>
+                    </Show>
                   </span>
                 </li>
               )}

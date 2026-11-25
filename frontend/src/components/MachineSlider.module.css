@@ -1,51 +1,33 @@
-/*
- * The tiered slider of docs/ux.md §7.7.
- *
- * The whole control is driven by one number, `--travelled`: the share of the
- * track the thumb has covered. The thumb is carried that share of the rail's
- * width, and the reading is carried the same distance and then pulled back by
- * that share of *its own* width — which centres it over the thumb in the
- * middle of the track and tucks it inside the ends without measuring a single
- * element. Both are transforms, so nothing here lays the popover out twice.
- *
- * The reading sits above the track because the label is what the user is
- * looking at while the thumb moves; the dots sit on the rail as the map of
- * where the thumb can stop. Amber appears on exactly one thing: a machine
- * whose provider bills a minimum the moment it boots.
- */
 .slider {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
 }
 
-/* ── The product form, chosen before the size ────────────────────────── */
-
-/* A segmented row on the sunken surface: the chosen segment is raised off
-   it, the way a card's border names the choice on the flow's pages. */
 .forms {
   display: flex;
   gap: 2px;
-  padding: 2px;
-  width: fit-content;
-  max-width: 100%;
+  padding: 3px;
+  width: 100%;
   border-radius: var(--radius-md);
   background: var(--color-surface-sunken);
 }
 
 .form {
+  flex: 1 1 0;
   border: 0;
   border-radius: calc(var(--radius-md) - 3px);
   background: transparent;
   color: var(--color-text-muted);
   font-size: var(--text-sm);
   line-height: var(--line-normal);
-  padding: var(--space-1) var(--space-3);
+  padding: 5px var(--space-2);
   cursor: pointer;
   transition:
     background var(--transition-fast),
     color var(--transition-fast);
   white-space: nowrap;
+  text-align: center;
 }
 
 .form:hover {
@@ -59,118 +41,104 @@
   box-shadow: var(--shadow-sm);
 }
 
-/* ── `Auto`: no track, only what flyco would pick ────────────────────── */
-
-/* The same inset the control keeps, so the pick lines up where a machine
-   label would sit once a form is chosen. */
 .auto {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
-  padding-inline: 10px;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-1);
 }
 
-.autoName {
-  margin: 0;
-  font-size: var(--text-md);
-  font-weight: var(--weight-medium);
+.readoutHead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
 }
 
-/* The machine `Auto` resolved to — the concrete answer under the word. */
-.autoPick {
-  margin: 0;
-  font-size: var(--text-sm);
-  font-variant-numeric: tabular-nums;
-}
-
-/* ── The control ─────────────────────────────────────────────────────── */
-
-.control {
-  /* The thumb is the one large mark on the track; half of it is the room the
-     rail leaves at either end so a detent at 0% or 100% is still a circle on
-     the track rather than a circle off it. */
-  --thumb: 20px;
-
+.readoutCenter {
   display: flex;
   flex-direction: column;
+  align-items: center;
+  gap: 3px;
+}
+
+.readoutTitleRow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
   gap: var(--space-2);
-  padding-inline: calc(var(--thumb) / 2);
-  /* The reading's and the thumb's travel rows are `translateX`ed off the
-     rail by the travelled share, and a transform counts toward scrollable
-     overflow: past the cheapest detent they would stretch the popover's
-     sheet sideways to hold a row with nothing drawn in it. Clip at this
-     box's edge — the padding above is exactly the thumb's overhang, so the
-     clip never touches ink. */
-  overflow-x: clip;
 }
 
-/* ── The reading, which rides above the thumb ────────────────────────── */
-
-.readingRow {
-  position: relative;
-}
-
-.readingTravel {
-  transform: translateX(var(--travelled));
-  transition: transform var(--transition-fast);
-}
-
-/* Shrink-to-fit, so the pull-back below is a share of the label's own width
-   rather than of the whole track; capped at the control's width, so a long
-   reading wraps inside the popover instead of pushing it wider. */
-.reading {
-  display: inline-block;
-  max-width: 100%;
-  margin: 0;
-  transform: translateX(calc(-1 * var(--travelled)));
-  transition: transform var(--transition-fast);
+.readoutMetaRow {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: var(--space-3);
 }
 
 .machine {
   font-size: var(--text-md);
-  font-weight: var(--weight-medium);
+  font-weight: var(--weight-semibold);
   font-variant-numeric: tabular-nums;
+  color: var(--color-text);
+}
+
+.machineAccent {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-accent);
+  line-height: var(--line-tight);
+}
+
+.capacity {
+  font-size: var(--text-sm);
+  color: var(--color-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.rate {
+  font-size: var(--text-sm);
+  color: var(--color-text-faint);
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+
+.readoutMetaRow .rate {
+  margin-left: 0;
+}
+
+.control {
+  --thumb: 30px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding-top: var(--space-1);
 }
 
 .badge {
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  margin-left: var(--space-2);
-  vertical-align: middle;
   padding: 0 var(--space-2);
   border-radius: var(--radius-full);
   background: var(--color-warning-soft);
   color: var(--color-warning);
   font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
   line-height: 1.7;
   white-space: nowrap;
 }
 
-/* ── The track ───────────────────────────────────────────────────────── */
-
-/* A machine that starts charging the moment it boots says so on its dot
-   before the user ever stops on it. */
 .dotBound {
   width: 7px;
   height: 7px;
   background: var(--color-warning);
+  opacity: 1;
 }
 
-.ends {
-  display: flex;
-  justify-content: space-between;
-  font-size: var(--text-xs);
-  color: var(--color-text-faint);
-}
-
-/* ── Everything the choice implies ───────────────────────────────────── */
-
-/* Holds its line whether or not it has something to say: a popover anchored
-   to a chip that changes height as the thumb passes a machine is a popover
-   that shrugs. */
 .note {
-  min-height: calc(var(--text-sm) * var(--line-normal));
   margin: 0;
   font-size: var(--text-sm);
   line-height: var(--line-normal);
@@ -180,6 +148,7 @@
 .noteBound {
   color: var(--color-warning);
   font-weight: var(--weight-medium);
+  text-align: center;
 }
 
 .empty {
@@ -191,18 +160,9 @@
   font-size: var(--text-sm);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .readingTravel,
-  .reading {
-    transition: none;
-  }
-}
-
-/* ── Advanced ────────────────────────────────────────────────────────── */
-
 .filters {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: var(--space-3);
 }
 

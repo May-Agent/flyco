@@ -1,38 +1,37 @@
 .track {
   position: relative;
   flex-shrink: 0;
-  width: 34px;
-  height: 20px;
+  width: 38px;
+  height: 22px;
   padding: 0;
-  border: var(--border-width) solid var(--color-border-strong);
+  border: none;
   border-radius: var(--radius-full);
   background: var(--color-surface-sunken);
-  transition: background var(--transition-fast), border-color var(--transition-fast);
+  box-shadow: inset 0 1px 2px rgb(0 0 0 / 8%);
+  transition: background var(--transition-spring);
 }
 
 .track:disabled {
   opacity: 0.5;
 }
 
-/* No accent colour: "on" is ink, the same weight the primary action carries. */
 .on {
-  background: var(--color-primary);
-  border-color: var(--color-primary);
+  background: var(--color-accent);
+  box-shadow: none;
 }
 
 .knob {
   position: absolute;
   top: 2px;
   left: 2px;
-  width: 14px;
-  height: 14px;
+  width: 18px;
+  height: 18px;
   border-radius: var(--radius-full);
-  background: var(--color-bg);
-  box-shadow: var(--shadow-sm);
-  transition: transform var(--transition-fast);
+  background: #ffffff;
+  box-shadow: var(--shadow-thumb);
+  transition: transform var(--transition-spring);
 }
 
 .on .knob {
-  background: var(--color-primary-text);
-  transform: translateX(14px);
+  transform: translateX(16px);
 }

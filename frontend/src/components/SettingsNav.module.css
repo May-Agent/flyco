@@ -1,64 +1,35 @@
-/* The settings sections, in the rail's own vocabulary: one column, one
-   row per destination, the same weights the session list uses. */
 .nav {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
   min-height: 0;
-  flex: 1;
-}
-
-/* The way out, in the slot `New session` occupies on every other page. */
-.back {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  min-height: 30px;
-  padding: 0 var(--space-2);
-  margin-bottom: var(--space-4);
-  border-radius: var(--radius-sm);
-  color: var(--color-text);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  text-decoration: none;
-  transition: background var(--transition-fast);
-}
-
-.back svg {
-  color: var(--color-text-muted);
-}
-
-.back:hover {
-  background: var(--color-surface-sunken);
-}
-
-.heading {
-  margin: 0 0 var(--space-1);
-  padding: 0 var(--space-2);
-  font-size: var(--text-2xs);
-  font-weight: var(--weight-medium);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-caps);
-  color: var(--color-text-faint);
 }
 
 .link {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  min-height: 30px;
-  padding: 0 var(--space-2);
-  border-radius: var(--radius-sm);
+  gap: 10px;
+  width: 100%;
+  min-height: 34px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
   color: var(--color-text-muted);
+  font-family: inherit;
   font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-align: left;
   text-decoration: none;
   white-space: nowrap;
+  cursor: pointer;
   transition:
     color var(--transition-fast),
     background var(--transition-fast);
 }
 
 .link svg {
+  flex: none;
   color: var(--color-text-faint);
   transition: color var(--transition-fast);
 }
@@ -74,11 +45,25 @@
 
 .linkActive {
   color: var(--color-text) !important;
-  background: var(--color-surface-raised);
-  box-shadow: var(--shadow-sm);
-  font-weight: var(--weight-medium);
+  background: var(--color-surface-sunken);
+  font-weight: var(--weight-semibold);
 }
 
 .linkActive svg {
-  color: var(--color-text);
+  color: var(--color-accent);
+}
+
+@media (max-width: 720px) {
+  .nav {
+    flex-direction: row;
+    overflow-x: auto;
+    padding-bottom: 2px;
+    gap: 4px;
+  }
+
+  .link {
+    width: auto;
+    min-height: 30px;
+    padding: 0 10px;
+  }
 }

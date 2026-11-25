@@ -1,24 +1,5 @@
-/*
- * A rail down the left and the work beside it (docs/ux.md §2).
- *
- * Not a top bar. A horizontal bar spends the scarcest axis a screen has —
- * height — on navigation that never changes, and every page under it then
- * has to stack its own header beneath it: two bands of chrome before the
- * first word of content, three once a session says what state it is in.
- * The rail spends the axis there is plenty of, keeps the session list in
- * reach from inside a session, and leaves each page owning its own top
- * edge.
- *
- * The rail is one step down from the page — the surface colour, the page
- * on the ground — and the two meet at a hairline. Nothing in the rail is
- * boxed: rows are text that light up when the pointer is on them.
- */
-/* Exactly the window tall. The rail is the window's height and the work
-   beside it scrolls on its own, so a page that wants to own its scrolling
-   — the session page, whose composer never moves — can. */
 .shell {
   display: flex;
-  height: 100vh;
   height: 100dvh;
 }
 
@@ -30,42 +11,97 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  width: 256px;
-  height: 100vh;
+  width: 248px;
   height: 100dvh;
-  padding: var(--space-4) var(--space-3) var(--space-3);
+  padding: var(--space-3) var(--space-3);
   border-right: var(--border-width) solid var(--color-border);
   background: var(--color-surface);
+  transition:
+    width var(--transition-panel),
+    padding var(--transition-panel);
+}
+
+.railCollapsed {
+  display: none;
 }
 
 .brandRow {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: 0 var(--space-2);
-  margin-bottom: var(--space-2);
+  min-height: 32px;
+  padding: 0 6px;
+  margin-bottom: 2px;
 }
 
-/* The mark and the word, set as one lockup. */
 .brand {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
   color: var(--color-text);
   font-weight: var(--weight-semibold);
-  font-size: var(--text-lg);
+  font-size: var(--text-md);
   letter-spacing: var(--tracking-tight);
   text-decoration: none;
 }
 
 .brandMark {
   flex: none;
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   color: var(--color-text);
 }
 
-/* Closes the drawer on a phone; the rail is permanent above that width. */
+.railCollapseDesktop {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin-left: auto;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.railCollapseDesktop:hover {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+
+.railExpandDesktop {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 15;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-sm);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.railExpandDesktop:hover {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+
 .railClose {
   display: none;
   margin-left: auto;
@@ -77,49 +113,51 @@
   cursor: pointer;
 }
 
-/*
- * The one action the product is for. It is a link rather than a button
- * because starting a session is going to the page that opens one — but
- * it is the only row in the rail drawn as a control, because it is the
- * only row that makes something rather than going somewhere.
- */
 .newSession {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  border: var(--border-width) solid var(--color-border);
+  min-height: 34px;
+  padding: 0 10px;
   border-radius: var(--radius-md);
-  background: var(--color-surface-raised);
-  box-shadow: var(--shadow-sm);
+  background: transparent;
   color: var(--color-text);
   text-decoration: none;
-  font-size: var(--text-md);
+  font-size: var(--text-sm);
   font-weight: var(--weight-medium);
-  transition:
-    border-color var(--transition-fast),
-    box-shadow var(--transition-fast);
+  transition: background var(--transition-fast);
 }
 
 .newSession:hover {
-  border-color: var(--color-border-strong);
-  box-shadow: var(--shadow-card);
+  background: var(--color-surface-sunken);
 }
 
 .newSession svg {
   color: var(--color-text-muted);
 }
 
-/* Identity sits at the foot, out of the way of the list, and everything
-   about the account hangs off it rather than competing with the sessions. */
-.account {
+.railFooter {
   flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-top: var(--space-2);
+  border-top: var(--border-width) solid var(--color-border);
+}
+
+.accountAnchor {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.account {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  margin-top: var(--space-1);
-  padding: var(--space-2);
+  min-width: 0;
+  height: 34px;
+  padding: 0 6px;
   border: none;
   border-radius: var(--radius-md);
   background: transparent;
@@ -144,13 +182,36 @@
   white-space: nowrap;
 }
 
+.settingsButton {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.settingsButton:hover {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
+}
+
 .avatar {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex: none;
-  width: 26px;
-  height: 26px;
+  width: 24px;
+  height: 24px;
   border-radius: var(--radius-full);
   background: var(--color-primary);
   color: var(--color-primary-text);
@@ -159,7 +220,6 @@
   letter-spacing: 0.02em;
 }
 
-/* Before /v1/me answers there is no login to take initials from. */
 .avatarBlank {
   width: 8px;
   height: 8px;
@@ -168,16 +228,16 @@
 }
 
 .menu {
-  min-width: 232px;
+  min-width: 216px;
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: 2px;
 }
 
 .menuIdentity {
   margin: 0 0 var(--space-1);
   padding: var(--space-1) var(--space-2);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   color: var(--color-text-muted);
 }
 
@@ -186,30 +246,14 @@
   font-weight: var(--weight-medium);
 }
 
-.menuLabel {
-  margin: var(--space-2) 0 0;
-  padding: 0 var(--space-2);
-  font-size: var(--text-2xs);
-  font-weight: var(--weight-medium);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-caps);
-  color: var(--color-text-faint);
-}
-
-.themeRow {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-}
-
-.themeOption,
 .menuAction,
 .menuLink {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  padding: var(--space-2);
+  min-height: 32px;
+  padding: var(--space-1) var(--space-2);
   border: none;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -221,33 +265,21 @@
   cursor: pointer;
 }
 
-.themeOption svg,
 .menuAction svg,
 .menuLink svg {
   color: var(--color-text-muted);
 }
 
-.themeOption:hover,
 .menuAction:hover,
 .menuLink:hover {
   background: var(--color-surface-sunken);
 }
 
-.themeChosen {
-  color: var(--color-text);
-  font-weight: var(--weight-medium);
-}
-
-.themeCheck {
-  margin-left: auto;
-  color: var(--color-text);
-}
-
 .menuAction {
   border-top: var(--border-width) solid var(--color-border);
   border-radius: 0 0 var(--radius-sm) var(--radius-sm);
-  margin-top: var(--space-2);
-  padding-top: var(--space-3);
+  margin-top: var(--space-1);
+  padding-top: var(--space-2);
   color: var(--color-text-muted);
 }
 
@@ -264,9 +296,10 @@
   overflow-y: auto;
 }
 
-/* Opens the rail on a phone. It floats over the page's own top edge rather
-   than reserving a band of its own, so a narrow screen still spends its
-   height on content. */
+.mainRailCollapsed {
+  padding-left: 0;
+}
+
 .railOpen {
   display: none;
   position: fixed;
@@ -290,11 +323,13 @@
 }
 
 @media (max-width: 900px) {
-  .rail {
+  .rail,
+  .railCollapsed {
+    display: flex;
     position: fixed;
     top: 0;
     left: 0;
-    width: min(288px, 86vw);
+    width: min(280px, 86vw);
     transform: translateX(-100%);
     transition: transform var(--transition-panel);
     box-shadow: var(--shadow-panel);
@@ -302,6 +337,11 @@
 
   .railOpened {
     transform: translateX(0);
+  }
+
+  .railCollapseDesktop,
+  .railExpandDesktop {
+    display: none;
   }
 
   .railClose,
@@ -314,11 +354,10 @@
     position: fixed;
     inset: 0;
     z-index: 19;
-    background: rgb(27 26 24 / 32%);
+    background: rgb(0 0 0 / 32%);
     border: none;
   }
 
-  /* Room for the floating opener, which would otherwise sit on the title. */
   .main {
     padding-top: var(--space-7);
   }

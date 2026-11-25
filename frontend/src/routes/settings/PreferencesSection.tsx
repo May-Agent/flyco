@@ -1,12 +1,7 @@
 /**
  * Settings → Preferences.
  *
- * How the app looks on this browser and when it may interrupt. Nothing
- * here reaches the control plane: the theme, the size and the reading
- * font are this browser's, and push is a subscription this browser holds.
- * It is a section of its own because it was scattered — the theme in the
- * account menu in the rail, the rest at the foot of the account page —
- * and none of it is about the account.
+ * Grouped inset rows for appearance and browser notifications.
  */
 import { For, Show, createSignal, onMount, type JSX } from "solid-js";
 import { createQuery } from "../../lib/query";
@@ -50,14 +45,12 @@ const THEMES: readonly { value: ThemePreference; label: string; icon: typeof Sun
   { value: "dark", label: "Dark", icon: Moon },
 ];
 
-/** How large the interface is drawn, smallest first. */
 const SIZES: readonly { value: TextSize; label: string }[] = [
   { value: "small", label: "Small" },
   { value: "default", label: "Default" },
   { value: "large", label: "Large" },
 ];
 
-/** What a transcript is set in. */
 const FONTS: readonly { value: ReadingFont; label: string }[] = [
   { value: "sans", label: "Sans" },
   { value: "serif", label: "Serif" },
@@ -72,7 +65,7 @@ function Appearance() {
   return (
     <div class={styles.group}>
       <p class={styles.groupLabel}>Appearance</p>
-      <article class={styles.card}>
+      <div class={styles.insetList}>
         <Row label="Theme">
           <div class={styles.segmented} role="group" aria-label="Theme">
             <For each={THEMES}>
@@ -131,27 +124,25 @@ function Appearance() {
             </For>
           </div>
         </Row>
-      </article>
+      </div>
     </div>
   );
 }
 
-/** One line of the appearance card: what it sets, and the control. */
 function Row(props: { label: string; children: JSX.Element }) {
   return (
-    <div class={styles.cardTop}>
-      <div class={styles.identity}>
-        <span class={styles.cardTitle}>{props.label}</span>
+    <div class={styles.insetRow}>
+      <div class={styles.insetRowBar}>
+        <div class={styles.identity}>
+          <span class={styles.cardTitle}>{props.label}</span>
+        </div>
+        <div class={styles.actions}>{props.children}</div>
       </div>
-      <div class={styles.actions}>{props.children}</div>
     </div>
   );
 }
 
 function Notifications() {
-  // A browser with no `PushManager` cannot use the key, so it is not asked
-  // for: firing a request whose answer can only be discarded is how the
-  // unsupported case ends up reported as a failure.
   const [vapid] = createQuery(
     () => (isPushSupported() ? true : undefined),
     getVapidPublicKey,
@@ -189,37 +180,38 @@ function Notifications() {
   return (
     <div class={styles.group}>
       <p class={styles.groupLabel}>Notifications</p>
-      <article class={styles.card}>
-        <div class={styles.cardTop}>
-          <span class={styles.mark} aria-hidden="true">
-            <BellRing size={16} />
-          </span>
-          <div class={styles.identity}>
-            <span class={styles.cardTitle}>Push notifications</span>
-          </div>
-          <div class={styles.actions}>
-            <Show
-              when={isPushSupported() && vapid.error === undefined && !vapid.loading && checked()}
-              fallback={
-                <span class={styles.status}>
-                  {isPushSupported() ? "Unavailable" : "Unsupported here"}
-                </span>
-              }
-            >
-              <button
-                type="button"
-                class={subscribed() ? styles.pill : styles.pillPrimary}
-                disabled={busy()}
-                onClick={() => void toggle()}
+      <div class={styles.insetList}>
+        <div class={styles.insetRow}>
+          <div class={styles.insetRowBar}>
+            <span class={styles.mark} aria-hidden="true">
+              <BellRing size={15} />
+            </span>
+            <div class={styles.identity}>
+              <span class={styles.cardTitle}>Push notifications</span>
+            </div>
+            <div class={styles.actions}>
+              <Show
+                when={isPushSupported() && vapid.error === undefined && !vapid.loading && checked()}
+                fallback={
+                  <span class={styles.status}>
+                    {isPushSupported() ? "Unavailable" : "Unsupported here"}
+                  </span>
+                }
               >
-                {busy() ? "Working…" : subscribed() ? "Turn off" : "Enable push"}
-              </button>
-            </Show>
+                <button
+                  type="button"
+                  class={subscribed() ? styles.pill : styles.pillPrimary}
+                  disabled={busy()}
+                  onClick={() => void toggle()}
+                >
+                  {busy() ? "Working…" : subscribed() ? "Turn off" : "Enable push"}
+                </button>
+              </Show>
+            </div>
           </div>
+          <ProblemNotice error={vapid.error ?? error()} />
         </div>
-        <ProblemNotice error={vapid.error ?? error()} />
-      </article>
+      </div>
     </div>
   );
 }
-

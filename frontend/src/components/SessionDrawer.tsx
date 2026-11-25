@@ -21,7 +21,16 @@
  * toggle is behind it.
  */
 import { For, Match, Show, Switch, createEffect, createSignal, on, onCleanup } from "solid-js";
-import { FileCode2, GitCompare, Monitor, SlidersHorizontal, TerminalSquare, X } from "lucide-solid";
+import {
+  FileCode2,
+  GitCompare,
+  Maximize2,
+  Minimize2,
+  Monitor,
+  PanelRightClose,
+  SlidersHorizontal,
+  TerminalSquare,
+} from "lucide-solid";
 import DiffPanel from "./DiffPanel";
 import EnvEditor from "./EnvEditor";
 import FilesPanel from "./FilesPanel";
@@ -107,6 +116,7 @@ export interface SessionDrawerProps {
 export default function SessionDrawer(props: SessionDrawerProps) {
   const open = () => props.open;
   const [tab, setTab] = createSignal<Tab>("terminal");
+  const [expanded, setExpanded] = createSignal(false);
   /** The screen exists only on a session that has a desktop to show. */
   const tabs = () => (props.computerUse ? [SCREEN_TAB, ...TABS] : TABS);
   /**
@@ -165,61 +175,93 @@ export default function SessionDrawer(props: SessionDrawerProps) {
 
   return (
     <Show when={open()}>
-      <div class={cx(styles.drawer, styles.drawerOpen)}>
+      <aside
+        class={cx(
+          styles.drawer,
+          styles.drawerOpen,
+          expanded() && styles.drawerExpanded,
+        )}
+        aria-label="Workbench"
+      >
         <div class={styles.panel}>
-          <div class={styles.tabs} role="tablist" aria-label="Session panels">
-            <For each={tabs()}>
-              {(entry) => (
-                <button
-                  type="button"
-                  role="tab"
-                  aria-selected={tab() === entry.id}
-                  aria-disabled={(entry.needsMachine === true && !props.machineUp) || undefined}
-                  disabled={entry.needsMachine === true && !props.machineUp}
-                  title={
-                    entry.needsMachine === true && !props.machineUp
-                      ? "The machine is not connected"
-                      : undefined
-                  }
-                  class={cx(
-                    styles.tab,
-                    tab() === entry.id && styles.tabActive,
-                    entry.needsMachine === true && !props.machineUp && styles.tabDisabled,
-                  )}
-                  onClick={() => setTab(entry.id)}
+          <div class={styles.headerBar}>
+            <div class={styles.tabs} role="tablist" aria-label="Session panels">
+              <For each={tabs()}>
+                {(entry) => (
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={tab() === entry.id}
+                    aria-disabled={(entry.needsMachine === true && !props.machineUp) || undefined}
+                    disabled={entry.needsMachine === true && !props.machineUp}
+                    title={
+                      entry.needsMachine === true && !props.machineUp
+                        ? "The machine is not connected"
+                        : undefined
+                    }
+                    class={cx(
+                      styles.tab,
+                      tab() === entry.id && styles.tabActive,
+                      entry.needsMachine === true && !props.machineUp && styles.tabDisabled,
+                    )}
+                    onClick={() => setTab(entry.id)}
+                  >
+                    <Switch>
+                      <Match when={entry.id === "screen"}>
+                        <Monitor size={13} aria-hidden="true" />
+                      </Match>
+                      <Match when={entry.id === "terminal"}>
+                        <TerminalSquare size={13} aria-hidden="true" />
+                      </Match>
+                      <Match when={entry.id === "files"}>
+                        <FileCode2 size={13} aria-hidden="true" />
+                      </Match>
+                      <Match when={entry.id === "diff"}>
+                        <GitCompare size={13} aria-hidden="true" />
+                      </Match>
+                      <Match when={entry.id === "env"}>
+                        <SlidersHorizontal size={13} aria-hidden="true" />
+                      </Match>
+                    </Switch>
+                    {entry.label}
+                  </button>
+                )}
+              </For>
+            </div>
+            <div class={styles.headerActions}>
+              <button
+                type="button"
+                class={styles.windowAction}
+                aria-label={expanded() ? "Restore panel width" : "Expand panel width"}
+                title={expanded() ? "Restore width" : "Expand width"}
+                onClick={() => setExpanded((was) => !was)}
+              >
+                <Show
+                  when={expanded()}
+                  fallback={<Maximize2 size={14} aria-hidden="true" />}
                 >
-                  <Switch>
-                    <Match when={entry.id === "screen"}>
-                      <Monitor size={13} aria-hidden="true" />
-                    </Match>
-                    <Match when={entry.id === "terminal"}>
-                      <TerminalSquare size={13} aria-hidden="true" />
-                    </Match>
-                    <Match when={entry.id === "files"}>
-                      <FileCode2 size={13} aria-hidden="true" />
-                    </Match>
-                    <Match when={entry.id === "diff"}>
-                      <GitCompare size={13} aria-hidden="true" />
-                    </Match>
-                    <Match when={entry.id === "env"}>
-                      <SlidersHorizontal size={13} aria-hidden="true" />
-                    </Match>
-                  </Switch>
-                  {entry.label}
-                </button>
-              )}
-            </For>
-            <button
-              type="button"
-              class={styles.close}
-              aria-label="Close the panel"
-              onClick={() => props.onOpenChange(false)}
-            >
-              <X size={16} aria-hidden="true" />
-            </button>
+                  <Minimize2 size={14} aria-hidden="true" />
+                </Show>
+              </button>
+              <button
+                type="button"
+                class={styles.close}
+                aria-label="Close the panel"
+                title="Close panel (⌘.)"
+                onClick={() => props.onOpenChange(false)}
+              >
+                <PanelRightClose size={15} aria-hidden="true" />
+              </button>
+            </div>
           </div>
 
-          <div class={styles.body} role="tabpanel">
+          <div
+            class={cx(
+              styles.body,
+              (tab() === "terminal" || tab() === "screen") && styles.bodyFlush,
+            )}
+            role="tabpanel"
+          >
             <Switch>
               <Match when={tab() === "screen"}>
                 <ScreenPanel
@@ -252,7 +294,7 @@ export default function SessionDrawer(props: SessionDrawerProps) {
             </Switch>
           </div>
         </div>
-      </div>
+      </aside>
     </Show>
   );
 }

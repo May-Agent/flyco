@@ -431,14 +431,37 @@ export default function SessionComposer(props: SessionComposerProps) {
     return false;
   }
 
+  function openSlashPalette(): void {
+    const current = text();
+    if (!current.startsWith("/")) {
+      setText(current.trim() === "" ? "/" : `/${current.trimStart()}`);
+    }
+    setHighlighted(0);
+    setDismissed(false);
+    field?.focus();
+  }
+
   return (
     <ComposerShell
       value={text()}
       onInput={onInput}
       onSubmit={send}
-      placeholder="Reply, / for a command, ! for the shell"
+      placeholder="Message, / for commands, ! for bash"
       label="Message the agent"
-      controls={props.controls}
+      controls={
+        <>
+          {props.controls}
+          <button
+            type="button"
+            class={styles.slashTrigger}
+            title="Slash commands"
+            aria-label="Slash commands"
+            onClick={openSlashPalette}
+          >
+            /
+          </button>
+        </>
+      }
       trailing={props.trailing}
       disabled={sending()}
       onKeyDown={onKeyDown}

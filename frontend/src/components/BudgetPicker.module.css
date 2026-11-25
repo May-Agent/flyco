@@ -1,64 +1,139 @@
+.panel {
+  min-width: 268px;
+}
+
 .popover {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+  padding: var(--space-1);
 }
 
-/* What the money is for, said once as a heading with its mark: the
-   machine, not the model's tokens, which the user's own plan bills. */
-.heading {
+.head {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: var(--space-2);
-  margin: 0;
-  color: var(--color-text-muted);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-}
-
-.sliderRow {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-3);
+  gap: 2px;
 }
 
 .amount {
   font-size: var(--text-xl);
   font-weight: var(--weight-semibold);
   font-variant-numeric: tabular-nums;
+  color: var(--color-accent);
+  line-height: var(--line-tight);
 }
 
-.slider {
-  width: 100%;
-  accent-color: var(--color-primary);
-}
-
-.note {
+.heading {
   margin: 0;
-  font-size: var(--text-sm);
   color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
 }
 
-/* The button that spends the round trip. Full width because the panel is
-   narrow and a button floating in it would be a target to aim at. */
+.capsule {
+  position: relative;
+  height: 28px;
+  padding-inline: 14px;
+  margin-block: 3px;
+  border-radius: var(--radius-full);
+  background: var(--color-surface-sunken);
+  box-shadow: inset 0 1px 2px rgb(0 0 0 / 5%);
+}
+
+.rail {
+  position: relative;
+  height: 100%;
+}
+
+.fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -14px;
+  width: calc(var(--travelled, 0%) + 14px);
+  border-radius: var(--radius-full) 0 0 var(--radius-full);
+  background: var(--color-accent);
+  pointer-events: none;
+  transition: width var(--transition-fast);
+}
+
+.thumb {
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  left: var(--travelled, 0%);
+  width: 30px;
+  height: 30px;
+  translate: -50% -50%;
+  border-radius: var(--radius-full);
+  background: #ffffff;
+  box-shadow: var(--shadow-thumb);
+  pointer-events: none;
+  transition:
+    left var(--transition-fast),
+    scale var(--transition-fast);
+}
+
+.range {
+  position: absolute;
+  z-index: 3;
+  top: 50%;
+  left: -15px;
+  right: -15px;
+  height: 32px;
+  margin: 0;
+  padding: 0;
+  transform: translateY(-50%);
+  appearance: none;
+  background: none;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.range::-webkit-slider-thumb {
+  appearance: none;
+  width: 30px;
+  height: 30px;
+}
+
+.range::-moz-range-thumb {
+  width: 30px;
+  height: 30px;
+  border: 0;
+}
+
+.rail:has(.range:focus-visible) .thumb {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.rail:has(.range:active) .thumb {
+  scale: 0.94;
+}
+
 .commit {
   width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border: var(--border-width) solid transparent;
-  border-radius: var(--radius-md);
+  height: 34px;
+  padding: 0 var(--space-3);
+  border: none;
+  border-radius: var(--radius-full);
   background: var(--color-primary);
   color: var(--color-primary-text);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   cursor: pointer;
-  transition: background var(--transition-fast);
+  transition:
+    background var(--transition-fast),
+    transform var(--transition-fast);
 }
 
 .commit:hover:not(:disabled) {
   background: var(--color-primary-hover);
+}
+
+.commit:active:not(:disabled) {
+  transform: scale(0.98);
 }
 
 .commit:disabled {

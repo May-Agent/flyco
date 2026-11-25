@@ -3,17 +3,19 @@
 
 .modal {
   width: min(560px, calc(100vw - 2 * var(--space-4)));
-  max-height: min(80vh, 720px);
+  max-height: min(84dvh, 740px);
   padding: 0;
-  border: var(--border-width) solid var(--color-border-strong);
-  border-radius: var(--radius-lg);
-  background: var(--color-surface);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-xl);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-modal);
   color: var(--color-text);
   overflow: hidden;
 }
 
 .modal::backdrop {
-  background: rgb(0 0 0 / 40%);
+  background: rgb(0 0 0 / 28%);
+  backdrop-filter: blur(8px);
 }
 
 .head {

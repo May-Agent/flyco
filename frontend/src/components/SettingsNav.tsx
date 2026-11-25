@@ -1,19 +1,10 @@
 /**
- * The rail, while the user is in settings.
- *
- * Settings used to carry a second vertical nav of its own, 200px to the
- * right of the shell's rail: two columns of links side by side, and the
- * page the user actually opened pushed into what was left. One column is
- * navigation; two are a maze.
- *
- * So the rail becomes the settings nav for as long as the user is in
- * settings, with `Sessions` at the top where `New session` sits everywhere
- * else — the way out is in the same place as the way on.
+ * Settings section definitions shared between the two-column Settings modal
+ * and direct `/settings/*` routes.
  */
 import { For } from "solid-js";
 import { A } from "@solidjs/router";
 import {
-  ArrowLeft,
   Blocks,
   Bot,
   CircleUser,
@@ -22,44 +13,69 @@ import {
   Server,
   SlidersHorizontal,
 } from "lucide-solid";
+import { cx } from "../lib/cx";
 import styles from "./SettingsNav.module.css";
 
-interface SettingsSection {
+export type SettingsSectionId =
+  | "agents"
+  | "compute"
+  | "tools"
+  | "instructions"
+  | "api-keys"
+  | "preferences"
+  | "account";
+
+export interface SettingsSection {
+  id: SettingsSectionId;
   href: string;
   label: string;
   icon: typeof Bot;
 }
 
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
-  { href: "/settings/agents", label: "Agents", icon: Bot },
-  { href: "/settings/compute", label: "Compute", icon: Server },
-  { href: "/settings/tools", label: "Tools", icon: Blocks },
-  { href: "/settings/instructions", label: "Instructions", icon: FileText },
-  { href: "/settings/api-keys", label: "API keys", icon: KeyRound },
-  { href: "/settings/preferences", label: "Preferences", icon: SlidersHorizontal },
-  { href: "/settings/account", label: "Account", icon: CircleUser },
+  { id: "agents", href: "/settings/agents", label: "Agents", icon: Bot },
+  { id: "compute", href: "/settings/compute", label: "Compute", icon: Server },
+  { id: "tools", href: "/settings/tools", label: "Tools", icon: Blocks },
+  { id: "instructions", href: "/settings/instructions", label: "Instructions", icon: FileText },
+  { id: "api-keys", href: "/settings/api-keys", label: "API keys", icon: KeyRound },
+  { id: "preferences", href: "/settings/preferences", label: "Preferences", icon: SlidersHorizontal },
+  { id: "account", href: "/settings/account", label: "Account", icon: CircleUser },
 ];
 
-export default function SettingsNav(props: { onNavigate?: () => void }) {
+export default function SettingsNav(props: {
+  active?: SettingsSectionId | undefined;
+  onSelect?: ((id: SettingsSectionId) => void) | undefined;
+  onNavigate?: (() => void) | undefined;
+}) {
   return (
     <nav class={styles.nav} aria-label="Settings sections">
-      <A href="/" end class={styles.back} onClick={() => props.onNavigate?.()}>
-        <ArrowLeft size={15} aria-hidden="true" />
-        Sessions
-      </A>
-      <p class={styles.heading}>Settings</p>
       <For each={SETTINGS_SECTIONS}>
-        {(section) => (
-          <A
-            href={section.href}
-            class={styles.link}
-            activeClass={styles.linkActive}
-            onClick={() => props.onNavigate?.()}
-          >
-            <section.icon size={15} aria-hidden="true" />
-            {section.label}
-          </A>
-        )}
+        {(section) =>
+          props.onSelect !== undefined ? (
+            <button
+              type="button"
+              class={cx(styles.link, props.active === section.id && styles.linkActive)}
+              aria-current={props.active === section.id ? "page" : undefined}
+              onClick={() => {
+                props.onSelect?.(section.id);
+                props.onNavigate?.();
+              }}
+            >
+              <section.icon size={15} aria-hidden="true" />
+              {section.label}
+            </button>
+          ) : (
+            <A
+              href={section.href}
+              class={styles.link}
+              activeClass={styles.linkActive}
+              onClick={() => props.onNavigate?.()}
+            >
+              <section.icon size={15} aria-hidden="true" />
+              {section.label}
+            </A>
+          )
+        }
       </For>
     </nav>
   );

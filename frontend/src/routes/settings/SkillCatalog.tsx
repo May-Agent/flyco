@@ -38,9 +38,13 @@ import styles from "./Settings.module.css";
 const TOOLS = "/settings/tools";
 
 export default function SkillCatalog() {
+  return <SkillCatalogView />;
+}
+
+export function SkillCatalogView(props: { onDone?: (() => void) | undefined }) {
   return (
     <section class={styles.section}>
-      <PickPage />
+      <PickPage onDone={props.onDone} />
     </section>
   );
 }
@@ -62,7 +66,7 @@ export default function SkillCatalog() {
 const PENDING_POLL_MS = 3000;
 const PENDING_DEADLINE_MS = 120_000;
 
-function PickPage() {
+function PickPage(props: { onDone?: (() => void) | undefined }) {
   const navigate = useNavigate();
   const [catalog, { refetch }] = createQuery(listCatalogSkills);
   const [query, setQuery] = createSignal("");
@@ -79,7 +83,11 @@ function PickPage() {
         plugin: skill.plugin,
         name: skill.name,
       });
-      navigate(TOOLS);
+      if (props.onDone !== undefined) {
+        props.onDone();
+      } else {
+        navigate(TOOLS);
+      }
     } catch (error) {
       setFailure(error);
       setInstalling(null);
@@ -172,11 +180,27 @@ function PickPage() {
 
   return (
     <>
-      <header class={styles.sectionHead}>
-        <A href={TOOLS} class={styles.backLink}>
-          <ArrowLeft size={14} aria-hidden="true" />
-          Back to Tools
-        </A>
+      <header class={styles.sectionHeadStack}>
+        <Show
+          when={props.onDone}
+          fallback={
+            <A href={TOOLS} class={styles.backLink}>
+              <ArrowLeft size={14} aria-hidden="true" />
+              Back to Tools
+            </A>
+          }
+        >
+          {(back) => (
+            <button
+              type="button"
+              class={cx(styles.backLink, styles.backButton)}
+              onClick={() => back()()}
+            >
+              <ArrowLeft size={14} aria-hidden="true" />
+              Back to Tools
+            </button>
+          )}
+        </Show>
         <h2>Add a skill</h2>
       </header>
 
@@ -373,10 +397,6 @@ function Marketplaces(props: { onChanged: () => void }) {
               placeholder="owner/name"
               required
             />
-            <p class={styles.hint}>
-              A repository with <code>.claude-plugin/marketplace.json</code> in it. flyco reads it
-              with your GitHub account, so a private one works.
-            </p>
           </div>
           <ProblemNotice error={addFailure()} />
           <div class={styles.formActions}>

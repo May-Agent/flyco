@@ -13,6 +13,12 @@
   padding: var(--space-6) var(--space-4);
 }
 
+.pageEmbedded {
+  padding: 0;
+  align-items: stretch;
+  justify-content: flex-start;
+}
+
 .card {
   width: min(560px, 100%);
   display: flex;
@@ -23,6 +29,15 @@
   border-radius: var(--radius-xl);
   background: var(--color-surface-raised);
   box-shadow: var(--shadow-raised);
+}
+
+.cardEmbedded {
+  width: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
 }
 
 /* ── The stage bars ──────────────────────────────────────────────────── */

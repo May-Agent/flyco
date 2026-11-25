@@ -34,28 +34,24 @@ import {
   Clock,
   PauseCircle,
   RefreshCw,
-  Server,
   Wallet,
   WifiOff,
 } from "lucide-solid";
 import ApprovalPrompt from "../components/ApprovalPrompt";
 import { BudgetRaise } from "../components/BudgetPicker";
-import GoalChip from "../components/GoalChip";
 import ConfirmDialog from "../components/ConfirmDialog";
 import ModelChip from "../components/ModelChip";
 import ModeChip from "../components/ModeChip";
-import MachinePanel from "../components/MachinePanel";
-import Popover from "../components/Popover";
 import ProblemNotice from "../components/ProblemNotice";
 import { useReadiness } from "../components/Readiness";
 import ContextRing, { type SessionTotals } from "../components/ContextRing";
 import SessionComposer, { type SessionCommand } from "../components/SessionComposer";
+import SessionPlusMenu from "../components/SessionPlusMenu";
 import SessionDrawer from "../components/SessionDrawer";
 import SessionHeader from "../components/SessionHeader";
 import { useSessions } from "../components/SessionNav";
 import SwarmPanel from "../components/SwarmPanel";
 import Transcript, { ProvisioningTimeline } from "../components/Transcript";
-import composerStyles from "../components/Composer.module.css";
 import {
   addSessionRepo,
   archiveSession,
@@ -78,7 +74,6 @@ import type { HarnessCommand } from "../api/wire";
 import { formatTimeOfDay } from "../lib/dates";
 import { reposLabel } from "../lib/repos";
 import { PROVIDER_LABEL } from "../lib/providers";
-import { machineChip } from "../lib/machines";
 import { modesFor } from "../lib/modes";
 import { orderedWindows } from "../lib/planUsage";
 import { dollarsToUsdMicros, usdMicrosToDollars } from "../lib/money";
@@ -975,42 +970,6 @@ function SessionView(props: { id: string }) {
 
   return (
     <section class={styles.page}>
-      <SessionHeader
-        session={session()}
-        sessionId={props.id}
-        connection={relay.state()}
-        machine={machine()}
-        onRename={(title) => void onRename(title)}
-        onArchive={() => void onArchive(false)}
-        archiving={archiving()}
-        onStartMachine={() => void onMachine("start")}
-        onStopMachine={() => void onMachine("stop")}
-        onKeepAwake={(minutes) => void onKeepAwake(minutes)}
-        drawerOpen={drawerOpen()}
-        onToggleDrawer={() => setDrawerOpen((was) => !was)}
-        onOpenPanel={requestPanel}
-        onAddRepo={
-          session()?.state === "archived" || session()?.state === "failed"
-            ? undefined
-            : (selection) => void onAddRepo(selection)
-        }
-        addingRepo={addingRepo()}
-      />
-
-      {/*
-        A session that could not be read takes everything derived from it
-        down with it — the machine, the budget, the relay — and repeating
-        the same 404 once per query would bury the way out of the page in
-        copies of itself. So the fatal notice replaces them.
-      */}
-      <Show when={fatal()} fallback={<ProblemNotice error={machine.error} />}>
-        <ProblemNotice
-          error={fatal()}
-          action={{ label: "Back to sessions", onClick: () => navigate("/") }}
-        />
-      </Show>
-      <ProblemNotice error={error()} />
-
       <Show when={pendingDirtySummary()}>
         {(summary) => (
           <ConfirmDialog
@@ -1030,6 +989,40 @@ function SessionView(props: { id: string }) {
 
       <div class={styles.body}>
         <div class={styles.column}>
+          <div class={styles.headerSlot}>
+            <SessionHeader
+              session={session()}
+              sessionId={props.id}
+              connection={relay.state()}
+              machine={machine()}
+              onRename={(title) => void onRename(title)}
+              onArchive={() => void onArchive(false)}
+              archiving={archiving()}
+              onStartMachine={() => void onMachine("start")}
+              onStopMachine={() => void onMachine("stop")}
+              onKeepAwake={(minutes) => void onKeepAwake(minutes)}
+              drawerOpen={drawerOpen()}
+              onToggleDrawer={() => setDrawerOpen((was) => !was)}
+              onOpenPanel={requestPanel}
+              onAddRepo={
+                session()?.state === "archived" || session()?.state === "failed"
+                  ? undefined
+                  : (selection) => void onAddRepo(selection)
+              }
+              addingRepo={addingRepo()}
+            />
+          </div>
+
+          <div class={styles.noticesSlot}>
+            <Show when={fatal()} fallback={<ProblemNotice error={machine.error} />}>
+              <ProblemNotice
+                error={fatal()}
+                action={{ label: "Back to sessions", onClick: () => navigate("/") }}
+              />
+            </Show>
+            <ProblemNotice error={error()} />
+          </div>
+
           <Show when={swarm()}>
             {(current) => <SwarmPanel swarm={current()} />}
           </Show>
@@ -1215,114 +1208,47 @@ function SessionView(props: { id: string }) {
                 machineUp={machineUp()}
                 deferred={deferredNote()}
                 controls={
-                  /*
-                    The session's own row (docs/ux.md §9.3): what it runs
-                    on, what that costs, and what it may spend — each a
-                    readout that opens the control that changes it, where
-                    the official composers keep the same things.
-                  */
-                  <div class={composerStyles.chips}>
-                    <Show when={machine()}>
-                      {(view) => (
-                        <Popover
-                          label="Machine"
-                          panelClass={composerStyles.popoverWide}
-                          openAt={machinePanelAt()}
-                          trigger={(attrs) => (
-                            <button
-                              id={attrs.id}
-                              onClick={attrs.onClick}
-                              aria-expanded={attrs.expanded()}
-                              aria-haspopup="dialog"
-                              type="button"
-                              class={composerStyles.chip}
-                              title="Machine"
-                            >
-                              <Server size={13} aria-hidden="true" />
-                              <span class={composerStyles.chipLabel}>{machineChip(view())}</span>
-                            </button>
-                          )}
-                        >
-                          {() => (
-                            <MachinePanel
-                              sessionId={props.id}
-                              machine={view()}
-                              openResize={machineResizeAt()}
-                              onChanged={() => void refetchMachine()}
-                              embedded
-                            />
-                          )}
-                        </Popover>
-                      )}
-                    </Show>
-                    <Show when={session()}>
-                      {(current) => (
-                        <BudgetRaise
-                          limitUsd={usdMicrosToDollars(current().budget.limit)}
-                          spentUsd={usdMicrosToDollars(current().budget.spent)}
-                          saving={settingBudget()}
-                          onSet={(dollars) => void onSetBudget(dollars)}
-                          trigger={(attrs) => (
-                            <button
-                              id={attrs.id}
-                              onClick={attrs.onClick}
-                              aria-expanded={attrs.expanded()}
-                              aria-haspopup="dialog"
-                              type="button"
-                              class={composerStyles.chip}
-                              title="Set the compute budget"
-                            >
-                              <Wallet size={13} aria-hidden="true" />
-                              <span class={composerStyles.chipLabel}>
-                                ${(budgetSpentUsd() ?? 0).toFixed(2)} / $
-                                {(budgetLimitUsd() ?? 0).toFixed(0)}
-                              </span>
-                            </button>
-                          )}
-                        />
-                      )}
-                    </Show>
-                    {/*
-                      The goal is a setting of the session, not a line in
-                      it — a chip like the model's, offered only where the
-                      running harness says it takes one.
-                    */}
-                    <Show when={commands().find((command) => command.name === "goal")}>
-                      {(command) => (
-                        <GoalChip
-                          description={command().description}
-                          onSet={(condition) => void onSend(`/goal ${condition}`)}
-                        />
-                      )}
-                    </Show>
-                  </div>
-                }
-                trailing={
                   <>
-                    {/*
-                      At the right, beside send, where both official apps
-                      keep their model: the last thing checked before a
-                      message goes out. These stay in the box when the
-                      chips island — the chips say where the session runs,
-                      these say what the next turn runs under.
-                    */}
-                    {/*
-                      The mode, beside the model: both say what the next
-                      turn runs under, and both reach the agent the same
-                      way. The list is the harness's own — Codex has no
-                      `dontAsk` worth a second row (src/lib/modes.ts).
-                    */}
+                    <SessionPlusMenu
+                      sessionId={props.id}
+                      machine={machine()}
+                      onMachineChanged={() => void refetchMachine()}
+                      openMachineAt={machinePanelAt()}
+                      openResizeAt={machineResizeAt()}
+                      budgetSpentUsd={budgetSpentUsd()}
+                      budgetLimitUsd={budgetLimitUsd()}
+                      savingBudget={settingBudget()}
+                      onSetBudget={(dollars) => void onSetBudget(dollars)}
+                      repos={session()?.repos ?? []}
+                      onAddRepo={
+                        session()?.state === "archived" || session()?.state === "failed"
+                          ? undefined
+                          : (selection) => void onAddRepo(selection)
+                      }
+                      addingRepo={addingRepo()}
+                      onOpenEnv={() => requestPanel({ panel: "env" })}
+                      goalDescription={commands().find((c) => c.name === "goal")?.description}
+                      onSetGoal={
+                        commands().some((c) => c.name === "goal")
+                          ? (condition) => void onSend(`/goal ${condition}`)
+                          : undefined
+                      }
+                    />
                     <Show when={session()}>
                       {(current) => (
                         <ModeChip
                           modes={modesFor(current().harness)}
                           mode={current().permission_mode}
                           saving={settingMode()}
-                          align="end"
+                          align="start"
                           onChoose={(mode) => void onSetMode(mode)}
                         />
                       )}
                     </Show>
+                  </>
+                }
+                trailing={
+                  <>
                     <Show when={session() !== undefined && models().length > 0 && session()}>
                       {(current) => (
                         <ModelChip
@@ -1334,14 +1260,6 @@ function SessionView(props: { id: string }) {
                         />
                       )}
                     </Show>
-                    {/*
-                      The usage ring, beside send, where the official
-                      composers keep it: how full the context window is,
-                      and one tap opens the panel with the plan windows
-                      beside it (docs/ux.md §9.3). Nothing is drawn until a
-                      harness has reported something — a ring at zero over
-                      a context flyco has never been told is an invention.
-                    */}
                     <Show when={latestContext() !== null || planUsage().length > 0}>
                       <ContextRing
                         context={latestContext()}

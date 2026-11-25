@@ -79,13 +79,21 @@ function displayName(server: CatalogMcpServer): string {
 }
 
 export default function McpCatalog() {
+  return <McpCatalogView />;
+}
+
+export function McpCatalogView(props: { onDone?: (() => void) | undefined }) {
   const navigate = useNavigate();
   const [step, setStep] = createSignal<Step>({ page: "pick" });
   const [adding, setAdding] = createSignal<string | null>(null);
   const [failure, setFailure] = createSignal<unknown>(null);
 
   function done(): void {
-    navigate(TOOLS);
+    if (props.onDone !== undefined) {
+      props.onDone();
+    } else {
+      navigate(TOOLS);
+    }
   }
 
   /**
@@ -138,6 +146,7 @@ export default function McpCatalog() {
         <PickPage
           adding={adding()}
           failure={failure()}
+          onBack={props.onDone}
           onChoose={choose}
         />
       </Show>
@@ -185,6 +194,7 @@ export default function McpCatalog() {
 function PickPage(props: {
   adding: string | null;
   failure: unknown;
+  onBack?: (() => void) | undefined;
   onChoose: (server: CatalogMcpServer) => void;
 }) {
   const [typed, setTyped] = createSignal("");
@@ -230,11 +240,27 @@ function PickPage(props: {
 
   return (
     <>
-      <header class={styles.sectionHead}>
-        <A href={TOOLS} class={styles.backLink}>
-          <ArrowLeft size={14} aria-hidden="true" />
-          Back to Tools
-        </A>
+      <header class={styles.sectionHeadStack}>
+        <Show
+          when={props.onBack}
+          fallback={
+            <A href={TOOLS} class={styles.backLink}>
+              <ArrowLeft size={14} aria-hidden="true" />
+              Back to Tools
+            </A>
+          }
+        >
+          {(back) => (
+            <button
+              type="button"
+              class={cx(styles.backLink, styles.backButton)}
+              onClick={() => back()()}
+            >
+              <ArrowLeft size={14} aria-hidden="true" />
+              Back to Tools
+            </button>
+          )}
+        </Show>
         <h2>Add an MCP server</h2>
       </header>
 
@@ -395,7 +421,6 @@ function DetailsPage(props: {
             pattern="[A-Za-z0-9_\-]+"
             title="Letters, digits, dashes and underscores"
           />
-          <p class={styles.hint}>What sessions announce the server as.</p>
         </div>
         <For each={props.install.inputs}>
           {(input) => (

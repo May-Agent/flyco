@@ -1,43 +1,140 @@
 /*
- * One stylesheet for the whole of settings.
- *
- * All five sections are built from the same handful of shapes — a card, a
- * pill button, an empty state, a field — so they share this module rather
- * than each inventing a card of its own. Every value is a token; nothing
- * here names a colour or a radius directly.
- *
- * A card is paper on the ground, lifted a step; a section is a heading, a
- * lede, and its cards, with the same vertical rhythm on every page.
+ * Unified settings stylesheet: supports both the centred two-column `<dialog>`
+ * modal and direct `/settings/*` routes, using inset grouped lists with 1px
+ * hairline dividers instead of multi-column card grids.
  */
 
-/* ── Layout ──────────────────────────────────────────────────────────── */
+/* ── Modal & Route Shell ─────────────────────────────────────────────── */
 
-/* Wide enough for three cards in a row, which is how many agents there
-   are: at 800px the third wrapped onto a line of its own while the window
-   beside it stood empty. */
+.modalDialog {
+  width: min(880px, calc(100vw - 2 * var(--space-4)));
+  height: min(660px, calc(100dvh - 2 * var(--space-4)));
+  max-width: none;
+  max-height: none;
+  padding: 0;
+  border: var(--border-width) solid var(--color-border);
+  border-radius: 20px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  box-shadow: var(--shadow-modal);
+  overflow: hidden;
+}
+
+.modalDialog::backdrop {
+  background: rgb(0 0 0 / 28%);
+  backdrop-filter: blur(10px);
+}
+
+.modalShell {
+  display: grid;
+  grid-template-columns: 204px minmax(0, 1fr);
+  height: 100%;
+}
+
 .page {
   flex: 1;
   width: 100%;
-  max-width: 1120px;
+  max-width: 980px;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5);
+}
+
+.window {
+  display: grid;
+  grid-template-columns: 204px minmax(0, 1fr);
+  min-height: min(640px, calc(100dvh - 2 * var(--space-6)));
+  border: var(--border-width) solid var(--color-border);
+  border-radius: 20px;
+  background: var(--color-bg);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-3);
+  border-right: var(--border-width) solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.sidebarHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 6px;
+}
+
+.sidebarTitle {
   margin: 0;
-  padding: var(--space-7) var(--space-7) var(--space-8);
+  padding: 0 6px;
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-snug);
+  color: var(--color-text);
 }
 
-.content {
+.sidebarHeader .sidebarTitle {
+  padding: 0;
+}
+
+.closeButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--color-surface-sunken);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.closeButton:hover {
+  background: var(--color-border-strong);
+  color: var(--color-text);
+}
+
+.content,
+.modalContent {
   min-width: 0;
+  padding: var(--space-5) var(--space-6);
+  overflow-y: auto;
 }
 
-/* ── Section frame ───────────────────────────────────────────────────── */
+/* ── Section & Group Frame ───────────────────────────────────────────── */
 
 .section {
   display: flex;
   flex-direction: column;
-  gap: var(--space-5);
+  gap: var(--space-4);
 }
 
-.sectionHead h2 {
-  margin: 0 0 var(--space-2);
-  font-size: var(--text-xl);
+.sectionHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.sectionHeadStack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+}
+
+.sectionHead h2,
+.sectionHeadStack h2 {
+  margin: 0;
+  font-size: var(--text-lg);
   font-weight: var(--weight-semibold);
   letter-spacing: var(--tracking-tight);
 }
@@ -45,47 +142,89 @@
 .lede {
   margin: 0;
   color: var(--color-text-muted);
+  font-size: var(--text-sm);
   max-width: 60ch;
-  line-height: var(--line-relaxed);
 }
 
 .group {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
+}
+
+.groupHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 0 2px;
 }
 
 .groupLabel {
-  margin: var(--space-3) 0 0;
+  margin: var(--space-1) 0 0;
   font-size: var(--text-2xs);
-  font-weight: var(--weight-medium);
+  font-weight: var(--weight-semibold);
   text-transform: uppercase;
   letter-spacing: var(--tracking-caps);
   color: var(--color-text-faint);
 }
 
+/* ── Inset Grouped List ──────────────────────────────────────────────── */
+
+.insetList {
+  display: flex;
+  flex-direction: column;
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+}
+
+.insetListDrop {
+  border-color: var(--color-accent);
+  background: var(--color-accent-soft);
+}
+
+.insetRow {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 12px var(--space-4);
+  border-bottom: var(--border-width) solid var(--color-border);
+  min-width: 0;
+}
+
+.insetRow:last-child {
+  border-bottom: none;
+}
+
+.insetRowBar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 32px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
 /* ── Cards ───────────────────────────────────────────────────────────── */
 
 .cards {
-  display: grid;
+  display: flex;
+  flex-direction: column;
   gap: var(--space-3);
-}
-
-/* As many across as fit, so three harnesses read as one row rather than
-   a pair and an orphan. */
-.cardsPaired {
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
 }
 
 .card {
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
-  padding: var(--space-5);
+  gap: var(--space-3);
+  padding: var(--space-4);
   border: var(--border-width) solid var(--color-border);
   border-radius: var(--radius-lg);
   background: var(--color-surface-raised);
-  box-shadow: var(--shadow-card);
+  box-shadow: var(--shadow-sm);
   min-width: 0;
 }
 
@@ -94,19 +233,22 @@
   align-items: center;
   gap: var(--space-3);
   min-width: 0;
+  flex-wrap: wrap;
 }
 
 .mark {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   flex-shrink: 0;
   border-radius: var(--radius-md);
   border: var(--border-width) solid var(--color-border);
   background: var(--color-surface);
   color: var(--color-text);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
 }
 
 .identity {
@@ -114,11 +256,20 @@
   flex-direction: column;
   min-width: 0;
   gap: 2px;
+  flex: 1 1 auto;
+}
+
+.identityInline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  min-width: 0;
 }
 
 .cardTitle {
   font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-snug);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -126,19 +277,16 @@
 }
 
 .cardMeta {
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   color: var(--color-text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-/* A meta line that opens with a vendor mark: the mark sits on the line, not
-   above it, because `Logomark` is a block element by design. */
-.metaWithMark {
-  composes: cardMeta;
-  display: flex;
+  display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
+}
+
+.metaWithMark {
+  composes: cardMeta;
 }
 
 .mono {
@@ -151,31 +299,23 @@
 .actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--space-2);
   margin-left: auto;
   flex-shrink: 0;
 }
 
-/* The account row inside an agent card.
-   Three cards share the row, so each is about a third of the page wide:
-   `Linked Sep 9, 2026 · Expires in 5 days` and two pills do not fit on one
-   line, and side by side the meta wrapped into three. The pills take their
-   own line beneath it, right-aligned. */
-.accountTop {
+.actionsStart {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  flex-wrap: wrap;
   gap: var(--space-2);
-  min-width: 0;
-}
-
-.accountTop .actions {
-  margin-left: auto;
 }
 
 .cardBody {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
 }
 
 /* ── Status pill ─────────────────────────────────────────────────────── */
@@ -184,28 +324,23 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  align-self: flex-start;
   height: 22px;
-  padding: 0 var(--space-2);
+  padding: 0 8px;
   border-radius: var(--radius-full);
   font-size: var(--text-2xs);
   font-weight: var(--weight-medium);
-  letter-spacing: 0.01em;
-  border: var(--border-width) solid var(--color-border);
-  color: var(--color-text-muted);
+  color: var(--color-text-faint);
   background: var(--color-surface);
   white-space: nowrap;
 }
 
 .statusOn {
   color: var(--color-success);
-  border-color: color-mix(in srgb, var(--color-success) 30%, transparent);
   background: var(--color-success-soft);
 }
 
 .statusWarn {
   color: var(--color-warning);
-  border-color: color-mix(in srgb, var(--color-warning) 30%, transparent);
   background: var(--color-warning-soft);
 }
 
@@ -216,10 +351,10 @@
 .pillDanger {
   display: inline-flex;
   align-items: center;
-  align-self: flex-start;
-  gap: var(--space-1);
+  justify-content: center;
+  gap: 6px;
   height: 30px;
-  padding: 0 var(--space-3);
+  padding: 0 12px;
   border-radius: var(--radius-full);
   border: var(--border-width) solid var(--color-border-strong);
   background: var(--color-surface-raised);
@@ -228,10 +363,12 @@
   font-weight: var(--weight-medium);
   text-decoration: none;
   white-space: nowrap;
+  cursor: pointer;
   transition:
     transform var(--transition-fast),
     background var(--transition-fast),
-    border-color var(--transition-fast);
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .pill:hover {
@@ -249,14 +386,6 @@
   border-color: var(--color-primary-hover);
 }
 
-/*
- * Destructive, but not shouting about it.
- *
- * `Unlink`, `Remove` and `Revoke` appear on every card on this page, and a
- * red pill on each of them would make red the page's ambient colour — which
- * is precisely what docs/ux.md §2 reserves it against. The danger shows up
- * where it is about to be acted on: on hover and on focus.
- */
 .pillDanger:hover,
 .pillDanger:focus-visible {
   color: var(--color-danger);
@@ -264,44 +393,68 @@
   background: var(--color-danger-muted);
 }
 
-/* A press is felt, not announced. */
 .pill:active:not(:disabled),
 .pillPrimary:active:not(:disabled),
 .pillDanger:active:not(:disabled) {
-  transform: translateY(1px);
+  transform: scale(0.98);
 }
 
 .pill:disabled,
 .pillPrimary:disabled,
 .pillDanger:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
 }
 
-/* ── Empty state: one sentence and the one action ────────────────────── */
+/* ── Empty state ─────────────────────────────────────────────────────── */
 
 .empty {
   display: flex;
-  flex-direction: column;
   align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
   gap: var(--space-3);
-  padding: var(--space-7) var(--space-4);
-  border: var(--border-width) dashed var(--color-border-strong);
+  padding: var(--space-4);
+  border: var(--border-width) solid var(--color-border);
   border-radius: var(--radius-lg);
-  text-align: center;
+  background: var(--color-surface-raised);
 }
 
 .emptyLine {
   margin: 0;
   color: var(--color-text-muted);
-  max-width: 44ch;
+  font-size: var(--text-sm);
 }
 
-/* ── Fields ──────────────────────────────────────────────────────────── */
+/* ── Forms & Inline Creation Bar ─────────────────────────────────────── */
 
 .form {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
+}
+
+.inlineForm {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.inlineForm input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 34px;
+  padding: 0 var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  font-size: var(--text-sm);
+  transition: border-color var(--transition-fast);
+}
+
+.inlineForm input:focus {
+  outline: none;
+  border-color: var(--color-focus-ring);
 }
 
 .fieldRow {
@@ -331,7 +484,7 @@
   background: var(--color-surface);
   color: var(--color-text);
   padding: var(--space-2) var(--space-3);
-  font-size: var(--text-md);
+  font-size: var(--text-sm);
   width: 100%;
   transition:
     border-color var(--transition-fast),
@@ -342,7 +495,7 @@
 .field select:focus,
 .field textarea:focus {
   outline: none;
-  border-color: var(--color-border-strong);
+  border-color: var(--color-focus-ring);
   background: var(--color-surface-raised);
 }
 
@@ -354,23 +507,29 @@
 }
 
 .field textarea::placeholder,
-.field input::placeholder {
+.field input::placeholder,
+.inlineForm input::placeholder {
   color: var(--color-text-faint);
 }
 
 .formActions {
   display: flex;
   align-items: center;
-  gap: var(--space-3);
+  gap: var(--space-2);
 }
 
 .note {
   margin: 0;
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   color: var(--color-text-faint);
 }
 
-/* ── Segmented choice (skill scope, theme) ───────────────────────────── */
+.noteProblem {
+  composes: note;
+  color: var(--color-warning);
+}
+
+/* ── Segmented Control ───────────────────────────────────────────────── */
 
 .segmented {
   display: inline-flex;
@@ -380,6 +539,11 @@
   background: var(--color-surface-sunken);
 }
 
+.segmentedInline {
+  composes: segmented;
+  align-self: flex-start;
+}
+
 .segment {
   display: inline-flex;
   align-items: center;
@@ -387,11 +551,15 @@
   height: 26px;
   border: none;
   background: transparent;
-  border-radius: var(--radius-sm);
-  padding: 0 var(--space-3);
-  font-size: var(--text-sm);
+  border-radius: calc(var(--radius-md) - 2px);
+  padding: 0 10px;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
   color: var(--color-text-muted);
-  transition: color var(--transition-fast);
+  cursor: pointer;
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
 }
 
 .segment:hover {
@@ -401,74 +569,7 @@
 .segmentOn {
   background: var(--color-surface-raised);
   color: var(--color-text);
-  font-weight: var(--weight-medium);
   box-shadow: var(--shadow-sm);
-}
-
-/* ── Drop zone ───────────────────────────────────────────────────────── */
-
-.dropZone {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-6) var(--space-4);
-  border: var(--border-width) dashed var(--color-border-strong);
-  border-radius: var(--radius-lg);
-  text-align: center;
-  color: var(--color-text-muted);
-  transition:
-    border-color var(--transition-fast),
-    background var(--transition-fast);
-}
-
-.dropZoneActive {
-  border-color: var(--color-text);
-  background: var(--color-surface-sunken);
-}
-
-/* ── Feature matrix ──────────────────────────────────────────────────── */
-
-.matrix {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: var(--text-sm);
-}
-
-.matrix th,
-.matrix td {
-  text-align: left;
-  padding: var(--space-2) var(--space-3);
-  border-bottom: var(--border-width) solid var(--color-border);
-  white-space: nowrap;
-}
-
-.matrix thead th {
-  color: var(--color-text-faint);
-  font-size: var(--text-2xs);
-  font-weight: var(--weight-medium);
-  text-transform: uppercase;
-  letter-spacing: var(--tracking-caps);
-}
-
-.matrix tbody th {
-  font-weight: var(--weight-normal);
-  white-space: normal;
-}
-
-.matrix td[data-availability="supported"] {
-  color: var(--color-success);
-}
-
-.matrix td[data-availability="planned"],
-.matrix td[data-availability="phase2"] {
-  color: var(--color-text-muted);
-}
-
-.matrix td[data-availability="disabled"],
-.matrix td[data-availability="harness_limitation"],
-.matrix td[data-availability="not_applicable"] {
-  color: var(--color-text-faint);
 }
 
 /* ── Outliner ────────────────────────────────────────────────────────── */
@@ -480,7 +581,7 @@
   border: var(--border-width) solid var(--color-border);
   border-radius: var(--radius-lg);
   background: var(--color-surface-raised);
-  box-shadow: var(--shadow-card);
+  box-shadow: var(--shadow-sm);
   overflow: hidden;
 }
 
@@ -488,7 +589,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  min-height: 40px;
+  min-height: 38px;
   padding: var(--space-2) var(--space-3);
   border-bottom: var(--border-width) solid var(--color-border);
   min-width: 0;
@@ -526,6 +627,8 @@
 
 .treeTitle {
   min-width: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -533,7 +636,7 @@
 
 .treeSummary {
   color: var(--color-text-faint);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -566,6 +669,10 @@
   background: var(--color-surface-raised);
 }
 
+.iconButtonDanger {
+  composes: iconButton;
+}
+
 .iconButtonDanger:hover {
   color: var(--color-danger);
   border-color: var(--color-danger);
@@ -579,7 +686,7 @@
   background: var(--color-surface-raised);
   color: var(--color-text);
   padding: 2px var(--space-2);
-  font-size: var(--text-md);
+  font-size: var(--text-sm);
 }
 
 /* ── Secret reveal ───────────────────────────────────────────────────── */
@@ -587,6 +694,7 @@
 .secret {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: var(--space-2);
   padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-md);
@@ -596,79 +704,23 @@
 
 .secretValue {
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   overflow-wrap: anywhere;
   min-width: 0;
 }
 
-/* The way out of a refused unlink: the sessions holding the credential open
-   are what has to be archived, and they are not on this page. */
 .sessionsLink {
   align-self: flex-start;
   font-size: var(--text-sm);
-  color: var(--color-primary);
+  color: var(--color-accent);
 }
 
-/* A meta line that has stopped being background: a credential a week from
-   expiring is the one thing on its card worth reading. */
 .metaUrgent {
   color: var(--color-warning);
   font-weight: var(--weight-medium);
 }
 
-@media (max-width: 900px) {
-  .page {
-    padding: var(--space-5) var(--space-4) var(--space-8);
-  }
-}
-
-/* A row that is a fact rather than a choice: a marketplace, listed. It
-   answers nothing when pointed at, so it takes `.row`'s hover back — at
-   the same specificity, or the hover would win. */
-.rowStatic {
-  cursor: default;
-}
-
-.rowStatic:hover:not(:disabled) {
-  border-color: var(--color-border);
-  background: var(--color-surface-raised);
-}
-
-/* A note that is a failure rather than a status: a marketplace flyco
-   cannot read is something to fix or remove. */
-.noteProblem {
-  composes: note;
-  color: var(--color-warning);
-}
-
-/* The same control inside a `.field`, whose column stretches its children:
-   a segmented control is as wide as its segments and no wider. */
-.segmentedInline {
-  composes: segmented;
-  align-self: flex-start;
-}
-
-/* A label above a control that is not an input, so it cannot be a
-   `<label for>`. */
-.fieldLabel {
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
-  color: var(--color-text-muted);
-}
-
-/* An action inside a sentence: "Reading anthropics/skills… Check again". */
-.linkButton {
-  margin-left: var(--space-2);
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: var(--color-text);
-  font: inherit;
-  text-decoration: underline;
-  cursor: pointer;
-}
-
-/* ── Catalog rows (Tools → Add from catalog) ─────────────────────────── */
+/* ── Catalog rows ────────────────────────────────────────────────────── */
 
 .rows {
   list-style: none;
@@ -676,35 +728,48 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-raised);
+  overflow: hidden;
 }
 
-/* A row is the answer to the page's one question, so it is a button the
-   width of the page rather than a card with a button in it. */
+.rows > li {
+  border-bottom: var(--border-width) solid var(--color-border);
+}
+
+.rows > li:last-child {
+  border-bottom: none;
+}
+
 .row {
   display: flex;
   align-items: center;
   gap: var(--space-3);
   width: 100%;
-  padding: var(--space-3) var(--space-4);
-  border: var(--border-width) solid var(--color-border);
-  border-radius: var(--radius-lg);
-  background: var(--color-surface-raised);
+  padding: 10px var(--space-4);
+  border: none;
+  background: transparent;
   color: var(--color-text);
   text-align: left;
   font: inherit;
-  transition:
-    background var(--transition-fast),
-    border-color var(--transition-fast);
+  transition: background var(--transition-fast);
 }
 
 .row:hover:not(:disabled) {
-  border-color: var(--color-border-strong);
-  background: var(--color-surface-sunken);
+  background: var(--color-surface);
 }
 
 .row:disabled {
   opacity: 0.6;
+}
+
+.rowStatic {
+  cursor: default;
+}
+
+.rowStatic:hover:not(:disabled) {
+  background: transparent;
 }
 
 .rowBody {
@@ -716,6 +781,7 @@
 }
 
 .rowTitle {
+  font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -723,7 +789,7 @@
 }
 
 .rowMeta {
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   color: var(--color-text-muted);
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -747,17 +813,17 @@
   border-radius: 999px;
 }
 
-/* The quiet way back, above the page title: a link to the section a flow
-   was opened from, or a button to the flow's previous page. */
 .backLink {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
+  gap: 4px;
   width: fit-content;
-  margin-bottom: var(--space-3);
+  margin-bottom: var(--space-1);
   color: var(--color-text-muted);
   font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
   text-decoration: none;
+  cursor: pointer;
 }
 
 .backLink:hover {
@@ -780,8 +846,8 @@
 
 .breakdownList {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: var(--space-2) var(--space-5);
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-2) var(--space-4);
   margin: 0;
   padding: var(--space-3) 0 0;
   border-top: var(--border-width) solid var(--color-border);
@@ -791,7 +857,7 @@
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: var(--space-3);
+  gap: var(--space-2);
 }
 
 .breakdownLabel {
@@ -802,8 +868,35 @@
 
 .breakdownValue {
   margin: 0;
-  font-family: var(--font-mono);
   font-size: var(--text-xs);
-  color: var(--color-text);
   font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 720px) {
+  .modalDialog {
+    width: calc(100vw - 2 * var(--space-3));
+    height: calc(100dvh - 2 * var(--space-3));
+  }
+
+  .modalShell,
+  .window {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .sidebar {
+    border-right: none;
+    border-bottom: var(--border-width) solid var(--color-border);
+    padding: var(--space-3);
+    gap: var(--space-2);
+  }
+
+  .content,
+  .modalContent {
+    padding: var(--space-4);
+  }
+
+  .page {
+    padding: var(--space-3);
+  }
 }

@@ -91,33 +91,20 @@ export default function Home() {
             <div class={styles.readiness}>
               <Show when={readiness.harness().length === 0}>
                 <A href="/connect/harness" class={styles.readinessCard}>
-                  <Sparkles size={18} aria-hidden="true" />
-                  <span class={styles.readinessText}>
-                    <span class={styles.readinessTitle}>Give it a brain</span>
-                    <span class={styles.readinessDetail}>
-                      Link Claude Code or Codex. Sessions run on your own plan.
-                    </span>
-                  </span>
+                  <Sparkles size={17} aria-hidden="true" />
+                  <span class={styles.readinessTitle}>Connect an agent</span>
                   <span class={styles.readinessAction}>
-                    Connect an agent
+                    Link
                     <ChevronRight size={14} aria-hidden="true" />
                   </span>
                 </A>
               </Show>
               <Show when={readiness.compute().length === 0}>
                 <A href="/connect/compute" class={styles.readinessCard}>
-                  <Cpu size={18} aria-hidden="true" />
-                  <span class={styles.readinessText}>
-                    <span class={styles.readinessTitle}>
-                      Give it a computer
-                    </span>
-                    <span class={styles.readinessDetail}>
-                      Link Azure, AWS, Google Cloud or a machine you own. The
-                      machine stays yours.
-                    </span>
-                  </span>
+                  <Cpu size={17} aria-hidden="true" />
+                  <span class={styles.readinessTitle}>Add compute</span>
                   <span class={styles.readinessAction}>
-                    Add compute
+                    Link
                     <ChevronRight size={14} aria-hidden="true" />
                   </span>
                 </A>

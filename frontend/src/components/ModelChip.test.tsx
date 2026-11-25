@@ -54,7 +54,7 @@ describe("ModelChip", () => {
   });
 
   it("opens on the chosen model's effort rail, the list behind it", async () => {
-    const { getByRole, findByRole, queryByRole, findByText } = render(() => (
+    const { getByRole, findByRole, queryByRole } = render(() => (
       <ModelChip
         models={CODEX}
         choice={{ model: "gpt-5.6-terra", effort: "high" }}
@@ -68,7 +68,9 @@ describe("ModelChip", () => {
     expect(slider).toHaveAttribute("max", "5");
     expect(slider).toHaveValue("2");
     expect(slider).toHaveAttribute("aria-valuetext", "High");
-    expect(await findByText("GPT-5.6-Terra")).toBeInTheDocument();
+    expect(await findByRole("button", { name: "Choose a model" })).toHaveTextContent(
+      "GPT-5.6-Terra",
+    );
     expect(queryByRole("option")).not.toBeInTheDocument();
   });
 

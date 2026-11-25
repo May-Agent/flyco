@@ -112,8 +112,8 @@ export default function McpServerForm(props: McpServerFormProps) {
             {/* Short enough to read whole: the select is half of a 560px
                 dialog, and `stdio (a process on the machine)` lost its
                 closing paren behind the chevron. */}
-            <option value="stdio">stdio · runs on the machine</option>
-            <option value="http">http · a remote endpoint</option>
+            <option value="stdio">stdio (local process)</option>
+            <option value="http">http (remote endpoint)</option>
           </select>
         </div>
       </div>

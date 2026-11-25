@@ -47,10 +47,11 @@ export default function HarnessUsage(props: HarnessUsageProps) {
   const waited = () => {
     const from = limitedAt();
     const to = resetsAt();
-    if (from === null || to === null || to <= from) {
+    const nowSec = Math.floor(now / 1000);
+    if (from === null || to === null || to <= from || nowSec >= to) {
       return undefined;
     }
-    return (Math.floor(now / 1000) - from) / (to - from);
+    return (nowSec - from) / (to - from);
   };
 
   return (

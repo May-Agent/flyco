@@ -40,31 +40,23 @@ import {
   ARCHITECTURE_LABEL,
   FORM_LABEL,
   FORM_NOUN,
-  FORM_PLURAL,
   FORM_TITLE,
   MACHINE_FORMS,
   OS_LABEL,
   billingMinimum,
   billingMinimumSentence,
+  capacityLabel,
   detentLabel,
-  priceLabel,
   entryKey,
+  entryName,
   formOf,
+  priceLabel,
   type MachineForm,
 } from "../lib/machines";
 import styles from "./MachineSlider.module.css";
 
 /** The first segment, which is flyco keeping the choice. */
 const AUTO_NAME = "Auto";
-
-/**
- * What the leftmost detent is called.
- *
- * The track is one form's machines ordered by price, so its left end is
- * the cheapest thing the form offers — flyco choosing is a position on the
- * form row above, never a detent.
- */
-const CHEAPEST_NAME = "Cheapest";
 
 /**
  * A dimension the `Advanced` disclosure lets the user change.
@@ -221,9 +213,6 @@ export default function MachineSlider(props: MachineSliderProps) {
     return index < 0 ? 0 : index;
   });
 
-  /** The rightmost position, which is the last detent. */
-  const lastPosition = createMemo(() => Math.max(0, detents().length - 1));
-
   const selected = createMemo<MachineCatalogEntry | undefined>(() => detents()[position()]);
 
   /**
@@ -243,12 +232,7 @@ export default function MachineSlider(props: MachineSliderProps) {
     }
   });
 
-  /** How far along the track the thumb is, which the reading rides on too. */
-  const travelled = createMemo(() =>
-    lastPosition() === 0 ? "0%" : `${(position() / lastPosition()) * 100}%`,
-  );
-
-  /** The name over the thumb. */
+  /** Accessible readout for the range input. */
   const reading = createMemo(() => {
     const entry = selected();
     return entry === undefined ? "" : detentLabel(entry);
@@ -451,8 +435,13 @@ export default function MachineSlider(props: MachineSliderProps) {
           >
             {(automatic) => (
               <div class={styles.auto}>
-                <p class={styles.autoPick}>{detentLabel(automatic().entry)}</p>
-                <p class={styles.note}>{priceLabel(automatic().entry, props.spot)}</p>
+                <div class={styles.readoutHead}>
+                  <span class={styles.machine}>{entryName(automatic().entry)}</span>
+                  <Show when={capacityLabel(automatic().entry)}>
+                    {(cap) => <span class={styles.capacity}>{cap()}</span>}
+                  </Show>
+                  <span class={styles.rate}>{priceLabel(automatic().entry, props.spot)}</span>
+                </div>
                 <Show when={spotOffered() && props.onSpot}>
                   {(onSpot) => (
                     <label class={styles.toggleRow}>
@@ -470,14 +459,54 @@ export default function MachineSlider(props: MachineSliderProps) {
           </Show>
         }
       >
-        {(form) => (
+        {(_form) => (
           <>
-          {/*
-            Only the dimensions the caller can act on: a filter whose change
-            the request cannot carry is a control that lies. Each select is
-            scoped to the chosen form — an account that offers no codespace
-            is not an answer to "which account's codespaces".
-          */}
+          <Show when={detents().length > 0} fallback={<p class={styles.empty}>{emptyNotice()}</p>}>
+            <div class={styles.control}>
+              <Show when={selected()}>
+                {(entry) => (
+                  <div class={styles.readoutCenter}>
+                    <div class={styles.readoutTitleRow}>
+                      <span class={styles.machineAccent}>{entryName(entry())}</span>
+                      <Show when={bound()}>
+                        <span class={styles.badge}>
+                          <AlertTriangle size={12} aria-hidden="true" />
+                          License-bound
+                        </span>
+                      </Show>
+                    </div>
+                    <div class={styles.readoutMetaRow}>
+                      <Show when={capacityLabel(entry())}>
+                        {(cap) => <span class={styles.capacity}>{cap()}</span>}
+                      </Show>
+                      <Show when={!bound()}>
+                        <span class={styles.rate}>{priceLabel(entry(), props.spot)}</span>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </Show>
+
+              <Detents
+                count={detents().length}
+                position={position()}
+                ariaLabel="Machine"
+                ariaValueText={reading()}
+                dotClass={(index) => {
+                  const entry = detents()[index];
+                  return entry !== undefined && billingMinimum(entry) !== null
+                    ? styles.dotBound
+                    : undefined;
+                }}
+                onMove={move}
+              />
+
+              <Show when={bound() && note()}>
+                {(warning) => <p class={cx(styles.note, styles.noteBound)}>{warning()}</p>}
+              </Show>
+            </div>
+          </Show>
+
           <Show when={(props.filters ?? ALL_FILTERS).length > 0}>
           <Disclosure summary="Advanced">
             <div class={styles.filters}>
@@ -537,53 +566,6 @@ export default function MachineSlider(props: MachineSliderProps) {
               </Show>
             </div>
           </Disclosure>
-          </Show>
-
-          <Show when={detents().length > 0} fallback={<p class={styles.empty}>{emptyNotice()}</p>}>
-            {/* One number drives the whole control: the thumb's travel, and the
-                reading that rides above it. The reading is carried the same
-                distance and then pulled back by that share of its own width, so
-                it centres on the thumb in the middle and tucks inside the track
-                at either end without measuring anything. */}
-            <div class={styles.control} style={{ "--travelled": travelled() }}>
-              <div class={styles.readingRow}>
-                <div class={styles.readingTravel}>
-                  <p class={styles.reading}>
-                    <span class={styles.machine}>{reading()}</span>
-                    <Show when={bound()}>
-                      <span class={styles.badge}>
-                        <AlertTriangle size={12} aria-hidden="true" />
-                        License-bound
-                      </span>
-                    </Show>
-                  </p>
-                </div>
-              </div>
-
-              <Detents
-                count={detents().length}
-                position={position()}
-                ariaLabel="Machine"
-                ariaValueText={reading()}
-                dotClass={(index) => {
-                  const entry = detents()[index];
-                  return entry !== undefined && billingMinimum(entry) !== null
-                    ? styles.dotBound
-                    : undefined;
-                }}
-                onMove={move}
-              />
-
-              <div class={styles.ends}>
-                <span>{CHEAPEST_NAME}</span>
-                <span>
-                  {detents().length}{" "}
-                  {detents().length === 1 ? FORM_NOUN[form()] : FORM_PLURAL[form()]}
-                </span>
-              </div>
-
-              <p class={cx(styles.note, bound() && styles.noteBound)}>{note()}</p>
-            </div>
           </Show>
           </>
         )}
