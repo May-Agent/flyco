@@ -7354,6 +7354,7 @@ dependencies = [
  "flyco-core",
  "hex",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "shell-escape",
  "thiserror 2.0.21",

@@ -130,6 +130,10 @@ fn a_session_image_is_still_built_by_the_bare_installer() {
         "an argument-less run is the cloud image cloud-init builds: {script}"
     );
     assert!(
+        script.contains("image-runtime)"),
+        "the Containerfile builds the cached base runtime layer via `image-runtime`: {script}"
+    );
+    assert!(
         script.contains(&format!("install_unit {}", UNIT.name)),
         "which installs the session unit: {script}"
     );

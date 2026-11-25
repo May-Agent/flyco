@@ -56,7 +56,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: water-rs/stow@main
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.4
@@ -70,8 +70,7 @@ jobs:
       # The deploy driver. zen-rs/skyzen ships cargo-dist binaries on its
       # releases, so `cargo binstall` downloads a prebuilt `skyzen` in seconds;
       # it falls back to `cargo install` semantics when a release has no
-      # artifacts, so a version predating binaries still works. The rust-cache
-      # binary check ahead skips even the download on warm runs.
+      # artifacts, so a version predating binaries still works.
       - name: Install cargo-binstall
         uses: taiki-e/install-action@v2
         with:

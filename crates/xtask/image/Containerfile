@@ -3,17 +3,17 @@
 # `cargo xtask publish-flycod` with the daemon it carries, so the image, the
 # installer and the binaries in the release bucket are one commit's worth.
 #
-# The build context is the release staging directory: it holds both
-# cross-compiled `flycod` binaries, the installer, and the entrypoint. The
-# binaries are bind-mounted into the install step rather than copied, so
-# neither ends up in a layer of the image.
+# The base runtime layer depends only on `flycod.sh`, so BuildKit's registry
+# cache reuses the entire apt + Bun + harness-CLI layer whenever only `flycod`
+# Rust code changes. The target-architecture `flycod` binary is copied into a
+# separate layer afterwards and verified natively with `flycod --version`.
 FROM ubuntu:24.04
 LABEL org.opencontainers.image.source="https://github.com/May-Agent/flyco"
-ARG TARGETARCH
 RUN --mount=type=bind,source=flycod.sh,target=/tmp/flycod.sh \
-    --mount=type=bind,source=flycod-linux-x86_64,target=/tmp/bin/amd64 \
-    --mount=type=bind,source=flycod-linux-aarch64,target=/tmp/bin/arm64 \
-    sh /tmp/flycod.sh image "/tmp/bin/${TARGETARCH}"
+    sh /tmp/flycod.sh image-runtime
+ARG TARGETARCH
+COPY --chmod=0755 image-bin/${TARGETARCH}/flycod /usr/local/bin/flycod
+RUN /usr/local/bin/flycod --version
 COPY --chmod=0755 flyco-session /usr/local/bin/flyco-session
 # Run the daemon entrypoint as root so it exclusively owns `0600`
 # `/etc/flycod/config.toml` and non-agent-writable managed policy directories,
