@@ -82,31 +82,7 @@ impl Normalizer {
                 }
             }
             SessionEvent::ToolCall(call) => {
-                let call_id = call.tool_call_id.as_str().to_owned();
-                if self.started_tools.insert(call_id.clone()) {
-                    out.events.push(HarnessEvent::ToolStarted {
-                        turn_id: turn_id.to_owned(),
-                        call_id: call_id.clone(),
-                        tool: tool_name(
-                            call.name.as_deref(),
-                            call.title.as_str(),
-                            call.kind.as_ref(),
-                        ),
-                        input: call
-                            .raw_input
-                            .clone()
-                            .unwrap_or_else(|| tool_call_input(call)),
-                    });
-                }
-                if let Some(ok) = call.status.as_ref().and_then(finished)
-                    && self.completed_tools.insert(call_id.clone())
-                {
-                    out.events.push(HarnessEvent::ToolCompleted {
-                        turn_id: turn_id.to_owned(),
-                        call_id,
-                        ok,
-                    });
-                }
+                self.on_tool_call(call, turn_id, &mut out);
             }
             SessionEvent::Plan {
                 plan: Plan::Items(items),
@@ -161,6 +137,40 @@ impl Normalizer {
             | SessionEvent::Other(_) => {}
         }
         out
+    }
+
+    /// Translates one [`ToolCall`] snapshot into `ToolStarted` / `ToolCompleted`
+    /// events, holding `ToolStarted` until substantive detail (or completion)
+    /// arrives so metadata-only pre-updates never lock in a `"tool"` placeholder.
+    fn on_tool_call(&mut self, call: &ToolCall, turn_id: &str, out: &mut Normalized) {
+        let call_id = call.tool_call_id.as_str().to_owned();
+        let done = call.status.as_ref().and_then(finished);
+        if (is_substantive_tool_call(call) || done.is_some())
+            && self.started_tools.insert(call_id.clone())
+        {
+            out.events.push(HarnessEvent::ToolStarted {
+                turn_id: turn_id.to_owned(),
+                call_id: call_id.clone(),
+                tool: tool_name(
+                    call.name.as_deref(),
+                    call.title.as_str(),
+                    call.kind.as_ref(),
+                ),
+                input: call
+                    .raw_input
+                    .clone()
+                    .unwrap_or_else(|| tool_call_input(call)),
+            });
+        }
+        if let Some(ok) = done
+            && self.completed_tools.insert(call_id.clone())
+        {
+            out.events.push(HarnessEvent::ToolCompleted {
+                turn_id: turn_id.to_owned(),
+                call_id,
+                ok,
+            });
+        }
     }
 
     /// Translates a completed [`TurnOutcome`] into the closing turn event plus
@@ -421,6 +431,17 @@ fn block_text(block: &ContentBlock) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+/// Whether a [`ToolCall`] snapshot carries any user-visible detail beyond its
+/// identifier and vendor metadata.
+fn is_substantive_tool_call(call: &ToolCall) -> bool {
+    !call.title.is_empty()
+        || call.name.as_deref().is_some_and(|name| !name.is_empty())
+        || call.kind.is_some()
+        || call.raw_input.is_some()
+        || !call.content.is_empty()
+        || !call.locations.is_empty()
+}
+
 /// What flyco calls the tool a `ToolCall` describes.
 pub(super) fn tool_name(name: Option<&str>, title: &str, kind: Option<&Open<ToolKind>>) -> String {
     if !title.is_empty() {
@@ -546,11 +567,45 @@ pub(super) fn read_model_option(
         && !efforts.is_empty()
     {
         for model in list.iter_mut() {
+            model.label = strip_redundant_effort_from_label(&model.id, &model.label, &efforts);
             model.efforts.clone_from(&efforts);
             model.default_effort.clone_from(&default_effort);
         }
     }
     (models, current)
+}
+
+/// Strips a redundant effort word from a model's display label when the agent
+/// exposes a separate `thought_level` selector (e.g. `"SWE-2.1 Medium"` →
+/// `"SWE-2.1"` so the composer displays `"SWE-2.1 · High"` instead of
+/// `"SWE-2.1 Medium · High"`).
+///
+/// Composite `fusion-*` pairs and legacy `MODEL_*` entries keep their exact
+/// labels untouched.
+fn strip_redundant_effort_from_label(id: &str, label: &str, efforts: &[String]) -> String {
+    if id.starts_with("fusion-") || id.starts_with("MODEL_") {
+        return label.to_owned();
+    }
+    let words: Vec<&str> = label.split_whitespace().collect();
+    if words.len() <= 1 {
+        return label.to_owned();
+    }
+    let mut kept = Vec::with_capacity(words.len());
+    kept.push(words[0]);
+    for &word in &words[1..] {
+        let lower = word.to_ascii_lowercase();
+        let is_effort = efforts
+            .iter()
+            .any(|level| level.eq_ignore_ascii_case(&lower))
+            || matches!(
+                lower.as_str(),
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            );
+        if !is_effort {
+            kept.push(word);
+        }
+    }
+    kept.join(" ")
 }
 
 /// Every selectable value of a [`SelectOptions`], flattened.
@@ -859,5 +914,101 @@ mod tests {
         assert_eq!(usage.memory_files.len(), 1);
         assert_eq!(usage.agents.len(), 1);
         assert_eq!(usage.skills.len(), 1);
+    }
+
+    #[test]
+    fn metadata_only_tool_call_update_does_not_lock_in_placeholder_tool_name() {
+        use aither_acp::domain::{ToolCall, ToolCallId, ToolCallStatus, ToolKind};
+
+        let mut normalizer = Normalizer::default();
+        let state = SessionState::default();
+
+        let judging = ToolCall {
+            tool_call_id: ToolCallId::from("exec:0#abc"),
+            title: String::new(),
+            name: None,
+            kind: None,
+            status: None,
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: None,
+            raw_output: None,
+            capabilities: None,
+            meta: Some(json!({"cognition.ai/judging": true})),
+            extra: BTreeMap::new(),
+        };
+        let first = normalizer.on_event(&SessionEvent::ToolCall(judging), &state, "turn-1");
+        assert!(
+            first.events.is_empty(),
+            "metadata-only pre-update must not emit an empty placeholder ToolStarted"
+        );
+
+        let substantive = ToolCall {
+            tool_call_id: ToolCallId::from("exec:0#abc"),
+            title: "Ran uname".to_owned(),
+            name: None,
+            kind: Some(Open::Known(ToolKind::Execute)),
+            status: Some(Open::Known(ToolCallStatus::InProgress)),
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(json!({"command": "uname -s -m"})),
+            raw_output: None,
+            capabilities: None,
+            meta: None,
+            extra: BTreeMap::new(),
+        };
+        let second = normalizer.on_event(&SessionEvent::ToolCall(substantive), &state, "turn-1");
+        assert_eq!(
+            second.events,
+            [HarnessEvent::ToolStarted {
+                turn_id: "turn-1".to_owned(),
+                call_id: "exec:0#abc".to_owned(),
+                tool: "Ran uname".to_owned(),
+                input: json!({"command": "uname -s -m"}),
+            }]
+        );
+    }
+
+    #[test]
+    fn redundant_effort_words_are_stripped_from_model_labels_when_thought_level_exists() {
+        let efforts = vec![
+            "low".to_owned(),
+            "medium".to_owned(),
+            "high".to_owned(),
+            "xhigh".to_owned(),
+            "max".to_owned(),
+        ];
+        assert_eq!(
+            super::strip_redundant_effort_from_label("swe-2-1-medium", "SWE-2.1 Medium", &efforts),
+            "SWE-2.1"
+        );
+        assert_eq!(
+            super::strip_redundant_effort_from_label(
+                "swe-2-1-low-lightning",
+                "SWE-2.1 Ultrafast Low",
+                &efforts
+            ),
+            "SWE-2.1 Ultrafast"
+        );
+        assert_eq!(
+            super::strip_redundant_effort_from_label(
+                "swe-2-medium-lightning",
+                "SWE-2 Medium Ultrafast",
+                &efforts
+            ),
+            "SWE-2 Ultrafast"
+        );
+        assert_eq!(
+            super::strip_redundant_effort_from_label("glm-5-2-1m", "GLM-5.2 High 1M", &efforts),
+            "GLM-5.2 1M"
+        );
+        assert_eq!(
+            super::strip_redundant_effort_from_label(
+                "fusion-claude-opus-5-high-sidekick-swe-2-medium",
+                "Fusion (Claude Opus 5 High + SWE-2 Medium)",
+                &efforts
+            ),
+            "Fusion (Claude Opus 5 High + SWE-2 Medium)"
+        );
     }
 }

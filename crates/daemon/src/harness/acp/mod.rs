@@ -105,7 +105,7 @@ pub enum AcpError {
         detail: String,
     },
     /// A request to the agent failed.
-    #[error("the ACP agent {context}")]
+    #[error("the ACP agent {context}: {source}")]
     Agent {
         /// What was being asked.
         context: String,
@@ -2241,7 +2241,8 @@ impl Driver {
         respond: oneshot::Sender<PermissionOutcome>,
     ) -> bool {
         let id = ApprovalId::generate();
-        let (tool, input) = permission_tool_and_input(&request);
+        let state = self.session.state();
+        let (tool, input) = permission_tool_and_input(&request, &state);
         self.pending_permissions.insert(
             id,
             PendingPermission {
@@ -2493,27 +2494,108 @@ impl Driver {
     }
 }
 
+/// Resolves tool name and structured input for a [`PermissionSubject::ToolCall`]
+/// request, falling back to `state.tool_calls` and vendor `_meta` fields when
+/// `session/request_permission` sends a bare `toolCallId`.
+fn tool_call_permission(
+    request: &PermissionRequest,
+    subject: &aither_acp::domain::ToolCallSubject,
+    state: &aither_acp::SessionState,
+) -> (String, Value) {
+    let call = &subject.tool_call;
+    let stored = state.tool_calls.get(&call.tool_call_id);
+    let title = call
+        .title
+        .as_option()
+        .map(String::as_str)
+        .filter(|t| !t.is_empty())
+        .or_else(|| stored.map(|s| s.title.as_str()).filter(|t| !t.is_empty()))
+        .unwrap_or(request.title.as_str());
+    let name = call
+        .name
+        .as_option()
+        .map(String::as_str)
+        .filter(|n| !n.is_empty())
+        .or_else(|| {
+            stored
+                .and_then(|s| s.name.as_deref())
+                .filter(|n| !n.is_empty())
+        });
+    let kind = call
+        .kind
+        .as_option()
+        .or_else(|| stored.and_then(|s| s.kind.as_ref()));
+
+    let call_meta = call.meta.as_option();
+    let stored_meta = stored.and_then(|s| s.meta.as_ref());
+    let meta_str = |key: &str| {
+        call_meta
+            .and_then(|m| m.get(key))
+            .or_else(|| stored_meta.and_then(|m| m.get(key)))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let editable_command = meta_str("cognition.ai/editableCommand");
+    let permission_reason = meta_str("cognition.ai/permissionReason")
+        .or_else(|| request.description.as_deref().filter(|s| !s.is_empty()));
+    let permission_rule = meta_str("cognition.ai/permissionRule");
+
+    let mut tool = normalize::tool_name(name, title, kind);
+    if tool == "tool" && editable_command.is_some() {
+        "execute".clone_into(&mut tool);
+    }
+
+    let raw_input = call
+        .raw_input
+        .as_option()
+        .cloned()
+        .or_else(|| stored.and_then(|s| s.raw_input.clone()));
+    let input = raw_input.map_or_else(
+        || {
+            let mut map = serde_json::Map::new();
+            if let Some(cmd) = editable_command {
+                map.insert("command".to_owned(), Value::String(cmd.to_owned()));
+            }
+            if let Some(reason) = permission_reason {
+                map.insert("reason".to_owned(), Value::String(reason.to_owned()));
+            }
+            if let Some(rule) = permission_rule {
+                map.insert("rule".to_owned(), Value::String(rule.to_owned()));
+            }
+            if !title.is_empty() && map.is_empty() {
+                map.insert("title".to_owned(), Value::String(title.to_owned()));
+            }
+            if map.is_empty()
+                && let Some(stored_call) = stored
+                && (!stored_call.content.is_empty() || !stored_call.locations.is_empty())
+            {
+                normalize::tool_call_input(stored_call)
+            } else {
+                Value::Object(map)
+            }
+        },
+        |mut raw| {
+            if let Some(obj) = raw.as_object_mut()
+                && let Some(reason) = permission_reason
+            {
+                obj.entry("reason".to_owned())
+                    .or_insert_with(|| Value::String(reason.to_owned()));
+            }
+            raw
+        },
+    );
+    (tool, input)
+}
+
 /// Extracts a human-readable tool name and structured input payload from an
 /// ACP [`PermissionRequest`].
-fn permission_tool_and_input(request: &PermissionRequest) -> (String, Value) {
+fn permission_tool_and_input(
+    request: &PermissionRequest,
+    state: &aither_acp::SessionState,
+) -> (String, Value) {
     match &request.subject {
         Some(Open::Known(PermissionSubject::ToolCall(subject))) => {
-            let call = &subject.tool_call;
-            let title = call
-                .title
-                .as_option()
-                .map(String::as_str)
-                .filter(|t| !t.is_empty())
-                .unwrap_or(request.title.as_str());
-            let name = call.name.as_option().map(String::as_str);
-            let tool = normalize::tool_name(name, title, call.kind.as_option());
-            let input = call.raw_input.as_option().cloned().unwrap_or_else(|| {
-                json!({
-                    "title": title,
-                    "description": request.description,
-                })
-            });
-            (tool, input)
+            tool_call_permission(request, subject, state)
         }
         Some(Open::Known(PermissionSubject::Command(cmd))) => {
             let tool = if request.title.is_empty() {
@@ -2541,11 +2623,14 @@ fn permission_tool_and_input(request: &PermissionRequest) -> (String, Value) {
             } else {
                 request.title.clone()
             };
-            let input = json!({
-                "title": request.title,
-                "description": request.description,
-            });
-            (tool, input)
+            let mut map = serde_json::Map::new();
+            if !request.title.is_empty() {
+                map.insert("title".to_owned(), Value::String(request.title.clone()));
+            }
+            if let Some(desc) = request.description.as_deref().filter(|s| !s.is_empty()) {
+                map.insert("description".to_owned(), Value::String(desc.to_owned()));
+            }
+            (tool, Value::Object(map))
         }
     }
 }
@@ -2772,5 +2857,87 @@ mod tests {
         assert_eq!(servers.len(), MAX_MOUNT_PAGES);
         client.close().await;
         let _ = task.await;
+    }
+
+    #[test]
+    fn permission_request_resolves_bare_tool_call_from_session_state_and_meta() {
+        use std::collections::BTreeMap;
+
+        use aither_acp::domain::{
+            Open, Patch, PermissionRequest, PermissionSubject, SessionId, ToolCall, ToolCallId,
+            ToolCallSubject, ToolCallUpdate, ToolKind,
+        };
+
+        let mut state = aither_acp::SessionState::default();
+        state.tool_calls.insert(
+            ToolCallId::from("exec:0#1"),
+            ToolCall {
+                tool_call_id: ToolCallId::from("exec:0#1"),
+                title: "Ran rm".to_owned(),
+                name: None,
+                kind: Some(Open::Known(ToolKind::Execute)),
+                status: None,
+                content: Vec::new(),
+                locations: Vec::new(),
+                raw_input: Some(json!({"command": "rm -f /tmp/demo"})),
+                raw_output: None,
+                capabilities: None,
+                meta: None,
+                extra: BTreeMap::new(),
+            },
+        );
+
+        let request = PermissionRequest {
+            session_id: SessionId::from("s1"),
+            title: String::new(),
+            description: None,
+            subject: Some(Open::Known(PermissionSubject::ToolCall(Box::new(
+                ToolCallSubject {
+                    tool_call: ToolCallUpdate {
+                        tool_call_id: ToolCallId::from("exec:0#1"),
+                        title: Patch::Unchanged,
+                        name: Patch::Unchanged,
+                        kind: Patch::Unchanged,
+                        status: Patch::Unchanged,
+                        content: Patch::Unchanged,
+                        locations: Patch::Unchanged,
+                        raw_input: Patch::Unchanged,
+                        raw_output: Patch::Unchanged,
+                        capabilities: Patch::Unchanged,
+                        meta: Patch::Set(json!({
+                            "cognition.ai/editableCommand": "rm -f /tmp/demo",
+                            "cognition.ai/permissionReason": "The automatic review was unavailable."
+                        })),
+                        extra: BTreeMap::new(),
+                    },
+                    meta: None,
+                    extra: BTreeMap::new(),
+                },
+            )))),
+            options: Vec::new(),
+            meta: None,
+            extra: BTreeMap::new(),
+        };
+
+        let (tool, input) = super::permission_tool_and_input(&request, &state);
+        assert_eq!(tool, "Ran rm");
+        assert_eq!(
+            input,
+            json!({
+                "command": "rm -f /tmp/demo",
+                "reason": "The automatic review was unavailable."
+            })
+        );
+
+        let (fallback_tool, fallback_input) =
+            super::permission_tool_and_input(&request, &aither_acp::SessionState::default());
+        assert_eq!(fallback_tool, "execute");
+        assert_eq!(
+            fallback_input,
+            json!({
+                "command": "rm -f /tmp/demo",
+                "reason": "The automatic review was unavailable."
+            })
+        );
     }
 }

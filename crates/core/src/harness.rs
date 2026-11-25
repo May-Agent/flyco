@@ -1220,7 +1220,7 @@ mod tests {
             .find(|model| model.is_default)
             .expect("one default");
         assert_eq!(default.id, "swe-2-1-medium");
-        assert_eq!(default.label, "SWE-2.1 Medium");
+        assert_eq!(default.label, "SWE-2.1");
         assert_eq!(
             default.efforts,
             vec!["low", "medium", "high", "xhigh", "max"]
