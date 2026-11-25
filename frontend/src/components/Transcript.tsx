@@ -3,8 +3,9 @@
  *
  * Everything that happened, in the order it happened: the user's messages
  * as bubbles, the agent's prose as Markdown, its tool calls as one-line
- * rows that expand, the machine being built as a timeline, approvals as
- * action cards, and anything else worth reading as a notice.
+ * rows that expand, the machine being built as a timeline, and anything else
+ * worth reading as a notice. Pending approvals replace the composer instead of
+ * appearing as chat cards here.
  *
  * The whole column is driven by one folded list (src/lib/transcript.ts).
  * Nothing here reaches back into the relay for a second opinion, so a row
@@ -28,7 +29,6 @@ import {
 import Markdown from "./Markdown";
 import { shellOutcomeLabel, shellSucceeded } from "../lib/shell";
 import type { ModelOption, ProvisioningStage } from "../api/wire";
-import { operation, type OperationDetail } from "../lib/approvals";
 import { cx } from "../lib/cx";
 import { formatDuration } from "../lib/duration";
 import { highlightHtml } from "../lib/highlight";
@@ -87,10 +87,6 @@ export interface TranscriptProps {
    * name.
    */
   models: readonly ModelOption[];
-  /** Decides one approval. Absent when there is nothing live to decide against. */
-  onDecide?: ((id: string, decision: "approved" | "denied") => void) | undefined;
-  /** Whether a decision is in flight, which disables both buttons. */
-  deciding?: boolean | undefined;
   /** The instant elapsed times are measured against. */
   now: number;
   /**
@@ -102,9 +98,13 @@ export interface TranscriptProps {
 }
 
 export default function Transcript(props: TranscriptProps) {
+  const visibleItems = createMemo(() =>
+    props.items.filter((item) => item.kind !== "approval"),
+  );
+
   return (
     <ol class={styles.transcript} aria-label="Transcript">
-      <For each={props.items}>
+      <For each={visibleItems()}>
         {(item) => (
           <li class={styles.item} data-kind={item.kind}>
             <Switch>
@@ -180,16 +180,6 @@ export default function Transcript(props: TranscriptProps) {
 
               <Match when={item.kind === "shell" && item}>
                 {(shell) => <ShellBlock shell={shell()} />}
-              </Match>
-
-              <Match when={item.kind === "approval" && item}>
-                {(approval) => (
-                  <ApprovalCard
-                    approval={approval()}
-                    onDecide={props.onDecide}
-                    deciding={props.deciding ?? false}
-                  />
-                )}
               </Match>
 
               <Match when={item.kind === "machine_change" && item}>
@@ -569,93 +559,6 @@ function MachineChangeRow(props: {
         {(price) => <span class={styles.machineChangePrice}>{price()}</span>}
       </Show>
     </p>
-  );
-}
-
-/**
- * Exactly what is being approved.
- *
- * A tool call's arguments are read out one per row — the name of the
- * argument, and the value as it was written — because the value is what the
- * decision is about, and finding a shell command inside pretty-printed JSON
- * is work the reader should not be doing (issue #136). A one-line value
- * sits beside its name; anything that runs over gets a block under it.
- */
-function OperationDetailView(props: { detail: OperationDetail }) {
-  return (
-    <Switch>
-      <Match when={props.detail.kind === "text" && props.detail}>
-        {(detail) => <pre class={styles.approvalDetail}>{detail().text}</pre>}
-      </Match>
-      <Match when={props.detail.kind === "fields" && props.detail}>
-        {(detail) => (
-          <dl class={styles.approvalFields}>
-            <For each={detail().fields}>
-              {(field) => (
-                <div class={styles.approvalField} data-block={field.block}>
-                  <dt class={styles.approvalFieldName}>{field.name}</dt>
-                  <dd class={styles.approvalFieldValue}>
-                    <code>{field.value}</code>
-                  </dd>
-                </div>
-              )}
-            </For>
-          </dl>
-        )}
-      </Match>
-    </Switch>
-  );
-}
-
-/**
- * One approval, inline where it happened (docs/ux.md §9.2).
- *
- * It keeps its place in the transcript after it is decided rather than
- * disappearing: what was approved, and when, is part of the record of the
- * session — and a card that vanished on click would leave the user unsure
- * which button they pressed.
- */
-function ApprovalCard(props: {
-  approval: Extract<TranscriptItem, { kind: "approval" }>;
-  onDecide?: ((id: string, decision: "approved" | "denied") => void) | undefined;
-  deciding: boolean;
-}) {
-  const asked = () => operation(props.approval.payload);
-
-  return (
-    <section class={styles.approval} data-state={props.approval.state} aria-label="Approval">
-      <p class={styles.approvalTitle}>{asked().title}</p>
-      <OperationDetailView detail={asked().detail} />
-      <Show
-        when={props.approval.state === "pending" && props.onDecide}
-        fallback={
-          <p class={styles.approvalDecided}>
-            {props.approval.state === "approved" ? "Approved" : "Denied"}
-          </p>
-        }
-      >
-        {(decide) => (
-          <div class={styles.approvalActions}>
-            <button
-              type="button"
-              class={styles.approve}
-              disabled={props.deciding}
-              onClick={() => decide()(props.approval.id, "approved")}
-            >
-              Approve
-            </button>
-            <button
-              type="button"
-              class={styles.deny}
-              disabled={props.deciding}
-              onClick={() => decide()(props.approval.id, "denied")}
-            >
-              Deny
-            </button>
-          </div>
-        )}
-      </Show>
-    </section>
   );
 }
 

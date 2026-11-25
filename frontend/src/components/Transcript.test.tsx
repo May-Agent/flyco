@@ -238,52 +238,23 @@ describe("Transcript command output", () => {
   });
 });
 
-describe("Transcript approval card", () => {
-  /** One approval, as the room raises it. */
-  function approval(payload: Extract<TranscriptItem, { kind: "approval" }>["payload"]) {
-    const item: TranscriptItem = {
+describe("Transcript approvals", () => {
+  it("omits approval items from the chat stream because pending approvals replace the composer", () => {
+    const { queryByRole, container } = show({
       kind: "approval",
       key: "approval-ap-1",
       id: "ap-1",
-      payload,
-      state: "pending",
-      atUnix: T0,
-    };
-    return item;
-  }
-
-  it("reads a tool call's arguments out, one row each, instead of printing JSON", () => {
-    const { getByRole, getByText, queryByText } = show(
-      approval({
+      payload: {
         kind: "tool_use",
         tool: "Bash",
         input: { command: "git push --force origin fix/flaky-compaction" },
-      }),
-    );
+      },
+      state: "pending",
+      atUnix: T0,
+    });
 
-    const card = getByRole("region", { name: "Approval" });
-    expect(card.textContent).toContain("Run Bash");
-    expect(getByText("command")).toBeInTheDocument();
-    // The command exactly as it would run: no quotes, no braces, no
-    // re-indentation of the text the user is being asked to allow.
-    expect(getByText("git push --force origin fix/flaky-compaction")).toBeInTheDocument();
-    expect(queryByText(/^\{$/)).not.toBeInTheDocument();
-    expect(card.querySelector("dl")).not.toBeNull();
-  });
-
-  it("keeps writing the cards it wrote itself as sentences", () => {
-    const { getByRole } = show(
-      approval({
-        kind: "merge",
-        repo: "lexoliu/flyco",
-        from_branch: "fix/flaky-compaction",
-        into_branch: "dev",
-      }),
-    );
-
-    const card = getByRole("region", { name: "Approval" });
-    expect(card.textContent).toContain("lexoliu/flyco: fix/flaky-compaction → dev");
-    expect(card.querySelector("dl")).toBeNull();
+    expect(queryByRole("region", { name: "Approval" })).toBeNull();
+    expect(container.querySelectorAll("li")).toHaveLength(0);
   });
 });
 

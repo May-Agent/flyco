@@ -1,0 +1,154 @@
+/*
+ * Pending permission prompt occupying the composer slot: same raised surface,
+ * radius, and shadow as `.composer`, accented with the warning border so the
+ * waiting decision stands out immediately without adding a second banner.
+ */
+.prompt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border: var(--border-width) solid color-mix(in srgb, var(--color-warning) 45%, var(--color-border));
+  border-radius: var(--radius-xl);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-raised);
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.icon {
+  flex: none;
+  color: var(--color-warning);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-snug);
+}
+
+.queue {
+  margin-left: auto;
+  color: var(--color-text-muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: var(--space-3);
+  max-height: 220px;
+  overflow: auto;
+  border-radius: var(--radius-md);
+  background: var(--color-surface-sunken);
+}
+
+.field {
+  display: flex;
+  gap: var(--space-3);
+  align-items: baseline;
+}
+
+.field[data-block="true"] {
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.fieldName {
+  flex: none;
+  min-width: 5.5rem;
+  color: var(--color-text-faint);
+  font-size: var(--text-xs);
+}
+
+.fieldValue {
+  margin: 0;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+.field[data-block="true"] .fieldValue {
+  align-self: stretch;
+  white-space: pre-wrap;
+}
+
+.detail {
+  margin: 0;
+  padding: var(--space-3);
+  max-height: 220px;
+  overflow: auto;
+  border-radius: var(--radius-md);
+  background: var(--color-surface-sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.approve,
+.deny {
+  height: 34px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-full);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  cursor: pointer;
+  transition:
+    transform var(--transition-fast),
+    background var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.approve {
+  border: none;
+  background: var(--color-primary);
+  color: var(--color-primary-text);
+}
+
+.approve:hover:not(:disabled) {
+  background: var(--color-primary-hover);
+}
+
+.deny {
+  border: var(--border-width) solid var(--color-border-strong);
+  background: transparent;
+  color: var(--color-text);
+}
+
+.deny:hover:not(:disabled) {
+  border-color: var(--color-text-muted);
+}
+
+.approve:active:not(:disabled),
+.deny:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+.approve:disabled,
+.deny:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .approve:active:not(:disabled),
+  .deny:active:not(:disabled) {
+    transform: none;
+  }
+}

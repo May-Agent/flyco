@@ -185,42 +185,6 @@
 }
 
 /*
- * What makes the pill sticky, and what the transcript passes behind.
- *
- * The pill alone cannot do it: rows scrolling under a rounded pill show in
- * the scroller's top padding above it and in the slivers past its ends,
- * which reads as a banner dropped onto the transcript. The dock is the
- * page's own background across the full measure, and it sticks a padding's
- * worth above the scrollport so that strip is covered too.
- */
-.approvalDock {
-  position: sticky;
-  top: calc(-1 * var(--space-4));
-  z-index: 5;
-  padding-top: var(--space-4);
-  background: var(--color-bg);
-}
-
-/*
- * Amber, sticky, and the only coloured band on the page: while an approval
- * is pending nothing else the agent could do matters (docs/ux.md §9.2).
- */
-.approvalBanner {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin: 0;
-  padding: var(--space-2) var(--space-4);
-  border: var(--border-width) solid color-mix(in srgb, var(--color-warning) 35%, var(--color-border));
-  border-radius: var(--radius-full);
-  background: var(--color-warning-soft);
-  color: var(--color-warning);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  box-shadow: var(--shadow-card);
-}
-
-/*
  * The agent at work, at the foot of the transcript: one breathing dot and
  * one word, in the same quiet grey as `Worked for 8m 23s`, which is what
  * it turns into.
