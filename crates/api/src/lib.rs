@@ -72,6 +72,7 @@ pub mod sessions;
 pub mod skill_catalog;
 pub mod skills;
 pub mod sse;
+pub mod storage_quota;
 pub mod transcripts;
 pub mod turns;
 pub mod turnstile;

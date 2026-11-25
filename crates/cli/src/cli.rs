@@ -56,6 +56,8 @@ pub enum Command {
     },
     /// Linked harness accounts and the verified feature matrix.
     Harnesses,
+    /// Current R2 object storage usage and per-user quota.
+    Storage,
     /// Everything about one session, or the list of them.
     Session {
         /// The session subcommand.

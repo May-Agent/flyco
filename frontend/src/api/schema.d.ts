@@ -3086,6 +3086,9 @@ export interface paths {
          * Stores the uncommitted diff of one checkout of a session about to be archived automatically.
          * @description Stores the uncommitted diff of one checkout of a session about to be
          *     archived automatically.
+         *
+         *     Costs 2 D1 reads (session owner + storage quota check), 1 D1 write
+         *     (storage ledger upsert), and 1 R2 PUT.
          */
         put: operations["flyco_api::app::put_workdir_patch"];
         post?: never;
@@ -3185,6 +3188,29 @@ export interface paths {
          * @description Reports observed usage for each linked harness account.
          */
         get: operations["flyco_api::harness_accounts::llm_usage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/usage/storage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * `GET /v1/usage/storage` — the caller's current R2 storage usage and quota.
+         * @description `GET /v1/usage/storage` — the caller's current R2 storage usage and quota.
+         *
+         *     Costs 2 D1 reads (quota lookup + grouped category sum), 0 writes, 0 KV,
+         *     0 Durable Object calls, 0 R2 calls, 0 subrequests.
+         */
+        get: operations["flyco_api::storage_quota::get_storage_usage"];
         put?: never;
         post?: never;
         delete?: never;
@@ -6836,6 +6862,47 @@ export interface components {
             kind: "capacity_tiers";
             /** @description Tiers in ascending capacity order. */
             tiers: components["schemas"]["StoragePriceTier"][];
+        };
+        /** @description Per-category breakdown of a user's stored R2 objects. */
+        StorageUsageBreakdown: {
+            /**
+             * Format: int64
+             * @description Handoff and local-resume transcript payloads (`handoffs/`).
+             */
+            handoffs_bytes: number;
+            /**
+             * Format: int64
+             * @description Uploaded skill zip bundles (`skills/`).
+             */
+            skills_bytes: number;
+            /**
+             * Format: int64
+             * @description Session transcript JSONL batches (`transcripts/`).
+             */
+            transcripts_bytes: number;
+            /**
+             * Format: int64
+             * @description Uncommitted checkout diff patches (`workdirs/`).
+             */
+            workdir_patches_bytes: number;
+        };
+        /**
+         * @description Response of `GET /v1/usage/storage`: the caller's current R2 storage usage
+         *     and effective per-user quota.
+         */
+        StorageUsageView: {
+            /** @description Breakdown of `used_bytes` by object category. */
+            breakdown: components["schemas"]["StorageUsageBreakdown"];
+            /**
+             * Format: int64
+             * @description Effective storage quota for this user, in bytes.
+             */
+            quota_bytes: number;
+            /**
+             * Format: int64
+             * @description Total bytes currently stored across all user-owned R2 object categories.
+             */
+            used_bytes: number;
         };
         /** @description One stored event, as the catch-up API serves it. */
         StoredEvent: {
@@ -13033,6 +13100,39 @@ export interface operations {
                          */
                         resets_at_unix?: number | null;
                     }[];
+                };
+            };
+        };
+    };
+    "flyco_api::storage_quota::get_storage_usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description Breakdown of `used_bytes` by object category. */
+                        breakdown: components["schemas"]["StorageUsageBreakdown"];
+                        /**
+                         * Format: int64
+                         * @description Effective storage quota for this user, in bytes.
+                         */
+                        quota_bytes: number;
+                        /**
+                         * Format: int64
+                         * @description Total bytes currently stored across all user-owned R2 object categories.
+                         */
+                        used_bytes: number;
+                    };
                 };
             };
         };

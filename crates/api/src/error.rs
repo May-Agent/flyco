@@ -869,6 +869,22 @@ pub enum ApiError {
         limit: u64,
     },
 
+    /// A write to user-owned R2 object storage would exceed the user's
+    /// effective storage quota.
+    #[error(
+        "storage quota exceeded: using {used_bytes} of {quota_bytes} bytes; \
+         writing {incoming_bytes} bytes would exceed the limit",
+        status = StatusCode::PAYLOAD_TOO_LARGE
+    )]
+    StorageQuotaExceeded {
+        /// Bytes currently accounted for this user.
+        used_bytes: u64,
+        /// Effective storage quota for this user, in bytes.
+        quota_bytes: u64,
+        /// Size of the rejected object write, in bytes.
+        incoming_bytes: u64,
+    },
+
     /// A local resume/handoff targeted a different harness than the local
     /// session ran under.
     #[error(
@@ -1758,6 +1774,7 @@ impl ApiError {
             Self::HandoffObjectMissing { .. } => "handoff-object-missing",
             Self::HandoffChecksumMismatch { .. } => "handoff-checksum-mismatch",
             Self::HandoffTooLarge { .. } => "handoff-too-large",
+            Self::StorageQuotaExceeded { .. } => "storage-quota-exceeded",
             Self::HandoffHarnessMismatch { .. } => "handoff-harness-mismatch",
             Self::CliSessionGone => "cli-session-gone",
             Self::CliSessionDenied => "cli-session-denied",

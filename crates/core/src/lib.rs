@@ -126,7 +126,7 @@ pub use swarm::{
 };
 pub use usage::{
     CloudSpend, CloudUsageView, HarnessObservation, LlmUsageView, OBSERVATION_WINDOW_SECONDS,
-    RateLimitObservation,
+    RateLimitObservation, StorageUsageBreakdown, StorageUsageView,
 };
 pub use wire::{
     ApprovalDecision, ApprovalPayload, ClientEvent, ControlToDaemon, DaemonToControl,

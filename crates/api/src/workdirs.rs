@@ -18,7 +18,7 @@ const ROOT: &str = "workdirs";
 /// Media type of a stored `git diff --cached --binary` patch.
 pub const CONTENT_TYPE: &str = "application/octet-stream";
 
-fn key(session: flyco_core::SessionId, dir: &str) -> String {
+pub(crate) fn key(session: flyco_core::SessionId, dir: &str) -> String {
     format!("{ROOT}/{session}/{dir}/uncommitted.patch")
 }
 

@@ -38,7 +38,7 @@ pub const CONTENT_TYPE: &str = "application/octet-stream";
 /// is one whose sender went away.
 pub const HANDOFF_DEADLINE_SECS: u64 = 60 * 60;
 
-fn transcript_key(session: flyco_core::SessionId) -> String {
+pub(crate) fn transcript_key(session: flyco_core::SessionId) -> String {
     format!("{ROOT}/{session}/transcript")
 }
 

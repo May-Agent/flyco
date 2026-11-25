@@ -68,7 +68,7 @@ pub fn is_valid_stream(stream: &str) -> bool {
 }
 
 /// The object key one batch is stored under.
-fn batch_key(session: &str, stream: &str, seq: u64) -> String {
+pub(crate) fn batch_key(session: &str, stream: &str, seq: u64) -> String {
     format!("{ROOT}/{session}/{stream}/{seq:08}.jsonl")
 }
 

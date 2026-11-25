@@ -127,6 +127,8 @@ pub struct AppState {
     pub lobby: LobbyConfig,
     /// Cached linked harness accounts from `GET /v1/harness-accounts`.
     pub harness_accounts: Vec<HarnessAccountView>,
+    /// Current user R2 storage usage and effective quota.
+    pub storage_usage: Option<flyco_core::StorageUsageView>,
     /// Composer text editor.
     pub composer: Composer,
     /// Selected row index inside the live `/` command palette.
@@ -175,6 +177,7 @@ impl AppState {
             session: opts.initial_session.clone().map(SessionTranscript::new),
             lobby,
             harness_accounts: Vec::new(),
+            storage_usage: None,
             composer: Composer::default(),
             palette_selected: 0,
             overlay: None,
@@ -253,6 +256,7 @@ enum BgResult {
         accounts: Option<Vec<HarnessAccountView>>,
         default_machine: Option<MachineDefault>,
         local_repo: Option<(String, String)>,
+        storage_usage: Option<flyco_core::StorageUsageView>,
     },
     ActiveSessions(Outcome<Vec<SessionSummary>>),
     InactiveSessions(Outcome<Vec<SessionSummary>>),
@@ -421,19 +425,30 @@ async fn poll_follow(active: &mut Option<(SessionId, Follow<'_>)>) -> (SessionId
 
 fn spawn_bootstrap(api: Api, tx: mpsc::UnboundedSender<BgResult>) {
     tokio::spawn(async move {
-        let accounts = api
-            .get::<Vec<HarnessAccountView>>("/v1/harness-accounts")
-            .await
-            .ok();
-        let default_machine = api.get::<MachineDefault>("/v1/machines/default").await.ok();
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let local_repo = local_sessions::try_local_repo(&cwd, None, None)
-            .await
-            .map(|r| (r.slug, r.branch));
+        let (accounts, default_machine, storage_usage, local_repo) = tokio::join!(
+            async {
+                api.get::<Vec<HarnessAccountView>>("/v1/harness-accounts")
+                    .await
+                    .ok()
+            },
+            async { api.get::<MachineDefault>("/v1/machines/default").await.ok() },
+            async {
+                api.get::<flyco_core::StorageUsageView>("/v1/usage/storage")
+                    .await
+                    .ok()
+            },
+            async {
+                local_sessions::try_local_repo(&cwd, None, None)
+                    .await
+                    .map(|r| (r.slug, r.branch))
+            },
+        );
         let _ = tx.send(BgResult::Bootstrap {
             accounts,
             default_machine,
             local_repo,
+            storage_usage,
         });
     });
 }
@@ -509,7 +524,11 @@ async fn handle_bg_result<'a>(
             accounts,
             default_machine,
             local_repo,
+            storage_usage,
         } => {
+            if storage_usage.is_some() {
+                app.storage_usage = storage_usage;
+            }
             if let Some(accounts) = accounts {
                 // If the initial harness has no linked account, select the first linked one.
                 if !accounts.iter().any(|a| a.harness == app.lobby.harness)
@@ -1874,6 +1893,16 @@ fn detach_to_lobby(app: &mut AppState, active_follow: &mut Option<(SessionId, Fo
 }
 
 fn push_status_summary(app: &mut AppState) {
+    let storage_info = app.storage_usage.map_or_else(
+        || "unknown".to_owned(),
+        |usage| {
+            format!(
+                "{}/{}",
+                crate::discover::format_bytes(usage.used_bytes),
+                crate::discover::format_bytes(usage.quota_bytes)
+            )
+        },
+    );
     if let Some(session) = &app.session {
         let swarm_info = session.latest_swarm.as_ref().map_or_else(
             || "none".to_owned(),
@@ -1886,7 +1915,7 @@ fn push_status_summary(app: &mut AppState) {
             },
         );
         let summary = format!(
-            "session {}  harness={}  model={}  state={:?}  budget={}/{}  swarm={swarm_info}",
+            "session {}  harness={}  model={}  state={:?}  budget={}/{}  storage={storage_info}  swarm={swarm_info}",
             session.id,
             harness_label(session.harness),
             format_model_choice(&session.model),
@@ -1897,7 +1926,7 @@ fn push_status_summary(app: &mut AppState) {
         app.push_notice(summary);
     } else {
         let summary = format!(
-            "lobby  harness={}  model={}  repo={}  budget={}",
+            "lobby  harness={}  model={}  repo={}  budget={}  storage={storage_info}",
             harness_label(app.lobby.harness),
             app.lobby
                 .model
