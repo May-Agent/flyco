@@ -669,13 +669,15 @@ async fn user_oauth_tokens_and_collaborator_tokens_cannot_bootstrap_a_codespace(
     ));
 
     // User OAuth token (`gho_`), classic PAT (`ghp_`), fine-grained PAT
-    // (`github_pat_`), installation token (`ghs_`), and a collaborator's `ghu_`
-    // token must all be denied without consuming `bootstrap_enc`.
+    // (`github_pat_`), installation token (`ghs_`), an unprefixed legacy OAuth
+    // token with non-empty `X-OAuth-Scopes`, and a collaborator's `ghu_` token
+    // must all be denied without consuming `bootstrap_enc`.
     for disallowed in [
         crate::testing::GITHUB_ACCESS_TOKEN,
         "ghp_classic_pat_token",
         "github_pat_fine_grained_token",
         "ghs_actions_installation_token",
+        crate::testing::LEGACY_OAUTH_GITHUB_TOKEN,
         crate::testing::OTHER_CODESPACE_GITHUB_TOKEN,
     ] {
         let denied = client
@@ -705,6 +707,37 @@ async fn user_oauth_tokens_and_collaborator_tokens_cannot_bootstrap_a_codespace(
         .await;
     legit.assert_status(200);
     assert_eq!(legit.json::<CodespacesBootstrap>().config_toml, CONFIG_TOML);
+}
+
+#[skyzen::test]
+async fn a_codespace_token_with_empty_oauth_scopes_header_bootstraps(
+    ctx: TestContext,
+    _kv: Kv,
+    db: Db,
+) {
+    migrate(&db).await;
+    seed_codespace(&db, true).await;
+    let client = ctx.client(crate::testing::test_router(
+        db.clone(),
+        Queue::new(InMemoryQueue::new()),
+    ));
+
+    // Live GitHub Codespaces `ghu_` tokens return an empty `X-OAuth-Scopes:`
+    // header (`Some([])`) from `GET /user`.
+    let response = client
+        .post(BOOTSTRAP)
+        .bearer(crate::testing::CODESPACE_GITHUB_TOKEN_EMPTY_SCOPES)
+        .json(&flyco_core::CodespacesBootstrapRequest {
+            codespace_name: CODESPACE_NAME.to_owned(),
+        })
+        .send()
+        .await;
+
+    response.assert_status(200);
+    assert_eq!(
+        response.json::<CodespacesBootstrap>().config_toml,
+        CONFIG_TOML
+    );
 }
 
 #[skyzen::test]
