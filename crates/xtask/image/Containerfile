@@ -23,4 +23,7 @@ USER root
 WORKDIR /srv/flyco/work
 ENV HOME=/var/lib/flyco/daemon-home
 ENV PATH=/home/flyco/.bun/bin:/usr/local/bin:/usr/bin:/bin
-ENTRYPOINT ["/usr/local/bin/flyco-session"]
+# Default command runs `flyco-session` for container platforms (ECS, ACI,
+# Cloud Run, Podman hosts) while allowing devcontainer runtimes such as GitHub
+# Codespaces to override `CMD` cleanly via `overrideCommand`.
+CMD ["/usr/local/bin/flyco-session"]

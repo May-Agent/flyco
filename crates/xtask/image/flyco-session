@@ -11,6 +11,9 @@ set -eu
 config=/etc/flycod/config.toml
 
 if [ -z "${FLYCO_DAEMON_CONFIG:-}" ]; then
+  if [ "$#" -gt 0 ]; then
+    exec "$@"
+  fi
   echo "flyco-session: FLYCO_DAEMON_CONFIG is not set; this image is started by the flyco control plane" >&2
   exit 78
 fi
