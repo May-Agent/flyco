@@ -289,21 +289,12 @@ pub struct AcpConfig {
     #[serde(default = "default_model_option")]
     pub model_option: String,
     /// Id of the config option that carries the effort level, where the
-    /// agent keeps one — Codex's `reasoning_effort`. `None` on an agent
-    /// like Devin whose model ids carry the effort; a configured `effort`
-    /// then fails loudly rather than being dropped.
+    /// agent keeps one — Codex's `reasoning_effort`, or Devin and
+    /// Antigravity's `thought_level`. `None` when the agent has no effort
+    /// option; a configured `effort` then fails loudly rather than being
+    /// dropped.
     #[serde(default)]
     pub effort_option: Option<String>,
-    /// Suffixes this agent hangs after the effort word inside a fused
-    /// model id — Devin's `-fast`, `-priority`, `-1m`.
-    ///
-    /// Non-empty marks the agent's ids as effort-fused: a configured
-    /// `effort` is folded back into the model id (before the tail, so
-    /// `gpt-5-6-sol-priority` at `high` sends `gpt-5-6-sol-high-priority`)
-    /// instead of reaching `effort_option`. Empty, the default, leaves
-    /// `effort` to the separate option as usual.
-    #[serde(default)]
-    pub fused_effort_tails: Vec<String>,
     /// Permission mode the session opens under, expressed through
     /// [`modes`](Self::modes).
     pub permission_mode: PermissionMode,

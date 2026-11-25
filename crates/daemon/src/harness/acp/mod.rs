@@ -556,7 +556,6 @@ fn claude_acp_driver_config(claude: &ClaudeConfig) -> AcpConfig {
         effort: claude.effort.clone(),
         model_option: "model".to_owned(),
         effort_option: Some("reasoning_effort".to_owned()),
-        fused_effort_tails: Vec::new(),
         permission_mode: claude.permission_mode,
         modes,
         methods: AcpMethods {
@@ -1240,31 +1239,14 @@ async fn apply_permission_mode(
     Ok(())
 }
 
-/// Folds effort into a fused model id when `fused_effort_tails` is configured.
-fn model_id_to_send(config: &AcpConfig, model: &str, effort: Option<&str>) -> String {
-    let Some(effort) = effort else {
-        return model.to_owned();
-    };
-    for tail in &config.fused_effort_tails {
-        if let Some(stem) = model.strip_suffix(tail.as_str()) {
-            return format!("{stem}-{effort}{tail}");
-        }
-    }
-    if config.fused_effort_tails.is_empty() {
-        return model.to_owned();
-    }
-    format!("{model}-{effort}")
-}
-
 /// Selects the configured model and effort through the session's config options.
 async fn apply_model(session: &ClientSession, config: &AcpConfig) -> Result<(), AcpError> {
     if let Some(model) = &config.model {
-        let id = model_id_to_send(config, model, config.effort.as_deref());
         session
             .set_config(
                 config.model_option.as_str(),
                 ConfigValue::Id(ConfigValueById {
-                    value: id.as_str().into(),
+                    value: model.as_str().into(),
                 }),
             )
             .await
@@ -1275,9 +1257,6 @@ async fn apply_model(session: &ClientSession, config: &AcpConfig) -> Result<(), 
                 ),
                 source,
             })?;
-    }
-    if !config.fused_effort_tails.is_empty() {
-        return Ok(());
     }
     if let Some(effort) = &config.effort {
         let Some(option) = &config.effort_option else {
@@ -2427,12 +2406,11 @@ impl Driver {
     }
 
     async fn apply_model_choice(&mut self, model: ModelChoice) -> Result<(), AcpError> {
-        let id = model_id_to_send(&self.config, &model.model, model.effort.as_deref());
         self.session
             .set_config(
                 self.config.model_option.as_str(),
                 ConfigValue::Id(ConfigValueById {
-                    value: id.as_str().into(),
+                    value: model.model.as_str().into(),
                 }),
             )
             .await
@@ -2443,9 +2421,7 @@ impl Driver {
                 ),
                 source,
             })?;
-        if self.config.fused_effort_tails.is_empty()
-            && let Some(effort) = model.effort
-        {
+        if let Some(effort) = model.effort {
             let Some(option) = &self.config.effort_option else {
                 return Err(AcpError::EffortUnsupported);
             };
