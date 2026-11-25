@@ -285,8 +285,10 @@ async fn verify_bootstrap_token(
     };
 
     // Verify caller identity and token scope:
-    // 1. Classic OAuth tokens and PATs carry `X-OAuth-Scopes` (`scopes: Some`);
-    //    codespace-injected `ghu_` tokens carry none (`scopes: None`).
+    // 1. Classic OAuth tokens and PATs that can read a private repository carry
+    //    non-empty `X-OAuth-Scopes` (`repo`, etc.); codespace-injected `ghu_`
+    //    tokens carry either no `X-OAuth-Scopes` header (`None`) or an empty
+    //    one (`Some([])`).
     // 2. The caller must be the owner of `env_repo`, blocking collaborators or
     //    shared readers of `env_repo` from bootstrapping another user's machine.
     let identity = github
@@ -310,13 +312,17 @@ async fn verify_bootstrap_token(
             }
             other => ApiError::from(other),
         })?;
+    let has_oauth_scopes = identity
+        .scopes
+        .as_ref()
+        .is_some_and(|scopes| !scopes.is_empty());
     let login_matches = identity.user.login.eq_ignore_ascii_case(slug.owner());
-    if identity.scopes.is_some() || !login_matches {
+    if has_oauth_scopes || !login_matches {
         tracing::warn!(
             codespace = codespace_name,
             reason = "identity_mismatch",
             token_kind,
-            has_scopes = identity.scopes.is_some(),
+            has_oauth_scopes,
             scopes_count = identity.scopes.as_ref().map_or(0, Vec::len),
             login_matches,
             "denied codespace bootstrap"
@@ -364,7 +370,7 @@ async fn verify_bootstrap_token(
 ///
 /// Costs 2 D1 reads (machine row + linked account), 1 atomic D1 write
 /// (clearing `machines.bootstrap_enc`), and 2 GitHub subrequests (`GET /user`
-/// to verify owner identity and absence of `X-OAuth-Scopes`, and
+/// to verify owner identity and absence of non-empty `X-OAuth-Scopes`, and
 /// `GET /repos/{env_repo}` to verify private-repository read access).
 ///
 /// The order of the checks is the order the facts arrive: the machine row

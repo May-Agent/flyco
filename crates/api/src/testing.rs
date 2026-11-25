@@ -120,6 +120,15 @@ pub const GITHUB_ACCESS_TOKEN: &str = "gho_test_access_token";
 /// A codespace-injected `GITHUB_TOKEN` belonging to [`GITHUB_LOGIN`].
 pub const CODESPACE_GITHUB_TOKEN: &str = "ghu_test_codespace_token";
 
+/// A codespace-injected `GITHUB_TOKEN` belonging to [`GITHUB_LOGIN`] for which
+/// GitHub returns an empty `X-OAuth-Scopes` header (`Some([])`), matching live
+/// Codespaces `ghu_` responses on `GET /user`.
+pub const CODESPACE_GITHUB_TOKEN_EMPTY_SCOPES: &str = "ghu_test_codespace_empty_scopes";
+
+/// An unprefixed legacy OAuth token belonging to [`GITHUB_LOGIN`] that still
+/// carries non-empty `X-OAuth-Scopes` (`repo`).
+pub const LEGACY_OAUTH_GITHUB_TOKEN: &str = "legacy_unprefixed_oauth_token_with_repo_scope";
+
 /// A codespace-injected `GITHUB_TOKEN` belonging to [`OTHER_LOGIN`] (e.g. a
 /// collaborator on a shared repository).
 pub const OTHER_CODESPACE_GITHUB_TOKEN: &str = "ghu_other_codespace_token";
@@ -621,7 +630,9 @@ impl GithubOauth for TestGithub {
         &self,
         token: &GithubToken,
     ) -> impl Future<Output = Result<crate::github::GithubIdentity, GithubError>> + Send {
-        if token.access_token == CODESPACE_GITHUB_TOKEN {
+        if token.access_token == CODESPACE_GITHUB_TOKEN
+            || token.access_token == CODESPACE_GITHUB_TOKEN_EMPTY_SCOPES
+        {
             return ready(Ok(crate::github::GithubIdentity {
                 user: GithubUser {
                     id: GITHUB_ID,
@@ -631,7 +642,20 @@ impl GithubOauth for TestGithub {
                         name: name.to_owned(),
                     }),
                 },
-                scopes: None,
+                scopes: (token.access_token == CODESPACE_GITHUB_TOKEN_EMPTY_SCOPES).then(Vec::new),
+            }));
+        }
+        if token.access_token == LEGACY_OAUTH_GITHUB_TOKEN {
+            return ready(Ok(crate::github::GithubIdentity {
+                user: GithubUser {
+                    id: GITHUB_ID,
+                    login: GITHUB_LOGIN.to_owned(),
+                    name: Some(GITHUB_NAME.to_owned()),
+                    plan: self.plan.map(|name| crate::github::GithubPlan {
+                        name: name.to_owned(),
+                    }),
+                },
+                scopes: Some(vec!["repo".to_owned()]),
             }));
         }
         if token.access_token == OTHER_CODESPACE_GITHUB_TOKEN {
