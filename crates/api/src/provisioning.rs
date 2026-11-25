@@ -327,6 +327,7 @@ pub async fn destroy_codespace(
 #[derive(Debug, skyzen::FromRow)]
 struct SealedRow {
     id: ProviderAccountId,
+    user_github_id: i64,
     credentials_enc: String,
     resource_group: Option<String>,
     host_id: Option<HostId>,
@@ -372,9 +373,12 @@ pub async fn accounts_for(
     let removed = HostState::Removed;
     let rows: Vec<SealedRow> = sql!(
         db,
-        "SELECT provider_accounts.id, credentials_enc, resource_group, host_id, \
+        "SELECT provider_accounts.id, users.github_id AS user_github_id, \
+         credentials_enc, resource_group, host_id, \
          hosts.state AS host_state, hosts.facts AS host_facts \
-         FROM provider_accounts LEFT JOIN hosts ON hosts.id = provider_accounts.host_id \
+         FROM provider_accounts \
+         JOIN users ON users.id = provider_accounts.user_id \
+         LEFT JOIN hosts ON hosts.id = provider_accounts.host_id \
          WHERE provider_accounts.user_id = {user} AND ({kind} IS NULL OR kind = {kind}) \
          AND provider_accounts.unlinked_at_unix IS NULL \
          AND (host_id IS NULL OR hosts.state != {removed}) \
@@ -384,16 +388,20 @@ pub async fn accounts_for(
     .await?;
 
     let cipher = config.token_cipher();
+    let mut user_grant: Option<crate::github::GithubGrant> = None;
     let mut accounts = Vec::with_capacity(rows.len());
     for row in rows {
         let mut secrets = unseal(&cipher.open(&row.credentials_enc)?)?;
-        renew_codespaces_grant(
+        resolve_codespaces_credentials(
             db,
             config,
             github,
+            user,
+            row.user_github_id,
             row.id,
             &row.credentials_enc,
             &mut secrets,
+            &mut user_grant,
         )
         .await?;
         accounts.push(LinkedAccount {
@@ -428,9 +436,12 @@ pub async fn account(
     // such account to use.
     let row: SealedRow = sql!(
         db,
-        "SELECT provider_accounts.id, credentials_enc, resource_group, host_id, \
+        "SELECT provider_accounts.id, users.github_id AS user_github_id, \
+         credentials_enc, resource_group, host_id, \
          hosts.state AS host_state, hosts.facts AS host_facts \
-         FROM provider_accounts LEFT JOIN hosts ON hosts.id = provider_accounts.host_id \
+         FROM provider_accounts \
+         JOIN users ON users.id = provider_accounts.user_id \
+         LEFT JOIN hosts ON hosts.id = provider_accounts.host_id \
          WHERE provider_accounts.id = {id} AND provider_accounts.user_id = {user} \
          AND provider_accounts.unlinked_at_unix IS NULL"
     )
@@ -439,7 +450,19 @@ pub async fn account(
     .ok_or(ApiError::ProviderAccountNotFound)?;
 
     let mut secrets = unseal(&config.token_cipher().open(&row.credentials_enc)?)?;
-    renew_codespaces_grant(db, config, github, id, &row.credentials_enc, &mut secrets).await?;
+    let mut user_grant = None;
+    resolve_codespaces_credentials(
+        db,
+        config,
+        github,
+        user,
+        row.user_github_id,
+        id,
+        &row.credentials_enc,
+        &mut secrets,
+        &mut user_grant,
+    )
+    .await?;
 
     Ok(LinkedAccount {
         id,
@@ -448,6 +471,71 @@ pub async fn account(
         host: row.host(),
         resource_group: row.resource_group,
     })
+}
+
+/// Supplies the live GitHub grant for a Codespaces provider account.
+///
+/// When `owner_id` matches the signed-in user's own `github_id`, `users` is
+/// the single owner of the grant and its rotating `refresh_token`: any legacy
+/// renewal half still stored on `provider_accounts` is absorbed once into
+/// `users`, and the live grant is read (and renewed when due) through
+/// [`crate::users::github_grant`]. Only a Codespaces account linked for a
+/// *different* GitHub user (`owner_id != user_github_id`) renews its own row.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "resolves either the shared user grant or a separate-owner provider grant in one place"
+)]
+async fn resolve_codespaces_credentials(
+    db: &Db,
+    config: &ApiConfig,
+    github: &impl GithubOauth,
+    user: UserId,
+    user_github_id: i64,
+    account: ProviderAccountId,
+    sealed_enc: &str,
+    secrets: &mut StoredSecrets,
+    cached_user_grant: &mut Option<crate::github::GithubGrant>,
+) -> Result<(), ApiError> {
+    let is_same_owner = matches!(
+        &secrets.credentials,
+        ProviderCredentials::Codespaces { owner_id, .. } if *owner_id == user_github_id
+    );
+    if !is_same_owner {
+        return renew_codespaces_grant(db, config, github, account, sealed_enc, secrets).await;
+    }
+
+    let has_legacy_renewal = matches!(
+        &secrets.credentials,
+        ProviderCredentials::Codespaces {
+            refresh_token,
+            token_expires_at_unix,
+            ..
+        } if refresh_token.is_some() || token_expires_at_unix.is_some()
+    );
+    if has_legacy_renewal {
+        crate::users::absorb_split_codespaces_grants(db, config, user).await?;
+        *cached_user_grant = None;
+    }
+
+    let grant = if let Some(grant) = cached_user_grant {
+        grant.clone()
+    } else {
+        let loaded = crate::users::github_grant(db, config, github, user).await?;
+        *cached_user_grant = Some(loaded.clone());
+        loaded
+    };
+    if let ProviderCredentials::Codespaces {
+        token,
+        refresh_token,
+        token_expires_at_unix,
+        ..
+    } = &mut secrets.credentials
+    {
+        token.clone_from(&grant.token.access_token);
+        refresh_token.clone_from(&grant.refresh_token);
+        *token_expires_at_unix = grant.expires_at_unix;
+    }
+    Ok(())
 }
 
 /// Renews a stored Codespaces grant that is close enough to its end.

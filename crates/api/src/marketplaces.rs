@@ -220,17 +220,27 @@ async fn add(
     // Verify the caller's GitHub account can actually read the repository
     // before storing it or queuing a catalog refresh.
     let token = users::github_token(db, config, github, user).await?;
-    github
-        .get_repo(&token, &repo)
-        .await
-        .map_err(|error| match error {
-            GithubError::Status {
-                call: GithubCall::Repository,
-                status: 401 | 403 | 404,
-                ..
-            } => ApiError::InvalidMarketplace("your GitHub account cannot read this repository"),
-            other => ApiError::from(other),
-        })?;
+    let check = match github.get_repo(&token, &repo).await {
+        Ok(summary) => Ok(summary),
+        Err(first @ GithubError::Status { status: 401, .. }) => {
+            if let Some(fresh) =
+                users::force_renew_github_token(db, config, github, user, &token).await?
+            {
+                github.get_repo(&fresh, &repo).await
+            } else {
+                Err(first)
+            }
+        }
+        Err(other) => Err(other),
+    };
+    check.map_err(|error| match error {
+        GithubError::Status {
+            call: GithubCall::Repository,
+            status: 401 | 403 | 404,
+            ..
+        } => ApiError::InvalidMarketplace("your GitHub account cannot read this repository"),
+        other => ApiError::from(other),
+    })?;
 
     let slug = repo.to_string();
     let row: Option<MarketplaceRow> = sql!(

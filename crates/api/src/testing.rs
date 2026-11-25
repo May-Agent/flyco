@@ -307,6 +307,10 @@ pub struct TestGithub {
     pub public_env_repo: bool,
     /// What the token endpoint answers `exchange_code` and `refresh` with.
     pub grant: GithubGrantShape,
+    /// When set, `GITHUB_ACCESS_TOKEN` is rejected with `HTTP 401` on resource
+    /// calls while `GITHUB_RENEWED_ACCESS_TOKEN` succeeds — exercising forced
+    /// renewal when GitHub invalidates an access token ahead of its local clock.
+    pub reject_initial_access_token: bool,
     /// The files of each repository, by slug: what `read_tree` lists and
     /// `read_file` answers with. A repository not here has no files, which
     /// is the shape a marketplace that is not a marketplace has.
@@ -339,6 +343,7 @@ impl Default for TestGithub {
             unreadable: None,
             public_env_repo: false,
             grant: GithubGrantShape::Lasting,
+            reject_initial_access_token: false,
             files: &[],
         }
     }
@@ -354,6 +359,7 @@ impl TestGithub {
             unreadable: None,
             public_env_repo: false,
             grant: GithubGrantShape::Lasting,
+            reject_initial_access_token: false,
             files: &[],
         }
     }
@@ -367,6 +373,7 @@ impl TestGithub {
             unreadable: None,
             public_env_repo: false,
             grant: GithubGrantShape::Lasting,
+            reject_initial_access_token: false,
             files: &[],
         }
     }
@@ -381,7 +388,18 @@ impl TestGithub {
             unreadable: None,
             public_env_repo: false,
             grant: GithubGrantShape::Renewable,
+            reject_initial_access_token: false,
             files: &[],
+        }
+    }
+
+    /// An expiring, renewable grant whose initial `access_token` GitHub
+    /// already rejects with `401` even before its recorded expiry.
+    #[must_use]
+    pub const fn stale_access_token() -> Self {
+        Self {
+            reject_initial_access_token: true,
+            ..Self::expiring()
         }
     }
 
@@ -395,6 +413,7 @@ impl TestGithub {
             unreadable: None,
             public_env_repo: false,
             grant: GithubGrantShape::RefusedRenewal,
+            reject_initial_access_token: false,
             files: &[],
         }
     }
@@ -518,8 +537,15 @@ impl GithubOauth for TestGithub {
 
     fn list_repos(
         &self,
-        _token: &GithubToken,
+        token: &GithubToken,
     ) -> impl Future<Output = Result<Vec<flyco_core::RepoSummary>, GithubError>> + Send {
+        if self.reject_initial_access_token && token.access_token == GITHUB_ACCESS_TOKEN {
+            return ready(Err(GithubError::Status {
+                call: crate::github::GithubCall::Repositories,
+                status: 401,
+                reason: "Bad credentials".to_owned(),
+            }));
+        }
         ready(Ok(Self::repos()))
     }
 
@@ -531,9 +557,16 @@ impl GithubOauth for TestGithub {
     /// test that opens a session on a repository of its own naming.
     fn get_repo(
         &self,
-        _token: &GithubToken,
+        token: &GithubToken,
         slug: &flyco_core::RepoSlug,
     ) -> impl Future<Output = Result<flyco_core::RepoSummary, GithubError>> + Send {
+        if self.reject_initial_access_token && token.access_token == GITHUB_ACCESS_TOKEN {
+            return ready(Err(GithubError::Status {
+                call: crate::github::GithubCall::Repository,
+                status: 401,
+                reason: "Bad credentials".to_owned(),
+            }));
+        }
         if self.unreadable == Some(slug.as_str()) {
             return ready(Err(GithubError::Status {
                 call: crate::github::GithubCall::Repository,

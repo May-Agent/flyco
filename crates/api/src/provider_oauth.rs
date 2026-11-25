@@ -1182,6 +1182,22 @@ async fn finish_codespaces(
         ));
     };
 
+    let mut grant = GithubGrant {
+        token: GithubToken {
+            access_token: token,
+        },
+        refresh_token,
+        expires_at_unix: token_expires_at_unix,
+    };
+    if users::github_id(db, user).await? == Some(owner_id) {
+        // Authorizing the signed-in user's own GitHub account (e.g. to widen
+        // scopes) updates the single grant on `users` rather than creating a
+        // competing rotation stream in `provider_accounts`.
+        users::store_github_grant(db, config, user, &grant).await?;
+        grant.refresh_token = None;
+        grant.expires_at_unix = None;
+    }
+
     let view = link_codespaces_account(
         config,
         codespaces,
@@ -1191,13 +1207,7 @@ async fn finish_codespaces(
         queue,
         user,
         &attempt.account,
-        GithubGrant {
-            token: GithubToken {
-                access_token: token,
-            },
-            refresh_token,
-            expires_at_unix: token_expires_at_unix,
-        },
+        grant,
         owner_id,
         included_core_hours,
     )
@@ -1253,13 +1263,26 @@ async fn link_codespaces(
     queue: &Queue,
     user: UserId,
 ) -> Result<ProviderAccountView, ApiError> {
-    let grant = users::github_grant(db, config, github, user).await?;
-    let identity = github.current_user(&grant.token).await?;
+    let (identity, mut grant) =
+        users::with_github_token(db, config, github, user, |token| async move {
+            let identity = github.current_user(&token).await?;
+            Ok((
+                identity,
+                GithubGrant {
+                    token,
+                    refresh_token: None,
+                    expires_at_unix: None,
+                },
+            ))
+        })
+        .await?;
     for scope in [REPO_SCOPE, CODESPACE_SCOPE] {
         if !identity.grants_scope(scope) {
             return Err(ApiError::GithubScopeMissing { scope });
         }
     }
+    grant.refresh_token = None;
+    grant.expires_at_unix = None;
     link_codespaces_account(
         config,
         codespaces,

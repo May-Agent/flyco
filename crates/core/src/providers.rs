@@ -69,11 +69,12 @@ pub enum ProviderCredentials {
     },
     /// A GitHub account, for Codespaces.
     ///
-    /// The token is the user's own OAuth access token, granted `repo` and
-    /// `codespace` by the link sign-in — the same credential flyco stores
-    /// against the user record, kept here as well because a linked account
-    /// must carry everything its driver needs and the user's own token is
-    /// what the Codespaces API is called with.
+    /// When `owner_id` matches the signed-in flyco user's own GitHub account,
+    /// `users` is the single owner of the OAuth grant and its rotating
+    /// `refresh_token` (`refresh_token` and `token_expires_at_unix` stay
+    /// `None` at rest on the provider row, and provisioning loads the live
+    /// grant from `users`). A separate `owner_id` linked via OAuth carries and
+    /// renews its own grant here.
     Codespaces {
         /// The account's OAuth access token.
         token: String,
