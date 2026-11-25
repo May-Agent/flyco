@@ -237,6 +237,129 @@ fn is_disallowed_bootstrap_token(token: &str) -> bool {
         || token.starts_with("ghs_")
 }
 
+/// Fixed non-secret classification of a presented GitHub token prefix for
+/// structured denial logs.
+fn token_prefix_kind(token: &str) -> &'static str {
+    if token.starts_with("ghu_") {
+        "ghu"
+    } else if token.starts_with("gho_") {
+        "gho"
+    } else if token.starts_with("ghp_") {
+        "ghp"
+    } else if token.starts_with("github_pat_") {
+        "github_pat"
+    } else if token.starts_with("ghs_") {
+        "ghs"
+    } else {
+        "other"
+    }
+}
+
+async fn verify_bootstrap_token(
+    github: &GithubClient,
+    access_token: &str,
+    account_token: &str,
+    slug: &RepoSlug,
+    codespace_name: &str,
+) -> Result<GithubToken, ApiError> {
+    let token_kind = token_prefix_kind(access_token);
+
+    // Reject classic OAuth tokens (including the linked account's own token
+    // and sibling sessions' `github.token` values) and PATs before calling
+    // GitHub: a codespace's injected `GITHUB_TOKEN` is a codespace-scoped
+    // user-to-server token, never a user OAuth credential.
+    let matches_account_token = access_token == account_token;
+    if is_disallowed_bootstrap_token(access_token) || matches_account_token {
+        tracing::warn!(
+            codespace = codespace_name,
+            reason = "disallowed_token",
+            token_kind,
+            matches_account_token,
+            "denied codespace bootstrap"
+        );
+        return Err(ApiError::CodespacesBootstrapDenied);
+    }
+
+    let presented = GithubToken {
+        access_token: access_token.to_owned(),
+    };
+
+    // Verify caller identity and token scope:
+    // 1. Classic OAuth tokens and PATs carry `X-OAuth-Scopes` (`scopes: Some`);
+    //    codespace-injected `ghu_` tokens carry none (`scopes: None`).
+    // 2. The caller must be the owner of `env_repo`, blocking collaborators or
+    //    shared readers of `env_repo` from bootstrapping another user's machine.
+    let identity = github
+        .current_user(&presented)
+        .await
+        .map_err(|error| match error {
+            GithubError::Status {
+                call: GithubCall::UserProfile,
+                status: status @ (401 | 403 | 404),
+                reason,
+            } => {
+                tracing::warn!(
+                    codespace = codespace_name,
+                    reason = "current_user_status",
+                    token_kind,
+                    status,
+                    github_reason = %reason,
+                    "denied codespace bootstrap"
+                );
+                ApiError::CodespacesBootstrapDenied
+            }
+            other => ApiError::from(other),
+        })?;
+    let login_matches = identity.user.login.eq_ignore_ascii_case(slug.owner());
+    if identity.scopes.is_some() || !login_matches {
+        tracing::warn!(
+            codespace = codespace_name,
+            reason = "identity_mismatch",
+            token_kind,
+            has_scopes = identity.scopes.is_some(),
+            scopes_count = identity.scopes.as_ref().map_or(0, Vec::len),
+            login_matches,
+            "denied codespace bootstrap"
+        );
+        return Err(ApiError::CodespacesBootstrapDenied);
+    }
+
+    // Verify the presented token can read the private environment repository
+    // this account provisions on, and that the repository is still private.
+    let repo = github
+        .get_repo(&presented, slug)
+        .await
+        .map_err(|error| match error {
+            GithubError::Status {
+                call: GithubCall::Repository,
+                status: status @ (401 | 403 | 404),
+                reason,
+            } => {
+                tracing::warn!(
+                    codespace = codespace_name,
+                    reason = "get_repo_status",
+                    token_kind,
+                    status,
+                    github_reason = %reason,
+                    "denied codespace bootstrap"
+                );
+                ApiError::CodespacesBootstrapDenied
+            }
+            other => ApiError::from(other),
+        })?;
+    if !repo.private {
+        tracing::warn!(
+            codespace = codespace_name,
+            reason = "env_repo_public",
+            token_kind,
+            "denied codespace bootstrap"
+        );
+        return Err(ApiError::CodespacesBootstrapDenied);
+    }
+
+    Ok(presented)
+}
+
 /// Answers the bootstrap call.
 ///
 /// Costs 2 D1 reads (machine row + linked account), 1 atomic D1 write
@@ -268,7 +391,14 @@ async fn serve(
     let account = provisioning::account(db, config, github, row.user, row.account)
         .await
         .map_err(|error| match error {
-            ApiError::ProviderAccountNotFound => ApiError::CodespacesBootstrapDenied,
+            ApiError::ProviderAccountNotFound => {
+                tracing::warn!(
+                    codespace = codespace_name,
+                    reason = "account_not_found",
+                    "denied codespace bootstrap"
+                );
+                ApiError::CodespacesBootstrapDenied
+            }
             other => other,
         })?;
     let ProviderCredentials::Codespaces {
@@ -285,54 +415,8 @@ async fn serve(
         ApiError::CorruptRecord("this account's environment repository is not owner/name")
     })?;
 
-    // Reject classic OAuth tokens (including the linked account's own token
-    // and sibling sessions' `github.token` values) and PATs before calling
-    // GitHub: a codespace's injected `GITHUB_TOKEN` is a codespace-scoped
-    // user-to-server token, never a user OAuth credential.
-    if is_disallowed_bootstrap_token(access_token) || access_token == account_token.as_str() {
-        return Err(ApiError::CodespacesBootstrapDenied);
-    }
-
-    let presented = GithubToken {
-        access_token: access_token.to_owned(),
-    };
-
-    // Verify caller identity and token scope:
-    // 1. Classic OAuth tokens and PATs carry `X-OAuth-Scopes` (`scopes: Some`);
-    //    codespace-injected `ghu_` tokens carry none (`scopes: None`).
-    // 2. The caller must be the owner of `env_repo`, blocking collaborators or
-    //    shared readers of `env_repo` from bootstrapping another user's machine.
-    let identity = github
-        .current_user(&presented)
-        .await
-        .map_err(|error| match error {
-            GithubError::Status {
-                call: GithubCall::UserProfile,
-                status: 401 | 403 | 404,
-                ..
-            } => ApiError::CodespacesBootstrapDenied,
-            other => ApiError::from(other),
-        })?;
-    if identity.scopes.is_some() || !identity.user.login.eq_ignore_ascii_case(slug.owner()) {
-        return Err(ApiError::CodespacesBootstrapDenied);
-    }
-
-    // Verify the presented token can read the private environment repository
-    // this account provisions on, and that the repository is still private.
-    let repo = github
-        .get_repo(&presented, &slug)
-        .await
-        .map_err(|error| match error {
-            GithubError::Status {
-                call: GithubCall::Repository,
-                status: 401 | 403 | 404,
-                ..
-            } => ApiError::CodespacesBootstrapDenied,
-            other => ApiError::from(other),
-        })?;
-    if !repo.private {
-        return Err(ApiError::CodespacesBootstrapDenied);
-    }
+    let _presented =
+        verify_bootstrap_token(github, access_token, account_token, &slug, codespace_name).await?;
 
     let Some(sealed) = row.bootstrap_enc else {
         return Err(ApiError::MachineNotReady);
