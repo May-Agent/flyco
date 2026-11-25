@@ -396,10 +396,6 @@ struct Devcontainer<'a> {
     /// into it: which deployment's control plane to ask for its
     /// configuration.
     container_env: DevcontainerEnv<'a>,
-    /// Clears the session image's `ENTRYPOINT` (`flyco-session`, which expects
-    /// `FLYCO_DAEMON_CONFIG`) so the devcontainer runtime's default sleep loop
-    /// runs as PID 1 and `postStartCommand` can bootstrap `flycod`.
-    run_args: &'static [&'static str],
     /// The entrypoint GitHub runs each time the codespace starts.
     post_start_command: &'static str,
     /// `root`, matching the session image's `USER root` — `flycod codespace`
@@ -431,7 +427,6 @@ pub fn devcontainer_json(control_plane: &str) -> String {
     serde_json::to_string_pretty(&Devcontainer {
         image: &flyco_core::release::session_image_for_wire_protocol(),
         container_env: DevcontainerEnv { control_plane },
-        run_args: &["--entrypoint="],
         post_start_command: "flycod codespace",
         remote_user: "root",
     })
