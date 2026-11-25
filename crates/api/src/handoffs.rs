@@ -139,6 +139,8 @@ pub async fn view_for_daemon(
         ));
     };
     Ok(Some(flyco_core::HandoffView {
+        harness: row.source_harness,
+        session_id: row.harness_session_id,
         base_commit: row.base_commit,
         patch_sha256,
         has_transcript: row.transcript_sha256.is_some(),

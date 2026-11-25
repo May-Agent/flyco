@@ -604,7 +604,7 @@ async fn check_out(
         && let Some(view) = &handoff
         && view.has_transcript
     {
-        materialize_transcript(api).await?;
+        flyco_daemon::handoff::materialize_native_transcript(config, api, view, agent).await?;
     }
     Ok(())
 }
@@ -902,16 +902,24 @@ async fn apply_stored_patch(
         }
     }
     let (envelope_base, patch) = flyco_daemon::git::decode_snapshot(&stored);
-    // A handoff's base is the manifest's provenance; a daemon snapshot's
-    // is the envelope's. A bare patch stored before bases existed applies
-    // onto the clone tip, exactly as it always did.
+    // A handoff's base is the manifest's provenance (empty when no local
+    // working-tree diff is being replayed); a daemon snapshot's is the
+    // envelope's.
     let rewind = handoff
         .map(|view| view.base_commit.as_str())
+        .filter(|commit| !commit.is_empty())
         .or(envelope_base);
     if let Some(commit) = rewind {
         flyco_daemon::git::reset_to(workdir, commit).await?;
     }
     let bytes = patch.len();
+    if bytes == 0 {
+        tracing::info!(
+            workdir = %workdir.display(),
+            "empty stored patch: checkout matches base commit"
+        );
+        return Ok(());
+    }
     flyco_daemon::git::GitWorkdir::new(workdir.to_path_buf())
         .apply(patch)
         .await?;
@@ -919,36 +927,6 @@ async fn apply_stored_patch(
         bytes,
         workdir = %workdir.display(),
         "replayed the work the previous machine stored"
-    );
-    Ok(())
-}
-
-/// Writes a handoff's uploaded transcript where the handoff prompt tells
-/// the agent it is: outside the workdir, at the fixed path the prompt and
-/// [`flyco_core::HANDOFF_TRANSCRIPT_PATH`] agree on.
-async fn materialize_transcript(
-    api: &HttpControlApi,
-) -> Result<(), flyco_daemon::control::WireError> {
-    use flyco_daemon::control::WireError;
-
-    let Some(transcript) = api.get_handoff_transcript().await? else {
-        return Err(WireError::Handoff(
-            "the manifest announces a transcript that is not stored".to_owned(),
-        ));
-    };
-    let path = std::path::Path::new(flyco_core::HANDOFF_TRANSCRIPT_PATH);
-    if let Some(directory) = path.parent() {
-        tokio::fs::create_dir_all(directory)
-            .await
-            .map_err(|error| WireError::Handoff(error.to_string()))?;
-    }
-    tokio::fs::write(path, &transcript)
-        .await
-        .map_err(|error| WireError::Handoff(error.to_string()))?;
-    tracing::info!(
-        bytes = transcript.len(),
-        path = %path.display(),
-        "landed the handed-off transcript"
     );
     Ok(())
 }

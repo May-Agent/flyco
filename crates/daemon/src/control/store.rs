@@ -373,6 +373,56 @@ impl<A: ControlApi + Clone + Send + Sync + 'static> R2TranscriptSync<A> {
         drop(guard);
         Ok(())
     }
+
+    /// Seeds the main Claude transcript stream in object storage when no
+    /// batches exist yet, so a locally resumed session is immediately durable
+    /// across future machine restarts and resizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdkError`] if stream key derivation or any control-plane I/O
+    /// fails.
+    pub async fn seed_if_empty(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        bytes: &[u8],
+    ) -> Result<(), SdkError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let project_key = self.resolve_project_key(cwd);
+        let main_stream = stream_key(&project_key, session_id, None)
+            .map_err(|error| SdkError::Protocol(error.to_string()))?;
+        let existing = self
+            .api
+            .get_transcript(&main_stream)
+            .await
+            .map_err(|error| {
+                SdkError::Protocol(format!(
+                    "transcript read failed for `{main_stream}`: {error}"
+                ))
+            })?;
+        if existing.batches > 0 {
+            return Ok(());
+        }
+        let mut seq = 0_u64;
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let end = next_chunk_end(bytes, offset, MAX_BATCH_BYTES);
+            self.api
+                .put_transcript_batch(&main_stream, seq, bytes[offset..end].to_vec())
+                .await
+                .map_err(|error| {
+                    SdkError::Protocol(format!(
+                        "transcript seed push failed for `{main_stream}`: {error}"
+                    ))
+                })?;
+            seq += 1;
+            offset = end;
+        }
+        Ok(())
+    }
 }
 
 impl<A: ControlApi + Clone + Send + Sync + 'static> TranscriptSync for R2TranscriptSync<A> {

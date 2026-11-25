@@ -54,8 +54,8 @@ pub use catalog::curate;
 pub use env::{EnvDocument, EnvEntry, NETWORK_CONTROL_WARNING, UpdateEnv};
 pub use github::{BranchPage, BranchSummary, RepoSummary};
 pub use handoff::{
-    HANDOFF_DIR, HANDOFF_PATCH_BYTES_MAX, HANDOFF_TRANSCRIPT_BYTES_MAX, HANDOFF_TRANSCRIPT_PATH,
-    HandoffManifest, HandoffView, LocalHandoff, SESSION_WORKDIR, SessionSource,
+    HANDOFF_PATCH_BYTES_MAX, HANDOFF_TRANSCRIPT_BYTES_MAX, HandoffManifest, HandoffView,
+    LocalHandoff, SESSION_WORKDIR, SessionSource,
 };
 pub use harness::{
     Availability, ClaudeOauthStart, CodexOauthPending, CodexOauthStart, CompleteClaudeOauth,

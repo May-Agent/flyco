@@ -869,6 +869,19 @@ pub enum ApiError {
         limit: u64,
     },
 
+    /// A local resume/handoff targeted a different harness than the local
+    /// session ran under.
+    #[error(
+        "cannot resume a {source:?} session on {target:?}: local resume requires the same harness",
+        status = StatusCode::BAD_REQUEST
+    )]
+    HandoffHarnessMismatch {
+        /// The harness the local session ran under.
+        source: flyco_core::HarnessKind,
+        /// The harness requested for the cloud session.
+        target: flyco_core::HarnessKind,
+    },
+
     /// A create under this `Idempotency-Key` is already in flight.
     ///
     /// The claim row has no session bound yet, so the honest answer is a
@@ -1745,6 +1758,7 @@ impl ApiError {
             Self::HandoffObjectMissing { .. } => "handoff-object-missing",
             Self::HandoffChecksumMismatch { .. } => "handoff-checksum-mismatch",
             Self::HandoffTooLarge { .. } => "handoff-too-large",
+            Self::HandoffHarnessMismatch { .. } => "handoff-harness-mismatch",
             Self::CliSessionGone => "cli-session-gone",
             Self::CliSessionDenied => "cli-session-denied",
             Self::CliSessionPollDenied => "cli-session-poll-denied",

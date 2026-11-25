@@ -18,9 +18,10 @@ pub mod cli;
 pub mod client;
 pub mod creds;
 pub mod follow;
-pub mod interactive;
+pub mod local_sessions;
 pub mod out;
 pub mod pick;
+pub mod tui;
 
 pub mod auth;
 pub mod discover;

@@ -282,12 +282,13 @@ async fn start_session(
         SessionClaim::Proceed(claim) => claim,
     };
 
+    let title = opening_title(&resolved.prompt, source.as_ref());
     let session = match sessions::create(
         db,
         user.session_cap,
         sessions::Opening {
             user: user.id,
-            title: &flyco_core::excerpt(&resolved.prompt, MAX_SESSION_TITLE_CHARS),
+            title: &title,
             harness: resolved.harness,
             repos: &resolved.repos,
             machine_origin: resolved.machine_origin,
@@ -310,18 +311,8 @@ async fn start_session(
         claim.record(db, session.summary.id).await?;
     }
     let id = session.summary.id;
-    // The pending-handoff row lands before anything else that could fail:
-    // a session created with a source but no row would sit in `provisioning`
-    // with no route able to complete it.
     if let Some(flyco_core::SessionSource::LocalHandoff(handoff)) = &source {
-        fail_session_on(
-            db,
-            rooms,
-            id,
-            "the session's handoff could not be recorded",
-            handoffs::create_pending(db, id, handoff).await,
-        )
-        .await?;
+        record_pending_handoff(db, rooms, id, handoff).await?;
     }
     let machine = fail_session_on(
         db,
@@ -337,27 +328,27 @@ async fn start_session(
     // asynchronous can go wrong. No daemon exists yet — the room holds it
     // in its mailbox and hands it over on the daemon's first attach.
     //
-    // Both steps fail the session rather than return early: a session row
-    // whose prompt never reached its room, or whose job never reached the
-    // queue, would sit in `provisioning` waiting for something that is never
-    // going to happen.
-    fail_session_on(
-        db,
-        rooms,
-        id,
-        "the session's room would not take its first prompt",
-        rooms
-            .command(
-                db,
-                id,
-                &ControlToDaemon::UserMessage {
-                    text: resolved.prompt,
-                    origin: MessageOrigin::User,
-                },
-            )
-            .await,
-    )
-    .await?;
+    // A native local resume may omit an initial prompt so the cloud harness
+    // loads the previous conversation and waits idle for the next message.
+    if !resolved.prompt.is_empty() {
+        fail_session_on(
+            db,
+            rooms,
+            id,
+            "the session's room would not take its first prompt",
+            rooms
+                .command(
+                    db,
+                    id,
+                    &ControlToDaemon::UserMessage {
+                        text: resolved.prompt,
+                        origin: MessageOrigin::User,
+                    },
+                )
+                .await,
+        )
+        .await?;
+    }
     // A handoff stays out of the queue until `handoff/complete` has
     // verified its patch and transcript in storage; enqueueing here would
     // let the daemon boot a machine against objects still in flight.
@@ -436,6 +427,46 @@ struct ResolvedSession {
     spec: MachineSpec,
 }
 
+/// Derives the initial session title from the prompt or local resume source.
+fn opening_title(prompt: &str, source: Option<&flyco_core::SessionSource>) -> String {
+    if !prompt.is_empty() {
+        return flyco_core::excerpt(prompt, MAX_SESSION_TITLE_CHARS);
+    }
+    match source {
+        Some(flyco_core::SessionSource::LocalHandoff(handoff)) => flyco_core::excerpt(
+            &format!("Resumed {}", handoff.session_id),
+            MAX_SESSION_TITLE_CHARS,
+        ),
+        None => String::new(),
+    }
+}
+
+/// Records the pending handoff row and seeds `sessions.harness_session_id` so
+/// the cloud daemon boots directly into native `session/resume` / `session/load`.
+async fn record_pending_handoff(
+    db: &Db,
+    rooms: &Rooms,
+    id: SessionId,
+    handoff: &flyco_core::LocalHandoff,
+) -> Result<(), ApiError> {
+    fail_session_on(
+        db,
+        rooms,
+        id,
+        "the session's handoff could not be recorded",
+        handoffs::create_pending(db, id, handoff).await,
+    )
+    .await?;
+    fail_session_on(
+        db,
+        rooms,
+        id,
+        "the session's native harness id could not be recorded",
+        sessions::record_harness_session(db, id, &handoff.session_id).await,
+    )
+    .await
+}
+
 /// The resolution half of `start_session`: every check a create request can
 /// fail, done before anything is written.
 ///
@@ -457,8 +488,16 @@ async fn resolve_request(
     kv: &Kv,
     queue: &Queue,
 ) -> Result<ResolvedSession, ApiError> {
+    if let Some(flyco_core::SessionSource::LocalHandoff(ref handoff)) = request.source
+        && handoff.harness != request.harness
+    {
+        return Err(ApiError::HandoffHarnessMismatch {
+            source: handoff.harness,
+            target: request.harness,
+        });
+    }
     let prompt = request.prompt.trim();
-    if prompt.is_empty() {
+    if prompt.is_empty() && request.source.is_none() {
         return Err(ApiError::EmptyMessage);
     }
     let repos = resolve_repos(github, config, db, user, &request.repos).await?;

@@ -4668,11 +4668,16 @@ export interface components {
         /**
          * @description `GET /v1/sessions/{id}/handoff`, daemon-scoped — what the daemon
          *     materializes after cloning, or `404` for a session that was never a
-         *     handoff.
+         *     local resume/handoff.
          */
         HandoffView: {
-            /** @description The commit to check out before applying the stored patch. */
+            /**
+             * @description The commit to check out before applying the stored patch, or empty
+             *     when no local patch needs to be replayed.
+             */
             base_commit: string;
+            /** @description The harness whose native store receives the uploaded transcript payload. */
+            harness: components["schemas"]["HarnessKind"];
             /**
              * @description Whether a transcript object exists for
              *     `GET /v1/sessions/{id}/handoff/transcript` to fetch.
@@ -4683,6 +4688,8 @@ export interface components {
              *     apply` so a corrupt object fails loudly.
              */
             patch_sha256: string;
+            /** @description The harness-native session id being resumed. */
+            session_id: string;
         };
         /**
          * @description A Claude or Codex account the user has linked, as `GET
@@ -5312,30 +5319,25 @@ export interface components {
              */
             resets_at_unix?: number | null;
         };
-        /** @description The provenance a `flyco handoff` create declares. */
+        /** @description The provenance a local native resume declares. */
         LocalHandoff: {
             /**
              * @description The commit the local work was based on — `git merge-base HEAD
-             *     origin/<branch>` — which the cloud checkout rewinds the branch to
-             *     before the patch applies, so the patch reproduces the local tree
-             *     byte-for-byte rather than failing against a moved branch tip.
+             *     origin/<branch>` — or empty when no local working-tree patch is
+             *     being replayed.
              */
             base_commit: string;
             /**
-             * @description Which harness the local session ran under. The cloud session's own
-             *     `harness` may differ — a Claude session handed to Codex is a
-             *     legitimate move — so the source is recorded rather than assumed.
+             * @description Which harness the local session ran under. Must match the cloud
+             *     session's `harness`; cross-harness handoff is rejected.
              */
             harness: components["schemas"]["HarnessKind"];
-            /**
-             * @description The sender's local workdir as an absolute path. Recorded for the
-             *     handoff prompt's path map and for forensics; the daemon never
-             *     materializes it.
-             */
+            /** @description The sender's local workdir as an absolute path, recorded for forensics. */
             local_workdir: string;
             /**
-             * @description The harness-native session id being handed off — Claude's session
-             *     UUID, Codex's rollout/thread id, Devin's session name.
+             * @description The harness-native session id to resume — Claude's session UUID,
+             *     Codex's rollout/thread id, Devin's session id, or Antigravity's
+             *     conversation UUID.
              */
             session_id: string;
         };
@@ -11647,8 +11649,13 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        /** @description The commit to check out before applying the stored patch. */
+                        /**
+                         * @description The commit to check out before applying the stored patch, or empty
+                         *     when no local patch needs to be replayed.
+                         */
                         base_commit: string;
+                        /** @description The harness whose native store receives the uploaded transcript payload. */
+                        harness: components["schemas"]["HarnessKind"];
                         /**
                          * @description Whether a transcript object exists for
                          *     `GET /v1/sessions/{id}/handoff/transcript` to fetch.
@@ -11659,6 +11666,8 @@ export interface operations {
                          *     apply` so a corrupt object fails loudly.
                          */
                         patch_sha256: string;
+                        /** @description The harness-native session id being resumed. */
+                        session_id: string;
                     };
                 };
             };

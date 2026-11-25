@@ -216,9 +216,22 @@ async fn complete_frees_provisioning_and_the_daemon_reads_the_result(
         .send()
         .await
         .json();
+    assert_eq!(view.harness, HarnessKind::Codex);
+    assert_eq!(view.session_id, "rollout-abc");
     assert_eq!(view.base_commit, "deadbeef");
     assert_eq!(view.patch_sha256, hex::encode(Sha256::digest(PATCH)));
     assert!(view.has_transcript);
+    let harness_view: flyco_core::HarnessSessionView = client
+        .get(&format!("/v1/sessions/{session}/harness-session"))
+        .bearer(&daemon)
+        .send()
+        .await
+        .json();
+    assert_eq!(
+        harness_view.harness_session_id.as_deref(),
+        Some("rollout-abc"),
+        "local resume seeds harness_session_id on creation"
+    );
     let body = client
         .get(&format!("/v1/sessions/{session}/handoff/transcript"))
         .bearer(&daemon)
@@ -543,4 +556,64 @@ async fn an_ordinary_session_answers_no_handoff(ctx: TestContext, kv: Kv, db: Db
         .send()
         .await
         .assert_status(404);
+}
+
+#[skyzen::test]
+async fn cross_harness_handoff_is_refused(ctx: TestContext, kv: Kv, db: Db, queue: Queue) {
+    let router = migrated_router_on(&db, queue.clone()).await;
+    let caller = sign_in(&kv, &db, seed_user(&db).await).await;
+    let client = ctx.client(router);
+
+    let response = client
+        .post("/v1/sessions")
+        .bearer(&caller.token)
+        .json(&CreateSession {
+            source: Some(source()),
+            prompt: String::new(),
+            harness: HarnessKind::ClaudeCode,
+            repos: vec![flyco_core::RepoSelection {
+                repo: REPO.to_owned(),
+                branch: None,
+            }],
+            budget_limit: Usd::from_dollars(10),
+            machine: Some(machine_choice(caller.account)),
+            spot: true,
+            model: None,
+            permission_mode: None,
+        })
+        .send()
+        .await;
+    response.assert_status(400);
+    let problem: Problem = response.json();
+    assert!(problem.kind.ends_with("/handoff-harness-mismatch"));
+}
+
+#[skyzen::test]
+async fn local_resume_allows_empty_prompt(ctx: TestContext, kv: Kv, db: Db, queue: Queue) {
+    let router = migrated_router_on(&db, queue.clone()).await;
+    let caller = sign_in(&kv, &db, seed_user(&db).await).await;
+    let client = ctx.client(router);
+
+    let response = client
+        .post("/v1/sessions")
+        .bearer(&caller.token)
+        .json(&CreateSession {
+            source: Some(source()),
+            prompt: String::new(),
+            harness: HarnessKind::Codex,
+            repos: vec![flyco_core::RepoSelection {
+                repo: REPO.to_owned(),
+                branch: None,
+            }],
+            budget_limit: Usd::from_dollars(10),
+            machine: Some(machine_choice(caller.account)),
+            spot: true,
+            model: None,
+            permission_mode: None,
+        })
+        .send()
+        .await;
+    response.assert_status(201);
+    let created: SessionDetail = response.json();
+    assert!(created.summary.title.contains("rollout-abc"));
 }
