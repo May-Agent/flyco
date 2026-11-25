@@ -1040,6 +1040,8 @@ describe("route smoke tests", () => {
 
     const field = getByLabelText("Message the agent");
     expect(field.closest("[inert]")).not.toBeNull();
+    // Stacked above the composer in document flow, never overlaying it.
+    expect(state.compareDocumentPosition(field) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("refuses a shell command while the suspended session's machine is off", async () => {
