@@ -1,19 +1,16 @@
 name: Publish flycod
 
-# Dispatch only. Automatic runs are off across this repository (Lexo,
-# 2026-08-28: private-repo Actions minutes are billing-gated), and a release
+# Dispatch only. Automatic runs are off across this repository, and a release
 # is a deliberate act in any case: publishing a daemon is what every machine
 # provisioned afterwards will run. Trigger with
 # `gh workflow run publish-flycod.yml`, or from the Actions tab.
 #
-# The job runs exactly the same `cargo xtask publish-flycod` a developer runs
-# locally, so there is one implementation of the procedure and this file only
-# supplies the toolchain and the credentials. The installer and its systemd
-# unit are published by that command too, straight out of `crates/xtask/install/`
-# in this checkout, and so is the session container image out of
-# `crates/xtask/image/`, so a release is one commit's worth of daemon,
-# installer and image rather than a build here and a hand upload somewhere
-# else.
+# Each Linux architecture builds natively in parallel (`ubuntu-latest` for
+# `x86_64`, `ubuntu-24.04-arm` for `aarch64`, zero QEMU) using `water-rs/stow`
+# for Rust prebuilt/local caching and GHCR registry layer caching for the
+# container image base runtime. Once both native builds succeed, `publish`
+# assembles the multi-architecture manifest list, uploads the release objects
+# to R2, verifies what the control plane serves, and attests all staged files.
 on:
   workflow_dispatch:
     inputs:
@@ -35,15 +32,85 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# The session image is pushed to this repository's package on ghcr.io with
-# the workflow's own token; nothing else here writes to GitHub.
 permissions:
   contents: read
   packages: write
 
 jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            docker_arch: amd64
+            runner: ubuntu-latest
+          - arch: aarch64
+            docker_arch: arm64
+            runner: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: water-rs/stow@main
+        with:
+          shared-key: publish-flycod
+      # zig is the linker driver that pins glibc 2.31 so the published binary
+      # runs on Ubuntu 20.04+ VMs as well as Ubuntu 24.04 session containers.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - name: Build flycod and push ${{ matrix.docker_arch }} image by digest
+        run: >-
+          cargo xtask publish-flycod
+          --arch ${{ matrix.arch }}
+          --channel ${{ inputs.channel }}
+          ${{ inputs.dry_run && '--dry-run' || '' }}
+          ${{ inputs.allow_wire_mismatch && '--allow-wire-mismatch' || '' }}
+      - name: Upload ${{ matrix.arch }} release binary and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: flycod-${{ matrix.arch }}
+          path: |
+            target/flycod-release/${{ inputs.channel }}/flycod-linux-${{ matrix.arch }}
+            target/flycod-release/${{ inputs.channel }}/flycod-linux-${{ matrix.arch }}.sha256
+          retention-days: 90
+          if-no-files-found: error
+      - name: Upload ${{ matrix.docker_arch }} image digest
+        if: ${{ !inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.docker_arch }}
+          path: target/flycod-release/${{ inputs.channel }}/image-digest-${{ matrix.docker_arch }}.txt
+          retention-days: 1
+          if-no-files-found: error
+      # Reuse the compiled xtask binary in `publish` so the finalize job does
+      # zero Rust compilation.
+      - name: Upload xtask runner binary
+        if: ${{ matrix.arch == 'x86_64' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xtask-runner
+          path: target/debug/xtask
+          retention-days: 1
+          if-no-files-found: error
+
   publish:
-    name: Cross-compile and publish
+    name: Merge manifests and publish
+    needs: build
     runs-on: ubuntu-latest
     # A job-level block replaces the workflow-level one, so the two
     # permissions above are restated beside the attestation pair.
@@ -54,9 +121,6 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v4
-      # The session image is built for both Linux architectures and pushed
-      # as one manifest list; the arm64 half runs under QEMU here.
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -64,32 +128,39 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: dtolnay/rust-toolchain@stable
+      - name: Download release binaries and checksums
+        uses: actions/download-artifact@v4
         with:
-          targets: x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-      # zig is the cross-linker; `cargo-zigbuild` is the cargo wrapper that
-      # drives it and applies the `.2.31` glibc pin. The prebuilt binary
-      # keeps a release from paying a source build of the tool.
-      - uses: mlugg/setup-zig@v2
+          pattern: flycod-*
+          merge-multiple: true
+          path: target/flycod-release/${{ inputs.channel }}
+      - name: Download image digests
+        if: ${{ !inputs.dry_run }}
+        uses: actions/download-artifact@v4
         with:
-          version: 0.15.2
-      - uses: taiki-e/install-action@v2
+          pattern: image-digest-*
+          merge-multiple: true
+          path: target/flycod-release/${{ inputs.channel }}
+      - name: Download xtask runner binary
+        uses: actions/download-artifact@v4
         with:
-          tool: cargo-zigbuild
-      # wrangler performs the six `r2 object put` calls. Installed globally
-      # so it is on PATH under the name the xtask executes.
-      - run: npm install --global wrangler@4
-      - name: cargo xtask publish-flycod
+          name: xtask-runner
+          path: target/debug
+      - run: chmod +x target/debug/xtask
+      # wrangler performs the `r2 object put` calls. Installed globally so it
+      # is on PATH under the name the xtask executes.
+      - if: ${{ !inputs.dry_run }}
+        run: npm install --global wrangler@4
+      - name: Finalize manifests, upload R2 objects, and verify
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: >-
-          cargo xtask publish-flycod
+          ./target/debug/xtask publish-flycod
+          --finalize
           --channel ${{ inputs.channel }}
           ${{ inputs.dry_run && '--dry-run' || '' }}
           ${{ inputs.allow_wire_mismatch && '--allow-wire-mismatch' || '' }}
-      # The xtask builds, stages and uploads in one command, so the
-      # attestation follows it; it covers the staged bytes the upload sent.
       - name: Attest the published objects
         if: ${{ !inputs.dry_run }}
         uses: actions/attest@v4

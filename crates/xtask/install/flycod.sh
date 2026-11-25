@@ -19,7 +19,7 @@ fi
 
 usage() {
   echo "usage: flycod.sh [--asset-base URL] [--control-plane URL]                     set this machine up as a flyco session VM" >&2
-  echo "       flycod.sh [--asset-base URL] [--control-plane URL] image <flycod>      set up a session container image, flycod from a file" >&2
+  echo "       flycod.sh [--asset-base URL] [--control-plane URL] image-runtime       install the session container base runtime without flycod" >&2
   echo "       flycod.sh [--asset-base URL] [--control-plane URL] host enroll <token> enrol this machine as a flyco host" >&2
   exit 64
 }
@@ -132,14 +132,6 @@ install_flycod() {
   download "$binary_base/$artifact?sha256=$expected_sha256" "$scratch/$artifact"
   (cd "$scratch" && sha256sum --check "$artifact.sha256")
   install -m 0755 "$scratch/$artifact" "$install_root/flycod"
-}
-
-# The image build has the binary it just cross-compiled on hand, and no
-# control plane to fetch one from: an image is published *with* the daemon
-# it carries, by the same publish, so downloading here would be downloading
-# the previous release.
-install_flycod_from() {
-  install -m 0755 "$1" "$install_root/flycod"
 }
 
 # One systemd unit, downloaded and installed under its published name.
@@ -314,14 +306,18 @@ EOF
   chmod 0755 "$install_root/npx" "$install_root/node"
 }
 
-verify_session_runtime() {
-  "$install_root/flycod" --version
+verify_session_tools() {
   command -v fish >/dev/null
   runuser -u "$runtime_user" -- env HOME=/home/flyco /home/flyco/.bun/bin/bun --version
   runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/claude" --version
   runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/codex" --version
   runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/devin" --version
   runuser -u "$runtime_user" -- env HOME=/home/flyco "$install_root/agy" --version
+}
+
+verify_session_runtime() {
+  "$install_root/flycod" --version
+  verify_session_tools
 }
 
 install_session() {
@@ -337,16 +333,15 @@ install_session() {
   verify_session_runtime
 }
 
-# A session container image. The daemon binary is a file the image build
-# has on hand, there is no systemd, and the configuration is not on disk
-# yet: the entrypoint writes it at start as the daemon principal (`root`,
-# `0600 /etc/flycod/config.toml`), and `flycod run` drops privileges to the
-# unprivileged `flyco` user whenever spawning harnesses, shells, or PTYs.
-install_image() {
+# Base runtime layer of the session container image: everything a session needs
+# except `flycod` itself, which the Containerfile copies into a later layer so
+# daemon code changes keep this layer cached. There is no systemd and no
+# config.toml yet; the entrypoint writes `0600 /etc/flycod/config.toml` at
+# start as root and `flycod run` drops to `flyco` for harnesses, shells, and PTYs.
+install_image_runtime() {
   install_session_runtime
   install -d -o root -g root -m 0700 /etc/flycod
-  install_flycod_from "$1"
-  verify_session_runtime
+  verify_session_tools
 }
 
 # ── A machine the user owns ──
@@ -405,10 +400,10 @@ install_host() {
 
 case "${1:-}" in
   "") install_session ;;
-  image)
+  image-runtime)
     shift
-    [ -n "${1:-}" ] && [ -f "$1" ] || usage
-    install_image "$1"
+    [ "$#" -eq 0 ] || usage
+    install_image_runtime
     ;;
   host)
     shift

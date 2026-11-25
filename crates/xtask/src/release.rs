@@ -58,6 +58,10 @@ pub const ASSET_DIR: [&str; 3] = ["crates", "xtask", "install"];
 /// One Linux CPU architecture `flycod` is published for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Architecture {
+    /// CLI name of the architecture (`x86_64` or `aarch64`).
+    pub name: &'static str,
+    /// Docker `TARGETARCH` / platform segment (`amd64` or `arm64`).
+    pub docker_arch: &'static str,
     /// The binary and checksum this architecture contributes, named by the
     /// same table the control plane serves from.
     pub published: PublishedBinary,
@@ -72,10 +76,14 @@ pub struct Architecture {
 /// with no architecture here would never be produced.
 pub const ARCHITECTURES: [Architecture; BINARY_COUNT] = [
     Architecture {
+        name: "x86_64",
+        docker_arch: "amd64",
         published: flyco_core::release::X86_64,
         triple: "x86_64-unknown-linux-gnu",
     },
     Architecture {
+        name: "aarch64",
+        docker_arch: "arm64",
         published: flyco_core::release::AARCH64,
         triple: "aarch64-unknown-linux-gnu",
     },
@@ -96,6 +104,80 @@ impl Architecture {
     #[must_use]
     pub fn built_binary(self, target_dir: &Path) -> PathBuf {
         target_dir.join(self.triple).join("release").join(BINARY)
+    }
+
+    /// Docker `--platform` argument for this architecture.
+    #[must_use]
+    pub fn docker_platform(self) -> String {
+        format!("linux/{}", self.docker_arch)
+    }
+
+    /// Path inside the staging directory where the Containerfile copies this
+    /// architecture's `flycod` binary from.
+    #[must_use]
+    pub fn image_bin_path(self, stage_dir: &Path) -> PathBuf {
+        stage_dir
+            .join(IMAGE_BIN_DIR)
+            .join(self.docker_arch)
+            .join(BINARY)
+    }
+
+    /// Registry cache reference for this architecture's `BuildKit` layer cache.
+    #[must_use]
+    pub fn image_cache_ref(self) -> String {
+        format!(
+            "{}:buildcache-{}",
+            flyco_core::release::SESSION_IMAGE,
+            self.docker_arch
+        )
+    }
+
+    /// Path inside the staging directory where `docker buildx build
+    /// --metadata-file` writes its JSON output.
+    #[must_use]
+    pub fn image_metadata_file(self, stage_dir: &Path) -> PathBuf {
+        stage_dir.join(format!("image-metadata-{}.json", self.docker_arch))
+    }
+
+    /// Path inside the staging directory where the per-arch build records the
+    /// pushed image digest (`sha256:...`) for the finalize job.
+    #[must_use]
+    pub fn image_digest_file(self, stage_dir: &Path) -> PathBuf {
+        stage_dir.join(format!("image-digest-{}.txt", self.docker_arch))
+    }
+}
+
+impl fmt::Display for Architecture {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name)
+    }
+}
+
+/// A `--arch` value naming no Linux architecture flyco publishes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown architecture {given:?}; flyco publishes {known}")]
+pub struct UnknownArchitecture {
+    /// What the operator asked for.
+    given: String,
+    /// The architectures that do exist.
+    known: String,
+}
+
+impl FromStr for Architecture {
+    type Err = UnknownArchitecture;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        ARCHITECTURES
+            .into_iter()
+            .find(|arch| arch.name == value || arch.docker_arch == value)
+            .ok_or_else(|| UnknownArchitecture {
+                given: value.to_owned(),
+                known: ARCHITECTURES
+                    .iter()
+                    .map(|arch| arch.name)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            })
     }
 }
 
@@ -407,6 +489,10 @@ impl Release {
     }
 }
 
+/// Subdirectory inside the staging directory holding per-architecture binaries
+/// indexed by Docker `TARGETARCH` (`image-bin/amd64/flycod`, `image-bin/arm64/flycod`).
+pub const IMAGE_BIN_DIR: &str = "image-bin";
+
 /// The Containerfile of the session image, staged beside the binaries.
 pub const CONTAINERFILE: &str = "Containerfile";
 
@@ -441,12 +527,12 @@ pub struct Invocation {
 }
 
 impl Invocation {
-    /// `cargo zigbuild --release -p flyco-daemon --bin flycod --target <a> --target <b>`
+    /// `cargo zigbuild --release -p flyco-daemon --bin flycod --target <a> [--target <b>]`
     ///
-    /// One invocation for both architectures: zigbuild accepts repeated
-    /// `--target`, and cargo then shares one dependency graph between them.
+    /// Builds `flycod` for the requested Linux architectures with the pinned
+    /// glibc version.
     #[must_use]
-    pub fn zigbuild() -> Self {
+    pub fn zigbuild_for(architectures: &[Architecture]) -> Self {
         let mut args = vec![
             "zigbuild".to_owned(),
             "--release".to_owned(),
@@ -455,7 +541,7 @@ impl Invocation {
             "--bin".to_owned(),
             BINARY.to_owned(),
         ];
-        for architecture in ARCHITECTURES {
+        for architecture in architectures {
             args.push("--target".to_owned());
             args.push(architecture.zig_target());
         }
@@ -463,6 +549,15 @@ impl Invocation {
             program: "cargo",
             args,
         }
+    }
+
+    /// `cargo zigbuild --release -p flyco-daemon --bin flycod --target <a> --target <b>`
+    ///
+    /// One invocation for both architectures: zigbuild accepts repeated
+    /// `--target`, and cargo then shares one dependency graph between them.
+    #[must_use]
+    pub fn zigbuild() -> Self {
+        Self::zigbuild_for(&ARCHITECTURES)
     }
 
     /// `wrangler r2 object put <bucket>/<key> --file <path> --content-type <type> --remote`
@@ -554,6 +649,79 @@ impl Invocation {
         }
         args.push(if push { "--push" } else { "--load" }.to_owned());
         args.push(stage_dir.display().to_string());
+        Self {
+            program: "docker",
+            args,
+        }
+    }
+
+    /// Builds one native architecture of the session image using registry layer
+    /// caching.
+    ///
+    /// A real publish pushes the single-architecture image by digest (no tag
+    /// yet) and writes `--metadata-file` so the finalize job can assemble the
+    /// multi-architecture manifest list once every architecture succeeds. A dry
+    /// run loads the built image locally under `tags[0]`.
+    #[must_use]
+    pub fn image_build_arch(
+        architecture: Architecture,
+        stage_dir: &Path,
+        dry_run_tag: Option<&str>,
+    ) -> Self {
+        let cache_ref = architecture.image_cache_ref();
+        let mut args = vec![
+            "buildx".to_owned(),
+            "build".to_owned(),
+            "--file".to_owned(),
+            stage_dir.join(CONTAINERFILE).display().to_string(),
+            "--platform".to_owned(),
+            architecture.docker_platform(),
+            "--cache-from".to_owned(),
+            format!("type=registry,ref={cache_ref}"),
+        ];
+        if let Some(tag) = dry_run_tag {
+            args.push("--tag".to_owned());
+            args.push(tag.to_owned());
+            args.push("--load".to_owned());
+        } else {
+            args.push("--cache-to".to_owned());
+            args.push(format!("type=registry,ref={cache_ref},mode=max"));
+            args.push("--output".to_owned());
+            args.push(format!(
+                "type=image,name={},push-by-digest=true,name-canonical=true,push=true",
+                flyco_core::release::SESSION_IMAGE
+            ));
+            args.push("--metadata-file".to_owned());
+            args.push(
+                architecture
+                    .image_metadata_file(stage_dir)
+                    .display()
+                    .to_string(),
+            );
+        }
+        args.push(stage_dir.display().to_string());
+        Self {
+            program: "docker",
+            args,
+        }
+    }
+
+    /// Merges per-architecture image digests pushed by `image_build_arch` into
+    /// one multi-architecture manifest list tagged with every release tag.
+    #[must_use]
+    pub fn image_merge_manifests(tags: &[String], digests: &[String]) -> Self {
+        let mut args = vec![
+            "buildx".to_owned(),
+            "imagetools".to_owned(),
+            "create".to_owned(),
+        ];
+        for tag in tags {
+            args.push("--tag".to_owned());
+            args.push(tag.clone());
+        }
+        for digest in digests {
+            args.push(format!("{}@{digest}", flyco_core::release::SESSION_IMAGE));
+        }
         Self {
             program: "docker",
             args,
@@ -893,6 +1061,97 @@ mod tests {
         assert_eq!(
             keys.last().map(String::as_str),
             Some("releases/dev/flycod.sh")
+        );
+    }
+
+    #[test]
+    fn an_architecture_parses_and_names_its_docker_metadata() {
+        let x86: super::Architecture = "x86_64".parse().expect("x86_64");
+        let arm: super::Architecture = "aarch64".parse().expect("aarch64");
+        assert_eq!("amd64".parse::<super::Architecture>(), Ok(x86));
+        assert_eq!("arm64".parse::<super::Architecture>(), Ok(arm));
+        assert_eq!(x86.docker_platform(), "linux/amd64");
+        assert_eq!(arm.docker_platform(), "linux/arm64");
+        assert_eq!(
+            x86.image_cache_ref(),
+            "ghcr.io/may-agent/flyco-session:buildcache-amd64"
+        );
+        assert_eq!(
+            arm.image_cache_ref(),
+            "ghcr.io/may-agent/flyco-session:buildcache-arm64"
+        );
+        let stage = Path::new("/tmp/stage");
+        assert_eq!(
+            arm.image_bin_path(stage),
+            PathBuf::from("/tmp/stage/image-bin/arm64/flycod")
+        );
+        assert_eq!(
+            arm.image_digest_file(stage),
+            PathBuf::from("/tmp/stage/image-digest-arm64.txt")
+        );
+        let err = "riscv64"
+            .parse::<super::Architecture>()
+            .expect_err("unsupported arch");
+        assert_eq!(
+            err.to_string(),
+            "unknown architecture \"riscv64\"; flyco publishes x86_64, aarch64"
+        );
+    }
+
+    #[test]
+    fn single_arch_image_build_uses_registry_cache_and_push_by_digest() {
+        let [x86_64, aarch64] = ARCHITECTURES;
+        let stage = Path::new("/tmp/stage");
+
+        let pushed = Invocation::image_build_arch(aarch64, stage, None);
+        assert_eq!(pushed.program, "docker");
+        assert!(pushed.args.contains(&"linux/arm64".to_owned()));
+        assert!(pushed.args.contains(
+            &"type=registry,ref=ghcr.io/may-agent/flyco-session:buildcache-arm64".to_owned()
+        ));
+        assert!(
+            pushed.args.contains(
+                &"type=registry,ref=ghcr.io/may-agent/flyco-session:buildcache-arm64,mode=max"
+                    .to_owned()
+            )
+        );
+        assert!(pushed.args.contains(
+            &"type=image,name=ghcr.io/may-agent/flyco-session,push-by-digest=true,name-canonical=true,push=true"
+                .to_owned()
+        ));
+        assert!(
+            pushed
+                .args
+                .contains(&"/tmp/stage/image-metadata-arm64.json".to_owned())
+        );
+
+        let dry = Invocation::image_build_arch(
+            x86_64,
+            stage,
+            Some("ghcr.io/may-agent/flyco-session:dev"),
+        );
+        assert!(dry.args.contains(&"linux/amd64".to_owned()));
+        assert!(dry.args.contains(&"--load".to_owned()));
+        assert!(!dry.args.contains(&"--cache-to".to_owned()));
+
+        let tags = dev().image_tags(19, false);
+        let digests = vec![
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222".to_owned(),
+        ];
+        let merge = Invocation::image_merge_manifests(&tags, &digests);
+        assert_eq!(merge.program, "docker");
+        assert_eq!(merge.args[..3], ["buildx", "imagetools", "create"]);
+        assert_eq!(merge.args.iter().filter(|arg| *arg == "--tag").count(), 3);
+        assert!(
+            merge
+                .args
+                .contains(&format!("ghcr.io/may-agent/flyco-session@{}", digests[0]))
+        );
+        assert!(
+            merge
+                .args
+                .contains(&format!("ghcr.io/may-agent/flyco-session@{}", digests[1]))
         );
     }
 

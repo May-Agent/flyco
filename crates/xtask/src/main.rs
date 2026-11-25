@@ -5,6 +5,8 @@
 //!
 //! ```text
 //! cargo xtask publish-flycod [--channel dev] [--dry-run] [--allow-wire-mismatch]
+//! cargo xtask publish-flycod --arch <x86_64|aarch64> [--channel dev] [--dry-run] [--allow-wire-mismatch]
+//! cargo xtask publish-flycod --finalize [--channel dev] [--dry-run] [--allow-wire-mismatch]
 //! ```
 
 mod publish;
