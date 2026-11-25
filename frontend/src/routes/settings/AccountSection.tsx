@@ -1,10 +1,5 @@
 /**
- * Settings → Account (docs/ux.md §10).
- *
- * Who flyco acts as, and the way out. The credentials that call the API
- * without a browser are their own section, and so is everything about how
- * the app looks and when it interrupts: neither is a fact about the
- * identity, and both were making this page a drawer of leftovers.
+ * Settings → Account.
  */
 import { Show } from "solid-js";
 import { createQuery } from "../../lib/query";
@@ -19,7 +14,16 @@ import { signOut } from "../../lib/signOut";
 import styles from "./Settings.module.css";
 
 export default function AccountSection() {
+  return <AccountSectionView />;
+}
+
+export function AccountSectionView(props: { onSignedOut?: (() => void) | undefined }) {
   const navigate = useNavigate();
+
+  function handleSignOut(): void {
+    props.onSignedOut?.();
+    signOut(navigate);
+  }
 
   return (
     <section class={styles.section}>
@@ -27,50 +31,50 @@ export default function AccountSection() {
         <h2>Account</h2>
       </header>
 
-      <Identity />
+      <Identity onSignOut={handleSignOut} />
       <StorageQuota />
-
-      <div>
-        <button type="button" class={styles.pill} onClick={() => signOut(navigate)}>
-          <LogOut size={14} aria-hidden="true" />
-          Sign out
-        </button>
-      </div>
     </section>
   );
 }
 
-/* ── Identity ─────────────────────────────────────────────────────────── */
-
-function Identity() {
+function Identity(props: { onSignOut: () => void }) {
   const [me] = createQuery(getMe);
 
   return (
     <div class={styles.group}>
       <ProblemNotice error={me.error} />
-      <Show when={me()}>
-        {(user) => (
-          <article class={styles.card}>
-            <div class={styles.cardTop}>
-              <span class={styles.mark} aria-hidden="true">
-                {initialsOf(user().login)}
-              </span>
-              <div class={styles.identity}>
-                <span class={styles.cardTitle}>{user().login}</span>
-                <span class={styles.metaWithMark}>
-                  <Logomark mark={GITHUB_MARK} size={12} />
-                  Signed in with GitHub · {user().session_cap} sessions at once
-                </span>
-              </div>
+      <div class={styles.insetList}>
+        <div class={styles.insetRow}>
+          <div class={styles.insetRowBar}>
+            <Show when={me()}>
+              {(user) => (
+                <>
+                  <span class={styles.mark} aria-hidden="true">
+                    {initialsOf(user().login)}
+                  </span>
+                  <div class={styles.identity}>
+                    <span class={styles.cardTitle}>{user().login}</span>
+                    <span class={styles.metaWithMark}>
+                      <Logomark mark={GITHUB_MARK} size={12} />
+                      <span>GitHub</span>
+                      <span class={styles.status}>{user().session_cap} concurrent sessions</span>
+                    </span>
+                  </div>
+                </>
+              )}
+            </Show>
+            <div class={styles.actions}>
+              <button type="button" class={styles.pill} onClick={props.onSignOut}>
+                <LogOut size={14} aria-hidden="true" />
+                Sign out
+              </button>
             </div>
-          </article>
-        )}
-      </Show>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
-
-/* ── Storage ──────────────────────────────────────────────────────────── */
 
 function formatStorageBytes(bytes: number): string {
   const GB = 1_000_000_000;
@@ -145,4 +149,3 @@ function StorageQuota() {
     </div>
   );
 }
-

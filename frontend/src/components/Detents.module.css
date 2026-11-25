@@ -1,77 +1,88 @@
 /*
- * The drawn slider of Detents.tsx: a rail of countable stops, a thumb
- * carried `--travelled` along it, and a transparent range input laid over
- * the rail as the actual control.
- *
- * The thumb is the one large mark on the track; half of it is the room
- * left at either end so a detent at 0% or 100% is still a circle on the
- * rail rather than a circle off it. The component pads vertically for the
- * thumb's overhang and focus ring; the caller pads horizontally, because
- * what sits beside the rail — a reading riding above the thumb, the names
- * of the end stops — is the caller's to align. `--thumb` is theirs to
- * override where the mark should be a different size.
+ * Capsule slider with countable stops: a recessed pill track, a smooth
+ * filled capsule to the thumb's centre, discrete stop dots, and an elevated
+ * circular white thumb over a transparent native `<input type="range">`.
  */
 
 .detents {
-  padding-block: calc(var(--thumb, 20px) / 2);
+  padding-block: 3px;
+}
+
+.capsule {
+  position: relative;
+  height: 28px;
+  padding-inline: 14px;
+  border-radius: var(--radius-full);
+  background: var(--color-surface-sunken);
+  box-shadow: inset 0 1px 2px rgb(0 0 0 / 5%);
 }
 
 .rail {
   position: relative;
-  height: 6px;
-  border-radius: var(--radius-full);
-  background: var(--color-border);
+  height: 100%;
 }
 
-/* One dot per stop. They are the whole reason the control is drawn rather
-   than left to the user agent: a range input with a step hides the fact
-   that the positions are countable. */
+.fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -14px;
+  width: calc(var(--travelled, 0%) + 14px);
+  border-radius: var(--radius-full) 0 0 var(--radius-full);
+  background: var(--color-accent);
+  pointer-events: none;
+  transition: width var(--transition-spring);
+}
+
 .dot {
   position: absolute;
+  z-index: 1;
   top: 50%;
-  width: 4px;
-  height: 4px;
+  width: 5px;
+  height: 5px;
   translate: -50% -50%;
   border-radius: var(--radius-full);
   background: var(--color-text-faint);
+  opacity: 0.65;
+  pointer-events: none;
+  transition:
+    background var(--transition-fast),
+    opacity var(--transition-fast);
 }
 
-/* The dot under the thumb is covered by it; dropping it keeps the ink
-   circle clean rather than showing a rim of dot around the edge. */
+.dotFilled {
+  background: rgb(255 255 255 / 65%);
+  opacity: 1;
+}
+
 .dotTaken {
   opacity: 0;
 }
 
-/* The mark rides the rail on `left`, not on a translated full-width box:
-   a box the width of the rail shifted `translateX(100%)` sits a whole rail
-   beyond its right edge, and a panel that scrolls in one axis scrolls in
-   both — so every step to the right grew the popover's horizontal scroll
-   by the width of the rail. A point offset overflows nothing. */
 .thumb {
   position: absolute;
+  z-index: 2;
   top: 50%;
   left: var(--travelled, 0%);
-  width: var(--thumb, 20px);
-  height: var(--thumb, 20px);
+  width: var(--thumb, 30px);
+  height: var(--thumb, 30px);
   translate: -50% -50%;
   border-radius: var(--radius-full);
-  background: var(--color-primary);
-  box-shadow: var(--shadow-sm);
+  background: #ffffff;
+  box-shadow: var(--shadow-thumb);
+  pointer-events: none;
   transition:
-    left var(--transition-fast),
+    left var(--transition-spring),
     scale var(--transition-fast);
 }
 
-/* The input is the control; the rail above is what it looks like. It is
-   transparent and laid over the rail, stretched half a thumb past each end
-   so that its own thumb — sized to match, and never painted — travels
-   exactly the distance the drawn one does. */
 .range {
   position: absolute;
+  z-index: 3;
   top: 50%;
-  left: calc(-1 * var(--thumb, 20px) / 2);
-  right: calc(-1 * var(--thumb, 20px) / 2);
-  height: var(--thumb, 20px);
+  left: calc(-1 * var(--thumb, 30px) / 2);
+  right: calc(-1 * var(--thumb, 30px) / 2);
+  height: 32px;
   margin: 0;
   padding: 0;
   transform: translateY(-50%);
@@ -83,28 +94,29 @@
 
 .range::-webkit-slider-thumb {
   appearance: none;
-  width: var(--thumb, 20px);
-  height: var(--thumb, 20px);
+  width: var(--thumb, 30px);
+  height: var(--thumb, 30px);
 }
 
 .range::-moz-range-thumb {
-  width: var(--thumb, 20px);
-  height: var(--thumb, 20px);
+  width: var(--thumb, 30px);
+  height: var(--thumb, 30px);
   border: 0;
 }
 
-/* The ring belongs on the mark the user sees, not on the transparent input. */
 .rail:has(.range:focus-visible) .thumb {
   outline: 2px solid var(--color-focus-ring);
-  outline-offset: 3px;
+  outline-offset: 2px;
 }
 
 .rail:has(.range:active) .thumb {
-  scale: 0.92;
+  scale: 0.94;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .thumb {
+  .fill,
+  .thumb,
+  .dot {
     transition: none;
   }
 }

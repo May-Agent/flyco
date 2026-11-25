@@ -28,6 +28,7 @@ import {
   type JSX,
 } from "solid-js";
 import { A, useMatch } from "@solidjs/router";
+import { ChevronRight, Folder, FolderOpen } from "lucide-solid";
 import { createQuery, type Query } from "../lib/query";
 import { listSessions, type SessionSummary } from "../api/client";
 import { cx } from "../lib/cx";
@@ -181,7 +182,18 @@ export default function SessionNav(props: SessionNavProps) {
   const { sessions } = useSessions();
   const [query, setQuery] = createSignal("");
   const [showArchived, setShowArchived] = createSignal(false);
+  const [collapsedRepos, setCollapsedRepos] = createSignal<ReadonlySet<string>>(new Set());
   const current = useMatch(() => "/sessions/:id");
+
+  function toggleRepoGroup(repo: string): void {
+    const next = new Set(collapsedRepos());
+    if (next.has(repo)) {
+      next.delete(repo);
+    } else {
+      next.add(repo);
+    }
+    setCollapsedRepos(next);
+  }
 
   const [now, setNow] = createSignal(Date.now());
   const ticker = setInterval(() => setNow(Date.now()), TICK_MS);
@@ -241,56 +253,68 @@ export default function SessionNav(props: SessionNavProps) {
           }
         >
           <For each={groups()}>
-            {(group) => (
-              <div class={styles.group}>
-                <p class={styles.groupLabel} title={group.repo}>
-                  {group.repo}
-                </p>
-                <ul class={styles.list}>
-                  <For each={group.rows}>
-                    {({ session, status }) => (
-                      <li>
-                        <A
-                          href={`/sessions/${session.id}`}
-                          class={cx(
-                            styles.row,
-                            current()?.params.id === session.id && styles.rowCurrent,
-                          )}
-                          onClick={() => props.onNavigate?.()}
-                          title={`${session.title} — ${status.detail === undefined ? status.label : `${status.label} · ${status.detail}`}`}
-                        >
-                          {/*
-                            A colour, and no motion. The rail sits in the
-                            corner of the eye for the whole of a session,
-                            and a row of pulsing dots out there is the
-                            page competing with the work being read in the
-                            middle of it. A session at rest, or waiting
-                            on a reply, has no dot at all: the slot is
-                            kept so titles line up.
-                          */}
-                          <span
-                            class={styles.dot}
-                            data-tone={status.tone}
-                            aria-hidden="true"
-                          />
-                          <span class={styles.title}>{session.title}</span>
-                        </A>
-                      </li>
-                    )}
-                  </For>
-                </ul>
-              </div>
-            )}
+            {(group) => {
+              const folded = () =>
+                query().trim() === "" && collapsedRepos().has(group.repo);
+              const folderLabel = () => {
+                const parts = group.repo.split("/");
+                return parts[parts.length - 1] || group.repo || "Workspace";
+              };
+              return (
+                <div class={styles.group}>
+                  <button
+                    type="button"
+                    class={styles.groupToggle}
+                    aria-expanded={!folded()}
+                    title={group.repo}
+                    onClick={() => toggleRepoGroup(group.repo)}
+                  >
+                    <Show
+                      when={!folded()}
+                      fallback={<Folder size={14} class={cx(styles.folderIcon)} aria-hidden="true" />}
+                    >
+                      <FolderOpen size={14} class={cx(styles.folderIcon)} aria-hidden="true" />
+                    </Show>
+                    <span class={styles.groupLabel}>{folderLabel()}</span>
+                    <ChevronRight
+                      size={12}
+                      class={cx(styles.groupChevron, !folded() && styles.groupChevronOpen)}
+                      aria-hidden="true"
+                    />
+                  </button>
+                  <Show when={!folded()}>
+                    <ul class={styles.list}>
+                      <For each={group.rows}>
+                        {({ session, status }) => (
+                          <li>
+                            <A
+                              href={`/sessions/${session.id}`}
+                              class={cx(
+                                styles.row,
+                                current()?.params.id === session.id && styles.rowCurrent,
+                              )}
+                              onClick={() => props.onNavigate?.()}
+                              title={session.title}
+                            >
+                              <span class={styles.title}>{session.title}</span>
+                              <span
+                                class={styles.dot}
+                                data-tone={status.tone}
+                                aria-hidden="true"
+                              />
+                            </A>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Show>
+                </div>
+              );
+            }}
           </For>
         </Show>
       </div>
 
-      {/*
-        Archived sessions are the same list read for a different reason,
-        and one quiet line at the foot is all the way in it needs: a tab
-        row above the list was a second thing to read before the first
-        session, on every page.
-      */}
       <Show when={archivedCount() > 0 || showArchived()}>
         <button
           type="button"
@@ -298,7 +322,17 @@ export default function SessionNav(props: SessionNavProps) {
           aria-pressed={showArchived()}
           onClick={() => setShowArchived((was) => !was)}
         >
-          {showArchived() ? "Back to sessions" : `Archived · ${archivedCount()}`}
+          <Show
+            when={showArchived()}
+            fallback={
+              <>
+                <span>Archived</span>
+                <span class={styles.archivedBadge}>{archivedCount()}</span>
+              </>
+            }
+          >
+            Back to sessions
+          </Show>
         </button>
       </Show>
     </div>

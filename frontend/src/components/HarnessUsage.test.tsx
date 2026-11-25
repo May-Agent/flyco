@@ -116,4 +116,18 @@ describe("HarnessUsage", () => {
       unstated.getAllByRole("progressbar").map((bar) => bar.getAttribute("aria-label")),
     ).toEqual(["Usage limit"]);
   });
+
+  it("hides an observed rate-limit window whose reset timestamp has already passed", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const expired = {
+      ...limited(),
+      rate_limited_at_unix: now - 7200,
+      resets_at_unix: now - 3600,
+    };
+    const { container } = render(() => (
+      <HarnessUsage row={expired} plan={{ state: "unmetered" }} />
+    ));
+    expect(container.querySelectorAll("[role='progressbar']")).toHaveLength(0);
+    expect(container.textContent).toBe("");
+  });
 });

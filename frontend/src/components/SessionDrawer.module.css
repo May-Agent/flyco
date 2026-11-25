@@ -1,87 +1,83 @@
 /*
- * The drawer is a column beside the transcript, not a modal over it: the
- * conversation stays readable while the terminal is open, which is the
- * whole reason to open a terminal.
- *
- * Collapsed, it is one 32px handle. Open, it takes a fixed share of the
- * page and the transcript column narrows to suit.
+ * Full-height right workbench pane beside the conversation column.
  */
 .drawer {
   display: flex;
   align-items: stretch;
-  gap: var(--space-2);
   flex: none;
-  /* Level with the transcript's first line and the composer's last: the
-     body it sits in is the window's height, and the page never scrolls. */
-  margin: var(--space-2) 0 var(--space-4);
   min-height: 0;
+  border-left: var(--border-width) solid var(--color-border);
+  background: var(--color-surface-raised);
+  transition: width var(--transition-panel);
 }
 
 .drawerOpen {
-  width: min(420px, 40vw);
+  width: min(460px, 42vw);
+}
+
+.drawerExpanded {
+  width: min(760px, 58vw);
 }
 
 .panel {
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
   flex: 1;
   min-width: 0;
   min-height: 0;
-  padding: var(--space-3);
-  border: var(--border-width) solid var(--color-border);
-  border-radius: var(--radius-lg);
-  background: var(--color-surface-raised);
-  box-shadow: var(--shadow-card);
   animation: slide var(--transition-panel);
+}
+
+.headerBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-height: 52px;
+  padding: 0 var(--space-3);
+  border-bottom: var(--border-width) solid var(--color-border);
+  background: var(--color-surface);
+  flex: none;
 }
 
 .tabs {
   display: flex;
-  /*
-   * No gap, and wrapping rather than scrolling: five pills have to fit the
-   * drawer's 420px, and a tab the reader has to scroll sideways to find is
-   * a tab they do not know exists. The pills separate themselves — only the
-   * selected one has a background.
-   */
-  gap: 0;
-  flex: none;
-  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
 }
 
 .tab {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
-  /*
-   * Tight horizontal padding because five tabs have to fit the drawer's
-   * 420px without a scrollbar: a tab the user has to scroll to find is a
-   * tab they do not know exists.
-   */
-  height: 26px;
-  padding: 0 var(--space-2);
-  border: var(--border-width) solid transparent;
-  border-radius: var(--radius-sm);
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--radius-md);
   background: transparent;
   color: var(--color-text-muted);
   font-size: var(--text-xs);
   font-weight: var(--weight-medium);
   white-space: nowrap;
   cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .tab:hover {
   color: var(--color-text);
+  background: var(--color-surface-sunken);
 }
 
 .tabActive {
-  background: var(--color-surface-sunken);
+  background: var(--color-surface-raised);
   color: var(--color-text);
+  box-shadow: var(--shadow-sm);
 }
 
-/* The pane reads the machine live; with none connected the tab is a dead
-   end, so it shows as one before it is opened rather than after. */
 .tabDisabled {
   opacity: 0.45;
   cursor: default;
@@ -89,18 +85,57 @@
 
 .tabDisabled:hover {
   color: var(--color-text-muted);
+  background: transparent;
+}
+
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.windowAction,
+.close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.windowAction:hover,
+.close:hover {
+  background: var(--color-surface-sunken);
+  color: var(--color-text);
 }
 
 .body {
   flex: 1;
   min-height: 0;
+  padding: var(--space-3);
   overflow-y: auto;
+}
+
+.bodyFlush {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 @keyframes slide {
   from {
     opacity: 0;
-    transform: translateX(8px);
+    transform: translateX(6px);
   }
 
   to {
@@ -109,46 +144,21 @@
   }
 }
 
-/* Only a phone needs it; on a desktop the header's toggle closes the drawer. */
-.close {
-  display: none;
-  align-items: center;
-  justify-content: center;
-  margin-left: auto;
-  padding: var(--space-1);
-  border: none;
-  border-radius: var(--radius-full);
-  background: transparent;
-  color: var(--color-text-muted);
-  cursor: pointer;
-}
-
-.close:hover {
-  color: var(--color-text);
-}
-
-/*
- * On a narrow screen there is no room for two columns, so the drawer stops
- * being one: it covers the transcript, at the full height a terminal needs,
- * and closes from its own corner. Stacked under the transcript it was a
- * 70vh block the user had to scroll to, with a terminal too short to use.
- */
 @media (max-width: 900px) {
   .drawer {
     position: fixed;
     inset: 0;
     z-index: 30;
-    margin: 0;
-    padding: var(--space-3);
-    background: var(--color-bg);
+    border-left: none;
   }
 
-  .drawerOpen {
+  .drawerOpen,
+  .drawerExpanded {
     width: auto;
   }
 
-  .close {
-    display: inline-flex;
+  .windowAction {
+    display: none;
   }
 }
 

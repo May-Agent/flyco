@@ -1,22 +1,11 @@
 /**
  * The one control that sets a session's compute budget.
  *
- * Two places set a budget and they are the same question asked twice: the
- * composer, before a session exists, and the session header, where raising
- * it is what releases a session paused on an exhausted one (docs/ux.md
- * §9.1). So the heading that names what the money buys, the slider and the
- * amount are written once here, and each caller supplies only what differs
- * — the control that opens the panel, and, where the change costs a round
- * trip, the action that commits it.
- *
- * Controlled, deliberately: the amount lives with the caller, because the
- * trigger renders it (the composer's chip reads `$10`, the header's ring
- * reads `$1.20 / $10`) and a draft hidden in here would leave both showing
- * a number the slider had already moved off.
+ * Controlled: the amount lives with the caller so the trigger and the
+ * capsule slider stay in lockstep.
  */
 import type { JSX } from "solid-js";
 import { Show, createSignal, onCleanup } from "solid-js";
-import { Server } from "lucide-solid";
 import Popover, { type TriggerAttrs } from "./Popover";
 import styles from "./BudgetPicker.module.css";
 
@@ -40,43 +29,51 @@ export interface BudgetPickerProps {
   align?: "start" | "end" | undefined;
   /** The control that opens the panel. */
   trigger: (attrs: TriggerAttrs) => JSX.Element;
-  /**
-   * What commits the change, for a caller whose change is a request.
-   *
-   * Absent in the composer, where the amount is a field of a form nobody
-   * has submitted yet and every move of the slider is already the answer.
-   */
+  /** What commits the change, for a caller whose change is a request. */
   action?: ((close: () => void) => JSX.Element) | undefined;
 }
 
 export default function BudgetPicker(props: BudgetPickerProps) {
   const min = () => props.min ?? MIN_BUDGET;
   const max = () => props.max ?? MAX_BUDGET;
+  const travelled = () => {
+    const span = max() - min();
+    if (span <= 0) {
+      return "0%";
+    }
+    const clamped = Math.min(max(), Math.max(min(), props.dollars));
+    return `${((clamped - min()) / span) * 100}%`;
+  };
 
   return (
-    <Popover label={props.label ?? "Budget"} align={props.align} trigger={props.trigger}>
+    <Popover
+      label={props.label ?? "Budget"}
+      align={props.align}
+      panelClass={styles.panel}
+      trigger={props.trigger}
+    >
       {(close) => (
         <div class={styles.popover}>
-          <p class={styles.heading}>
-            <Server size={13} aria-hidden="true" />
-            Compute budget
-          </p>
-          <div class={styles.sliderRow}>
+          <div class={styles.head}>
             <span class={styles.amount}>${props.dollars}</span>
-            <span class={styles.note}>
-              ${min()}–${max()}
-            </span>
+            <span class={styles.heading}>Compute budget</span>
           </div>
-          <input
-            class={styles.slider}
-            type="range"
-            min={min()}
-            max={max()}
-            step="1"
-            value={props.dollars}
-            aria-label="Session budget in dollars"
-            onInput={(event) => props.onChange(Number(event.currentTarget.value))}
-          />
+          <div class={styles.capsule}>
+            <div class={styles.rail} style={{ "--travelled": travelled() }}>
+              <span class={styles.fill} aria-hidden="true" />
+              <span class={styles.thumb} aria-hidden="true" />
+              <input
+                class={styles.range}
+                type="range"
+                min={min()}
+                max={max()}
+                step="1"
+                value={props.dollars}
+                aria-label="Session budget in dollars"
+                onInput={(event) => props.onChange(Number(event.currentTarget.value))}
+              />
+            </div>
+          </div>
           <Show when={props.action}>{(action) => action()(close)}</Show>
         </div>
       )}
@@ -99,33 +96,13 @@ export interface BudgetRaiseProps {
   label?: string;
   /** Which edge of the trigger the panel lines up with. */
   align?: "start" | "end" | undefined;
+  /** Programmatic open timestamp from a parent menu. */
+  openAt?: number | undefined;
 }
 
-/**
- * The budget of a session that already exists, which is a request rather
- * than a field.
- *
- * Where the composer's chip is the whole answer the moment the slider
- * moves, this one costs a round trip, so it holds the amount as a draft and
- * commits it on an explicit action. Two places raise a budget — the ring in
- * the session header and the notice on a session paused because the budget
- * ran out — and they differ only in what the user clicks to get here.
- */
 export function BudgetRaise(props: BudgetRaiseProps) {
-  /**
-   * The amount the slider is showing while the user drags it, or
-   * `undefined` for "whatever the session says" — what the panel opens on,
-   * and what it falls back to once a change has landed.
-   */
   const [draft, setDraft] = createSignal<number | undefined>(undefined);
 
-  /**
-   * The first whole dollar above what the session has already spent.
-   *
-   * The floor of the slider, because money that is gone is gone: a limit at
-   * or under the spend leaves the budget exhausted, so offering it would be
-   * offering a way to press the button and stay paused.
-   */
   const floor = () => Math.floor(props.spentUsd ?? 0) + 1;
   const amount = () => draft() ?? Math.max(floor(), Math.round(props.limitUsd ?? DEFAULT_BUDGET));
 
@@ -139,30 +116,58 @@ export function BudgetRaise(props: BudgetRaiseProps) {
   }
 
   return (
-    <BudgetPicker
+    <Popover
       label={props.label ?? "Session budget"}
       align={props.align}
-      dollars={amount()}
-      onChange={setDraft}
-      min={floor()}
-      max={Math.max(MAX_BUDGET, amount(), floor())}
+      openAt={props.openAt}
+      panelClass={styles.panel}
       trigger={props.trigger}
-      action={(close) => {
-        // A drag the user walked away from is not a decision: the panel's
-        // own unmount drops the draft, so reopening asks the session again
-        // rather than offering back a number nobody committed.
+    >
+      {(close) => {
         onCleanup(() => setDraft(undefined));
+        const min = () => floor();
+        const max = () => Math.max(MAX_BUDGET, amount(), floor());
+        const travelled = () => {
+          const span = max() - min();
+          if (span <= 0) {
+            return "0%";
+          }
+          const clamped = Math.min(max(), Math.max(min(), amount()));
+          return `${((clamped - min()) / span) * 100}%`;
+        };
         return (
-          <button
-            type="button"
-            class={styles.commit}
-            disabled={props.saving}
-            onClick={() => commit(close)}
-          >
-            {props.saving ? "Saving…" : `Set budget to $${amount()}`}
-          </button>
+          <div class={styles.popover}>
+            <div class={styles.head}>
+              <span class={styles.amount}>${amount()}</span>
+              <span class={styles.heading}>Compute budget</span>
+            </div>
+            <div class={styles.capsule}>
+              <div class={styles.rail} style={{ "--travelled": travelled() }}>
+                <span class={styles.fill} aria-hidden="true" />
+                <span class={styles.thumb} aria-hidden="true" />
+                <input
+                  class={styles.range}
+                  type="range"
+                  min={min()}
+                  max={max()}
+                  step="1"
+                  value={amount()}
+                  aria-label="Session budget in dollars"
+                  onInput={(event) => setDraft(Number(event.currentTarget.value))}
+                />
+              </div>
+            </div>
+            <button
+              type="button"
+              class={styles.commit}
+              disabled={props.saving}
+              onClick={() => commit(close)}
+            >
+              {props.saving ? "Saving…" : `Set budget to $${amount()}`}
+            </button>
+          </div>
         );
       }}
-    />
+    </Popover>
   );
 }

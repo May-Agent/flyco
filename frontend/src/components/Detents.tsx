@@ -41,39 +41,43 @@ export default function Detents(props: DetentsProps) {
 
   return (
     <div class={styles.detents}>
-      <div class={styles.rail}>
-        <For each={Array.from({ length: props.count })}>
-          {(_, index) => (
-            <span
-              aria-hidden="true"
-              class={cx(
-                styles.dot,
-                props.dotClass?.(index()),
-                index() === props.position && styles.dotTaken,
-              )}
-              style={{ left: last() === 0 ? "0%" : `${(index() / last()) * 100}%` }}
-            />
-          )}
-        </For>
-        <span class={styles.thumb} aria-hidden="true" style={{ "--travelled": travelled() }} />
-        <input
-          class={styles.range}
-          type="range"
-          min={0}
-          max={last()}
-          step={1}
-          value={props.position}
-          aria-label={props.ariaLabel}
-          aria-valuetext={props.ariaValueText}
-          onInput={(event) => props.onMove(Number(event.currentTarget.value))}
-          onKeyDown={(event) => {
-            const next = detentForKey(event.key, props.position, last());
-            if (next !== null) {
-              event.preventDefault();
-              props.onMove(next);
-            }
-          }}
-        />
+      <div class={styles.capsule}>
+        <div class={styles.rail} style={{ "--travelled": travelled() }}>
+          <span class={styles.fill} aria-hidden="true" />
+          <For each={Array.from({ length: props.count })}>
+            {(_, index) => (
+              <span
+                aria-hidden="true"
+                class={cx(
+                  styles.dot,
+                  index() < props.position && styles.dotFilled,
+                  props.dotClass?.(index()),
+                  index() === props.position && styles.dotTaken,
+                )}
+                style={{ left: last() === 0 ? "0%" : `${(index() / last()) * 100}%` }}
+              />
+            )}
+          </For>
+          <span class={styles.thumb} aria-hidden="true" />
+          <input
+            class={styles.range}
+            type="range"
+            min={0}
+            max={last()}
+            step={1}
+            value={props.position}
+            aria-label={props.ariaLabel}
+            aria-valuetext={props.ariaValueText}
+            onInput={(event) => props.onMove(Number(event.currentTarget.value))}
+            onKeyDown={(event) => {
+              const next = detentForKey(event.key, props.position, last());
+              if (next !== null) {
+                event.preventDefault();
+                props.onMove(next);
+              }
+            }}
+          />
+        </div>
       </div>
     </div>
   );

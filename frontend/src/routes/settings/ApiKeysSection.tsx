@@ -1,9 +1,7 @@
 /**
  * Settings → API keys.
  *
- * The credentials that call the flyco API without a browser session: the
- * CLI on a machine, a script, CI. Its own section because it is the one
- * page here that is about a credential rather than about the person.
+ * Compact inline creation bar above a grouped inset list of existing keys.
  */
 import { For, Show, createSignal } from "solid-js";
 import { createQuery } from "../../lib/query";
@@ -65,19 +63,31 @@ function ApiKeys() {
 
   return (
     <div class={styles.group}>
-      {/* No group label: this page holds one group, and `API keys` under
-          the `API keys` heading is the same words twice. Tools labels its
-          groups because it has two. */}
       <ProblemNotice error={keys.error ?? error()} />
+
+      <form class={styles.inlineForm} onSubmit={(event) => void create(event)}>
+        <label for="api-key-label" class="visually-hidden">
+          New key label
+        </label>
+        <input
+          id="api-key-label"
+          value={label()}
+          onInput={(event) => setLabel(event.currentTarget.value)}
+          placeholder="Key name (e.g. laptop, CI)"
+          required
+        />
+        <button type="submit" class={styles.pillPrimary} disabled={creating()}>
+          <Plus size={14} aria-hidden="true" />
+          {creating() ? "Creating…" : "Create key"}
+        </button>
+      </form>
 
       <Show when={created()}>
         {(key) => (
           <article class={styles.card}>
             <div class={styles.identity}>
               <span class={styles.cardTitle}>{key().label}</span>
-              <span class={styles.cardMeta}>
-                This is the only time this key is shown. Copy it before you leave the page.
-              </span>
+              <span class={styles.cardMeta}>Shown once — copy before closing.</span>
             </div>
             <div class={styles.secret}>
               <span class={styles.secretValue}>{key().token}</span>
@@ -93,18 +103,20 @@ function ApiKeys() {
       </Show>
 
       <Show when={(keys() ?? []).length > 0}>
-        <div class={styles.cards}>
+        <div class={styles.insetList}>
           <For each={keys()}>
             {(key) => (
-              <article class={styles.card}>
-                <div class={styles.cardTop}>
+              <div class={styles.insetRow}>
+                <div class={styles.insetRowBar}>
                   <div class={styles.identity}>
                     <span class={styles.cardTitle}>{key.label}</span>
                     <span class={styles.cardMeta}>
-                      Created {formatDate(key.created_at_unix)} ·{" "}
-                      {key.last_used_unix === null || key.last_used_unix === undefined
-                        ? "never used"
-                        : `last used ${formatDate(key.last_used_unix)}`}
+                      <span>Created {formatDate(key.created_at_unix)}</span>
+                      <span>
+                        {key.last_used_unix === null || key.last_used_unix === undefined
+                          ? "Never used"
+                          : `Used ${formatDate(key.last_used_unix)}`}
+                      </span>
                     </span>
                   </div>
                   <div class={styles.actions}>
@@ -117,34 +129,11 @@ function ApiKeys() {
                     </button>
                   </div>
                 </div>
-              </article>
+              </div>
             )}
           </For>
         </div>
       </Show>
-
-      <article class={styles.card}>
-        <form class={styles.form} onSubmit={(event) => void create(event)}>
-          <div class={styles.field}>
-            <label for="api-key-label">New key for</label>
-            <input
-              id="api-key-label"
-              value={label()}
-              onInput={(event) => setLabel(event.currentTarget.value)}
-              placeholder="CI"
-              required
-            />
-          </div>
-          <div class={styles.formActions}>
-            <button type="submit" class={styles.pillPrimary} disabled={creating()}>
-              <Plus size={14} aria-hidden="true" />
-              {creating() ? "Creating…" : "Create key"}
-            </button>
-            <span class={styles.note}>Keys call the flyco API without a browser session.</span>
-          </div>
-        </form>
-      </article>
     </div>
   );
 }
-

@@ -18,7 +18,7 @@
   padding: var(--space-3);
   background: var(--color-surface-raised);
   border: var(--border-width) solid var(--color-border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-xl);
   box-shadow: var(--shadow-panel);
   animation: rise var(--transition-panel);
 }

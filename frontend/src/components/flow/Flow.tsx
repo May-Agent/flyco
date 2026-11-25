@@ -38,11 +38,10 @@ export interface FlowProps extends FlowStart {
   readonly onDone: () => void;
   /**
    * `Back` on the first page, where there is no page to go back to.
-   *
-   * A flow opened from settings goes back to settings; the first run has
-   * nowhere to go, offers no `Back` there, and leaves this unset.
    */
   readonly onLeave?: (() => void) | undefined;
+  /** Render flush inside an existing modal or settings pane without outer card chrome. */
+  readonly embedded?: boolean | undefined;
 }
 
 export default function Flow(props: FlowProps) {
@@ -124,8 +123,11 @@ export default function Flow(props: FlowProps) {
   }
 
   return (
-    <div class={styles.page}>
-      <section class={styles.card} aria-labelledby="flow-title">
+    <div class={cx(styles.page, props.embedded === true && styles.pageEmbedded)}>
+      <section
+        class={cx(styles.card, props.embedded === true && styles.cardEmbedded)}
+        aria-labelledby="flow-title"
+      >
         {/*
           A stepper needs steps to compare. Entered from settings the flow
           has one stage, and a single bar is a dark rule across the top of

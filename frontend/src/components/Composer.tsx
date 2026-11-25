@@ -65,8 +65,9 @@ import {
   CATALOG_POLL_DEADLINE_MS,
   CATALOG_POLL_SECONDS,
   billingMinimumSentence,
+  capacityLabel,
   catalogNotReady,
-  chipLabel,
+  entryChipName,
   entryKey,
   readingMachines,
   readingMachinesShort,
@@ -425,43 +426,13 @@ export default function Composer(props: ComposerProps) {
       label="Describe a task"
       disabled={sending()}
       controls={
-        <div class={styles.chips}>
-          <HarnessChip
-            harness={harness()}
-            accounts={readiness.harness()}
-            onChoose={setHarnessChoice}
-          />
-          <ComputeChip
-            linked={readiness.compute().length > 0}
-            accounts={readiness.compute()}
-            automatic={automatic()}
-            entry={chosen()}
-            catalog={entries()}
-            error={machineError()}
-            pending={pending()}
-            pendingShort={pendingShort()}
-            catalogTimedOut={catalogTimedOut()}
-            onRetryCatalog={retryCatalog}
-            chosenKey={chosenKey()}
-            spot={spot()}
-            onChoose={setChosenKey}
-            onSpot={chooseSpot}
-          />
-          <RepoChip
-            repos={repos()}
-            onToggle={toggleRepo}
-            onPrimary={makePrimary}
-            onBranch={setRepoBranch}
-          />
-          <BudgetChip dollars={budget()} onChange={setBudget} />
-        </div>
+        <HarnessChip
+          harness={harness()}
+          accounts={readiness.harness()}
+          onChoose={setHarnessChoice}
+        />
       }
       trailing={
-        /*
-         * At the right, beside send, where both official apps keep their
-         * model chip: the last thing checked before the task goes out,
-         * and off the row of chips that decide where it runs.
-         */
         <Show when={model()}>
           {(choice) => (
             <ModelChip models={models()} choice={choice()} align="end" onChoose={setModelChoice} />
@@ -479,6 +450,37 @@ export default function Composer(props: ComposerProps) {
         >
           <ArrowUp size={16} aria-hidden="true" />
         </button>
+      }
+      tray={
+        <>
+          <div class={styles.trayStart}>
+            <RepoChip
+              repos={repos()}
+              onToggle={toggleRepo}
+              onPrimary={makePrimary}
+              onBranch={setRepoBranch}
+            />
+          </div>
+          <div class={styles.trayEnd}>
+            <ComputeChip
+              linked={readiness.compute().length > 0}
+              accounts={readiness.compute()}
+              automatic={automatic()}
+              entry={chosen()}
+              catalog={entries()}
+              error={machineError()}
+              pending={pending()}
+              pendingShort={pendingShort()}
+              catalogTimedOut={catalogTimedOut()}
+              onRetryCatalog={retryCatalog}
+              chosenKey={chosenKey()}
+              spot={spot()}
+              onChoose={setChosenKey}
+              onSpot={chooseSpot}
+            />
+            <BudgetChip dollars={budget()} onChange={setBudget} />
+          </div>
+        </>
       }
     >
       <Show when={licenseNotice()}>
@@ -609,15 +611,12 @@ function ComputeChip(props: {
   onChoose: (key: string | null) => void;
   onSpot: (spot: boolean) => void;
 }) {
-  const summary = createMemo(() => {
+  const sizeText = createMemo(() => {
     const entry = props.entry;
     if (entry === undefined) {
       return null;
     }
-    // Name and size: what the choice is about. The logomark names the
-    // provider; the price, the region, the account and the capacity mode
-    // are laid out in the panel one click away — see `chipLabel`.
-    return chipLabel(entry);
+    return capacityLabel(entry) ?? entryChipName(entry);
   });
 
   /** The sentence a license-bound machine has to show before send. */
@@ -637,10 +636,8 @@ function ComputeChip(props: {
     >
       <Popover
         label="Compute"
+        align="end"
         panelClass={styles.popoverWide}
-        // Whether flyco chose the machine or the user did is the slider's
-        // heading, not a word on the chip: the chip is the name and the
-        // price, and a suffix was what pushed the price into an ellipsis.
         anchorClass={styles.anchorShrink}
         trigger={(attrs) => (
           <button
@@ -658,7 +655,7 @@ function ComputeChip(props: {
               {(mark) => <Logomark mark={mark()} size={13} />}
             </Show>
             <span class={styles.chipLabel}>
-              {summary() ?? props.pendingShort ?? "Choosing\u2026"}
+              {sizeText() ?? props.pendingShort ?? "Choosing\u2026"}
             </span>
           </button>
         )}
@@ -889,6 +886,7 @@ function BudgetChip(props: { dollars: number; onChange: (dollars: number) => voi
     <BudgetPicker
       dollars={props.dollars}
       onChange={props.onChange}
+      align="end"
       trigger={(attrs) => (
         <button
           id={attrs.id}

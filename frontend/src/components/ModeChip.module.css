@@ -8,9 +8,23 @@
   max-width: min(380px, calc(100vw - 2 * var(--space-4)));
 }
 
-/* A change on its way to the agent: legible, but visibly not settled. */
 .saving {
   opacity: 0.6;
+}
+
+.triggerOpen {
+  color: var(--color-warning);
+  background: var(--color-warning-soft);
+}
+
+.triggerOpen > svg {
+  color: var(--color-warning);
+}
+
+.triggerOpen:hover,
+.triggerOpen[aria-expanded="true"] {
+  color: var(--color-warning);
+  background: color-mix(in srgb, var(--color-warning) 18%, var(--color-warning-soft));
 }
 
 .option {

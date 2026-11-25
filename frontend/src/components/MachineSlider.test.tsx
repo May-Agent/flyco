@@ -204,10 +204,9 @@ describe("MachineSlider", () => {
     // No track under Auto — the choice flyco keeps is the size as well as
     // the form, so the panel owes the machine, not a slider.
     expect(queryByLabelText("Machine")).toBeNull();
-    expect(getByText("Standard_D4als_v6 · 4 vCPU / 16 GiB")).toBeInTheDocument();
+    expect(getByText("Standard_D4als_v6")).toBeInTheDocument();
+    expect(getByText("4 vCPU / 16 GiB")).toBeInTheDocument();
     expect(getByText("$0.14/hr")).toBeInTheDocument();
-    // Auto segment already names Auto; do not repeat it inside the panel body.
-    expect(document.querySelectorAll("p").length).toBe(2);
   });
 
   it("lists the forms the catalog offers, Auto first", () => {
@@ -223,7 +222,7 @@ describe("MachineSlider", () => {
   it("keeps a codespace out of the VM form even though it runs on one", () => {
     // `runtime: vm` is the bargain — the disk survives a stop — while the
     // product is GitHub's: provider decides the form, not the runtime.
-    const { getByLabelText, getByRole, getByText } = mountControlled([
+    const { getByLabelText, getByRole } = mountControlled([
       SMALL,
       CODESPACE,
       CODESPACE_LARGE,
@@ -232,7 +231,6 @@ describe("MachineSlider", () => {
     getByRole("radio", { name: "Codespace" }).click();
     // Both codespace sizes, and only they, are on the track.
     expect(getByLabelText("Machine")).toHaveAttribute("max", "1");
-    expect(getByText("2 codespaces")).toBeInTheDocument();
     expect(getByLabelText("Machine")).toHaveAttribute(
       "aria-valuetext",
       "standardLinux32gb · 4 vCPU / 16 GiB",
@@ -277,10 +275,9 @@ describe("MachineSlider", () => {
   });
 
   it("gives the detents one position each within the chosen form", () => {
-    const { getByLabelText, getByText } = mount([SMALL, LARGE, CONTAINER], SMALL_KEY);
+    const { getByLabelText } = mount([SMALL, LARGE, CONTAINER], SMALL_KEY);
 
     expect(getByLabelText("Machine")).toHaveAttribute("max", "1");
-    expect(getByText("2 VMs")).toBeInTheDocument();
   });
 
   it("marks every stop the thumb can take on the form's track", () => {
@@ -373,7 +370,8 @@ describe("MachineSlider", () => {
     const { getByRole, getByText } = mount([HOST], null, vi.fn(), HOST_AUTOMATIC);
 
     expect(getByRole("radio", { name: "Container" })).toBeInTheDocument();
-    expect(getByText("mercury · 16 vCPU / 64 GiB")).toBeInTheDocument();
+    expect(getByText("mercury")).toBeInTheDocument();
+    expect(getByText("16 vCPU / 64 GiB")).toBeInTheDocument();
     expect(getByText("your hardware")).toBeInTheDocument();
   });
 
@@ -390,13 +388,13 @@ describe("MachineSlider", () => {
     const arm = entry("Standard_D4pls_v6", 4, 8, 96_000, {
       lineage: { architecture: "arm64", family: "dpls", generation: 6 },
     });
-    const { getByLabelText, getByText } = mount([SMALL, LARGE, arm], SMALL_KEY);
+    const { getByLabelText } = mount([SMALL, LARGE, arm], SMALL_KEY);
 
     // Three VMs while the architecture filter is open…
-    expect(getByText("3 VMs")).toBeInTheDocument();
+    expect(getByLabelText("Machine")).toHaveAttribute("max", "2");
     // …and only the Arm one once it is not.
     fireEvent.change(getByLabelText("Architecture"), { target: { value: "arm64" } });
-    expect(getByText("1 VM")).toBeInTheDocument();
+    expect(getByLabelText("Machine")).toHaveAttribute("max", "0");
   });
 
   it("only offers spot where a detent can quote a spot price", () => {
@@ -432,7 +430,7 @@ describe("MachineSlider without an Auto segment", () => {
   }
 
   it("names the one form a resize can express, and gives its machines the whole track", () => {
-    const { getByLabelText, getByRole, getByText, queryByRole } = mountFixed(
+    const { getByLabelText, getByRole, queryByRole } = mountFixed(
       [SMALL, LARGE],
       SMALL_KEY,
     );
@@ -440,7 +438,6 @@ describe("MachineSlider without an Auto segment", () => {
     // Two VMs, two positions: 0 and 1, and no segment for flyco to choose.
     expect(getByLabelText("Machine")).toHaveAttribute("max", "1");
     expect(getByLabelText("Machine")).toHaveValue("0");
-    expect(getByText("Cheapest")).toBeInTheDocument();
     expect(getByRole("radio", { name: "VM" })).toHaveAttribute("aria-checked", "true");
     expect(queryByRole("radio", { name: "Auto" })).toBeNull();
   });
@@ -509,12 +506,8 @@ describe("MachineSlider on a container", () => {
   });
 
   it("keeps a container's sizes off the VM track rather than hiding VMs behind them", () => {
-    // A session that needs a disk which survives a stop is not served by
-    // an execution whose filesystem ends with it — so the two forms are
-    // different segments, and neither's track carries the other's detents.
-    const { getByLabelText, getByText } = mount([CONTAINER, SMALL], SMALL_KEY);
+    const { getByLabelText } = mount([CONTAINER, SMALL], SMALL_KEY);
 
     expect(getByLabelText("Machine")).toHaveAttribute("max", "0");
-    expect(getByText("1 VM")).toBeInTheDocument();
   });
 });

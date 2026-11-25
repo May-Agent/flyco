@@ -1,11 +1,3 @@
-/*
- * The rail's session list. Every row is one line: a dot, when the session
- * needs one, and a title.
- *
- * This is a switcher — the reader is looking for a name they already know —
- * so anything beyond the name and whether it needs them is noise repeated
- * forty times down the side of the screen.
- */
 .nav {
   display: flex;
   flex-direction: column;
@@ -17,8 +9,8 @@
 .search {
   flex: none;
   width: 100%;
-  height: 32px;
-  padding: 0 var(--space-3);
+  height: 30px;
+  padding: 0 10px;
   border: var(--border-width) solid transparent;
   border-radius: var(--radius-md);
   background: var(--color-surface-sunken);
@@ -40,45 +32,80 @@
 
 .search:focus {
   outline: none;
-  border-color: var(--color-border-strong);
+  border-color: var(--color-focus-ring);
   background: var(--color-surface-raised);
 }
 
-/* The only thing on the page allowed to scroll independently: the rail is
-   full height, and its head and foot must stay put while forty sessions
-   move. */
 .scroller {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   margin: 0 calc(var(--space-2) * -1);
-  padding: var(--space-1) var(--space-2) 0;
-  /* Rows fade under the foot rather than being cut by it. */
-  mask-image: linear-gradient(to bottom, black calc(100% - 20px), transparent);
+  padding: var(--space-1) var(--space-2) var(--space-2);
 }
 
 .group {
-  margin-bottom: var(--space-4);
+  margin-bottom: var(--space-2);
 }
 
-/* A repository name, in the same case the repository spells it: it is a
-   name, not a heading, and `OWNER/REPO` in small capitals would be neither. */
-.groupLabel {
-  margin: 0 0 var(--space-1);
-  padding: 0 var(--space-2);
-  color: var(--color-text-faint);
-  font-size: var(--text-2xs);
+.groupToggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 28px;
+  padding: 0 8px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: var(--text-sm);
   font-weight: var(--weight-medium);
-  letter-spacing: 0.01em;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.groupToggle:hover {
+  background: var(--color-surface-sunken);
+}
+
+.folderIcon {
+  flex: none;
+  color: var(--color-text-muted);
+}
+
+.groupLabel {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
+}
+
+.groupChevron {
+  flex: none;
+  color: var(--color-text-faint);
+  opacity: 0;
+  transition:
+    transform var(--transition-fast),
+    opacity var(--transition-fast);
+}
+
+.groupToggle:hover .groupChevron,
+.groupToggle[aria-expanded="false"] .groupChevron {
+  opacity: 1;
+}
+
+.groupChevronOpen {
+  transform: rotate(90deg);
 }
 
 .list {
   list-style: none;
-  margin: 0;
+  margin: 2px 0 0;
   padding: 0;
   display: flex;
   flex-direction: column;
@@ -90,7 +117,7 @@
   align-items: center;
   gap: var(--space-2);
   min-height: 30px;
-  padding: 0 var(--space-2);
+  padding: 0 8px 0 28px;
   border-radius: var(--radius-sm);
   color: var(--color-text-muted);
   text-decoration: none;
@@ -105,21 +132,20 @@
   color: var(--color-text);
 }
 
-/* The open session is lifted a step: paper on the surface, like the
-   `New session` control above it. */
 .rowCurrent {
-  background: var(--color-surface-raised);
-  box-shadow: var(--shadow-sm);
+  background: var(--color-surface-sunken);
   color: var(--color-text);
   font-weight: var(--weight-medium);
 }
 
-.rowCurrent:hover {
-  background: var(--color-surface-raised);
+.title {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* The slot is always there so titles line up; the colour is there only
-   when the session is doing something the reader might want to know. */
 .dot {
   flex: none;
   width: 6px;
@@ -129,7 +155,7 @@
 }
 
 .dot[data-tone="working"] {
-  background: var(--color-success);
+  background: var(--color-accent);
 }
 
 .dot[data-tone="failed"] {
@@ -137,22 +163,11 @@
 }
 
 .dot[data-tone="neutral"] {
-  background: var(--color-neutral-dot);
+  background: transparent;
 }
 
-/* A session waiting out a plan window. Coloured, unlike the other resting
-   states, because it is the one kind of stop that ends by itself: it is
-   worth seeing in the corner of the eye that a session will be working
-   again this evening without anyone touching it. */
 .dot[data-tone="waiting"] {
   background: var(--color-warning);
-}
-
-.title {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .empty {
@@ -163,7 +178,10 @@
 
 .archivedToggle {
   flex: none;
-  padding: var(--space-2);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
   border: none;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -173,9 +191,17 @@
   font-weight: var(--weight-medium);
   text-align: left;
   cursor: pointer;
-  transition: color var(--transition-fast);
+  transition:
+    color var(--transition-fast),
+    background var(--transition-fast);
 }
 
 .archivedToggle:hover {
   color: var(--color-text);
+  background: var(--color-surface-sunken);
+}
+
+.archivedBadge {
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-faint);
 }

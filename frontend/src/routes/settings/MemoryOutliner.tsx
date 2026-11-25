@@ -143,12 +143,10 @@ export default function MemoryOutliner() {
           when={rows().length > 0 || composingUnder() === ROOT_KEY}
           fallback={
             <div class={styles.empty}>
-              <p class={styles.emptyLine}>
-                Nothing is remembered yet. Add a note and every agent reads it before it starts.
-              </p>
+              <p class={styles.emptyLine}>No notes yet.</p>
               <button
                 type="button"
-                class={styles.pillPrimary}
+                class={styles.pill}
                 onClick={() => setComposingUnder(ROOT_KEY)}
               >
                 <Plus size={14} aria-hidden="true" />

@@ -39,6 +39,9 @@ export interface ModeChipProps {
 }
 
 export default function ModeChip(props: ModeChipProps) {
+  const unrestricted = () =>
+    props.modes.find((option) => option.id === props.mode)?.unrestricted === true;
+
   return (
     <Popover
       label="Mode"
@@ -51,7 +54,11 @@ export default function ModeChip(props: ModeChipProps) {
           aria-expanded={attrs.expanded()}
           aria-haspopup="dialog"
           type="button"
-          class={cx(composer.chip, props.saving === true && styles.saving)}
+          class={cx(
+            composer.chip,
+            unrestricted() && styles.triggerOpen,
+            props.saving === true && styles.saving,
+          )}
           title="Permission mode"
         >
           <ModeMark mode={props.mode} modes={props.modes} size={13} />

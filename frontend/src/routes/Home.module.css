@@ -17,22 +17,25 @@
   gap: var(--space-5);
 }
 
-/* The question, set light and large: a heading that reads as an
-   invitation rather than a title. */
 .greeting {
-  margin: 0 0 var(--space-1) var(--space-1);
+  margin: 0 0 var(--space-2);
   font-size: var(--text-2xl);
-  font-weight: var(--weight-medium);
+  font-weight: var(--weight-semibold);
   letter-spacing: var(--tracking-tight);
+  text-align: center;
   color: var(--color-text);
 }
 
-/* ── Readiness cards ─────────────────────────────────────────────────── */
+/* ── Readiness rows ──────────────────────────────────────────────────── */
 
 .readiness {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
 }
 
 .readinessCard {
@@ -40,15 +43,14 @@
   align-items: center;
   gap: var(--space-3);
   padding: var(--space-3) var(--space-4);
-  border: var(--border-width) solid var(--color-border);
-  border-radius: var(--radius-lg);
-  background: var(--color-surface-raised);
-  box-shadow: var(--shadow-card);
+  border-bottom: var(--border-width) solid var(--color-border);
   text-decoration: none;
   color: inherit;
-  transition:
-    border-color var(--transition-fast),
-    box-shadow var(--transition-fast);
+  transition: background var(--transition-fast);
+}
+
+.readinessCard:last-child {
+  border-bottom: none;
 }
 
 .readinessCard > svg {
@@ -57,34 +59,22 @@
 }
 
 .readinessCard:hover {
-  border-color: var(--color-border-strong);
-  box-shadow: var(--shadow-raised);
-}
-
-.readinessText {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
+  background: var(--color-surface);
 }
 
 .readinessTitle {
+  font-size: var(--text-md);
   font-weight: var(--weight-medium);
-}
-
-.readinessDetail {
-  font-size: var(--text-sm);
-  color: var(--color-text-muted);
 }
 
 .readinessAction {
   margin-left: auto;
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
+  gap: 2px;
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
-  color: var(--color-text);
+  color: var(--color-text-muted);
   white-space: nowrap;
 }
 
