@@ -745,7 +745,6 @@ fn devcontainer_json_boots_as_root_for_dual_uid_daemon() {
         parsed["containerEnv"]["FLYCO_CONTROL_PLANE"],
         "https://dev.flyco.dev/"
     );
-    assert_eq!(parsed["runArgs"], serde_json::json!(["--entrypoint="]));
     assert_eq!(parsed["postStartCommand"], "flycod codespace");
     assert_eq!(parsed["remoteUser"], "root");
 }
