@@ -557,17 +557,15 @@ function SessionView(props: { id: string }) {
   });
 
   /**
-   * Whether the notice covers the composer instead of standing over it.
+   * Whether the notice blocks the composer until its action is taken.
    *
    * A session whose machine is gone has one thing to do first, and the
-   * notice carries it. The box stayed live beside the notice and took
-   * typing that could go nowhere until something else happened, so where
-   * there is a way out the notice lies over the box and the box is inert
-   * until it is taken. States with nothing to do — a machine coming back
-   * on its own, a plan window resetting — leave the box open, because a
-   * message typed into those is held and sent.
+   * notice carries it directly above the composer while the composer stays
+   * inert underneath until resumed. States with nothing to do — a machine
+   * coming back on its own, a plan window resetting — leave the box open,
+   * because a message typed into those is held and sent.
    */
-  const covered = createMemo(() => !refused() && notice()?.action?.kind === "resume");
+  const blocked = createMemo(() => !refused() && notice()?.action?.kind === "resume");
 
   /**
    * The pending approval currently occupying the composer slot, if any.
@@ -576,7 +574,7 @@ function SessionView(props: { id: string }) {
    * in the transcript, so the decision sits where the user acts next.
    */
   const activeApproval = createMemo(() =>
-    !refused() && !covered() ? waiting()[0] : undefined,
+    !refused() && !blocked() ? waiting()[0] : undefined,
   );
 
   /**
@@ -1135,11 +1133,11 @@ function SessionView(props: { id: string }) {
             that will refuse; one that can, and has something to say about
             itself first, says it directly above the box.
           */}
-          <div class={cx(styles.composer, covered() && styles.composerCovered)}>
+          <div class={styles.composer}>
             <Show when={notice()}>
               {(state) => (
                 <section
-                  class={cx(styles.stateNotice, covered() && styles.stateNoticeOver)}
+                  class={styles.stateNotice}
                   data-tone={state().tone}
                   aria-label="Session state"
                 >
@@ -1199,12 +1197,13 @@ function SessionView(props: { id: string }) {
               fallback={
                 <Show when={!refused()}>
                   <div
-                    class={cx(styles.composerBox, covered() && styles.composerInert)}
+                    class={cx(styles.composerBox, blocked() && styles.composerInert)}
                     ref={(el) => {
                       // `inert` takes the box out of tabbing and hit-testing
-                      // while the notice lies over it; Solid's JSX types do
-                      // not know the attribute yet, so it is set on the node.
-                      createEffect(() => el.toggleAttribute("inert", covered()));
+                      // while the session needs to be resumed first; Solid's
+                      // JSX types do not know the attribute yet, so it is set
+                      // on the node.
+                      createEffect(() => el.toggleAttribute("inert", blocked()));
                     }}
                   >
                   <SessionComposer

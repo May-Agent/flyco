@@ -225,10 +225,8 @@
 }
 
 /* Under the scroller, so it is at the foot of the window whatever the
-   transcript is doing. Held to the transcript's measure. */
-/* The state notice and the composer share one slot. Stacked, they are two
-   cards and need the gap between them; covered, the notice lies over the
-   box — see `.composerCovered`. */
+   transcript is doing. Held to the transcript's measure. The state notice
+   stacks directly above the composer with a clean gap between the two cards. */
 .composer {
   flex: none;
   display: flex;
@@ -241,35 +239,14 @@
 }
 
 .composerBox {
-  display: contents;
-}
-
-/*
- * A session with something to do first: the notice lies over the box
- * rather than beside it, so the thing to do is the only thing to click.
- */
-.composerCovered {
-  position: relative;
-}
-
-.composerCovered .composerBox {
   display: block;
 }
 
 .composerInert {
-  opacity: 0.35;
+  opacity: 0.45;
   filter: saturate(0.4);
   pointer-events: none;
   user-select: none;
-}
-
-.stateNoticeOver {
-  position: absolute;
-  z-index: 2;
-  left: 0;
-  right: 0;
-  top: 50%;
-  translate: 0 -50%;
 }
 
 /* The `git status --short` a refused archive quoted back, inside the shared
