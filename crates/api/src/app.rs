@@ -549,6 +549,13 @@ async fn resolve_request(
     };
     let account =
         provisioning::account(db, config, github, user.id, choice.provider_account).await?;
+    provider_accounts::check_monthly_quota(
+        db,
+        user.id,
+        choice.provider_account,
+        crate::clock::now_unix(),
+    )
+    .await?;
     // Checked against the cached catalog, which is what the picker showed;
     // the queue re-asks the provider when it actually builds the machine.
     let entry = machines::deployable(db, config, github, kv, user.id, &choice).await?;

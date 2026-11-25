@@ -152,6 +152,24 @@ pub struct LinkProvider {
     pub label: String,
     /// The credentials to seal. Their variant names the provider.
     pub credentials: ProviderCredentials,
+    /// Optional monthly spend cap in USD micros. `None` leaves the account
+    /// uncapped.
+    #[serde(default)]
+    pub monthly_limit: Option<Usd>,
+}
+
+/// Request body of `PATCH /v1/providers/{id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct UpdateProviderAccount {
+    /// New human-readable label, when renaming.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// New monthly spend cap in USD micros (must be greater than zero).
+    #[serde(default)]
+    pub monthly_limit: Option<Usd>,
+    /// Clears the account's monthly spend cap when `true`.
+    #[serde(default)]
+    pub clear_monthly_limit: bool,
 }
 
 /// One row of `GET /v1/providers`.
@@ -180,6 +198,12 @@ pub struct ProviderAccountView {
     /// way to say so. Inferring it from [`CloudProviderKind::Host`] would
     /// name the kind and not the machine.
     pub host_id: Option<HostId>,
+    /// Optional monthly spend cap in USD micros (`None` when uncapped).
+    #[serde(default)]
+    pub monthly_limit: Option<Usd>,
+    /// Metered spend accrued on this account in the current UTC calendar month.
+    #[serde(default)]
+    pub monthly_spent: Usd,
 }
 
 /// Answer of `GET /v1/providers/aws/iam-policy`.
@@ -378,6 +402,7 @@ mod tests {
                 client_secret: "secret".to_owned(),
                 subscription_id: "subscription".to_owned(),
             },
+            monthly_limit: None,
         };
 
         let json = serde_json::to_value(&request).expect("serialize");

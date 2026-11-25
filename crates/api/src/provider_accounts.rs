@@ -8,11 +8,13 @@
 //! [`ProviderAccountView`](flyco_core::ProviderAccountView) has no field
 //! that could hold one.
 
+use std::collections::{HashMap, HashSet};
+
 use askama::Template;
 use flyco_core::{
     AwsIamPolicy, CloudProviderKind, CloudUsageView, CurrentUser, HostId, LinkProvider,
     ProviderAccountId, ProviderAccountView, ProviderBonusHint, ProviderCredentials,
-    QuickstartAnswers, UserId,
+    QuickstartAnswers, UpdateProviderAccount, Usd, UserId,
 };
 use flyco_provider::LoginKey;
 use flyco_provider::aws::iam;
@@ -56,18 +58,208 @@ struct AccountRow {
     label: String,
     linked_at_unix: u64,
     host_id: Option<HostId>,
+    monthly_limit_micros: Option<Usd>,
 }
 
-impl From<AccountRow> for ProviderAccountView {
-    fn from(row: AccountRow) -> Self {
-        Self {
-            id: row.id,
-            kind: row.kind,
-            label: row.label,
-            linked_at_unix: row.linked_at_unix,
-            host_id: row.host_id,
+#[derive(Debug, skyzen::FromRow)]
+struct AccountSpendRow {
+    provider_account_id: ProviderAccountId,
+    spent_micros: Usd,
+}
+
+impl AccountRow {
+    fn into_view(self, monthly_spent: Usd) -> ProviderAccountView {
+        ProviderAccountView {
+            id: self.id,
+            kind: self.kind,
+            label: self.label,
+            linked_at_unix: self.linked_at_unix,
+            host_id: self.host_id,
+            monthly_limit: self.monthly_limit_micros,
+            monthly_spent,
         }
     }
+}
+
+/// First second (`00:00:00`) of the UTC calendar month containing `now_unix`.
+///
+/// Uses Howard Hinnant's civil-from-days / days-from-civil bijection so the
+/// Worker needs no calendar crate.
+#[must_use]
+pub(crate) const fn utc_month_start_unix(now_unix: u64) -> u64 {
+    const SECONDS_PER_DAY: u64 = 86_400;
+    let days = (now_unix / SECONDS_PER_DAY).cast_signed();
+    // Shift epoch from 1970-01-01 to 0000-03-01 (719_468 days earlier).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097).cast_unsigned();
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe.cast_signed() + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    // Convert (year, month, 1) back to days since 1970-01-01.
+    let shifted_year = if month <= 2 { year - 1 } else { year };
+    let target_era = if shifted_year >= 0 {
+        shifted_year
+    } else {
+        shifted_year - 399
+    } / 400;
+    let year_of_era = (shifted_year - target_era * 400).cast_unsigned();
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let first_day = target_era * 146_097 + day_of_era.cast_signed() - 719_468;
+    if first_day <= 0 {
+        0
+    } else {
+        first_day.cast_unsigned() * SECONDS_PER_DAY
+    }
+}
+
+/// Formats a `Usd` microdollar amount as `$X.XX` for error messages.
+fn format_usd(amount: Usd) -> String {
+    let micros = amount.micros();
+    let cents = micros / 10_000;
+    let dollars = cents / 100;
+    let rem_cents = cents % 100;
+    format!("${dollars}.{rem_cents:02}")
+}
+
+/// Validates an optional monthly spend cap: `Some(0)` is rejected because a
+/// zero cap cannot fund anything; callers who want no cap omit or clear it.
+const fn validate_monthly_limit(limit: Option<Usd>) -> Result<Option<Usd>, ApiError> {
+    if let Some(amount) = limit
+        && amount.micros() == 0
+    {
+        return Err(ApiError::InvalidProviderAccountUpdate(
+            "monthly_limit must be greater than zero",
+        ));
+    }
+    Ok(limit)
+}
+
+/// Metered spend accrued per linked provider account in the current UTC month.
+///
+/// Cost: 1 indexed D1 read (`spend_events_by_at_unix`).
+pub(crate) async fn monthly_spend_by_account(
+    db: &Db,
+    user: UserId,
+    now: u64,
+) -> Result<HashMap<ProviderAccountId, Usd>, ApiError> {
+    let month_start = utc_month_start_unix(now);
+    let rows: Vec<AccountSpendRow> = sql!(
+        db,
+        "SELECT machines.provider_account_id, COALESCE(SUM(spend_events.amount_micros), 0) AS spent_micros \
+         FROM spend_events \
+         JOIN budgets ON budgets.id = spend_events.budget_id \
+         JOIN machines ON machines.session_id = budgets.session_id \
+         JOIN provider_accounts ON provider_accounts.id = machines.provider_account_id \
+         WHERE provider_accounts.user_id = {user} \
+         AND spend_events.at_unix >= {month_start} \
+         GROUP BY machines.provider_account_id"
+    )
+    .fetch_all()
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.provider_account_id, row.spent_micros))
+        .collect())
+}
+
+/// Metered spend accrued on one provider account in the current UTC month.
+///
+/// Cost: 1 indexed D1 read (`spend_events_by_at_unix`).
+pub(crate) async fn monthly_spend_for_account(
+    db: &Db,
+    account: ProviderAccountId,
+    now: u64,
+) -> Result<Usd, ApiError> {
+    let month_start = utc_month_start_unix(now);
+    let spent: Usd = sql!(
+        db,
+        "SELECT COALESCE(SUM(spend_events.amount_micros), 0) \
+         FROM spend_events \
+         JOIN budgets ON budgets.id = spend_events.budget_id \
+         JOIN machines ON machines.session_id = budgets.session_id \
+         WHERE machines.provider_account_id = {account} \
+         AND spend_events.at_unix >= {month_start}"
+    )
+    .fetch_scalar()
+    .await?;
+    Ok(spent)
+}
+
+/// Linked accounts of `user` that have a configured monthly cap and have
+/// reached or exceeded it in the current UTC month.
+///
+/// Cost: 1 D1 read for capped accounts + 1 indexed D1 read for monthly spend
+/// (skipped when the user has no capped accounts).
+pub(crate) async fn exhausted_accounts(
+    db: &Db,
+    user: UserId,
+    now: u64,
+) -> Result<HashSet<ProviderAccountId>, ApiError> {
+    let capped: Vec<AccountRow> = sql!(
+        db,
+        "SELECT id, kind, label, linked_at_unix, host_id, monthly_limit_micros \
+         FROM provider_accounts \
+         WHERE user_id = {user} \
+         AND unlinked_at_unix IS NULL \
+         AND monthly_limit_micros IS NOT NULL"
+    )
+    .fetch_all()
+    .await?;
+    if capped.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let spent = monthly_spend_by_account(db, user, now).await?;
+    let mut exhausted = HashSet::new();
+    for row in capped {
+        if let Some(limit) = row.monthly_limit_micros {
+            let current = spent.get(&row.id).copied().unwrap_or(Usd::ZERO);
+            if current.micros() >= limit.micros() {
+                exhausted.insert(row.id);
+            }
+        }
+    }
+    Ok(exhausted)
+}
+
+/// Refuses provisioning onto `account` when it has reached its monthly cap.
+///
+/// Cost: 1 D1 read for the account row + 1 indexed D1 read for monthly spend
+/// when `monthly_limit_micros` is set.
+pub(crate) async fn check_monthly_quota(
+    db: &Db,
+    user: UserId,
+    account: ProviderAccountId,
+    now: u64,
+) -> Result<(), ApiError> {
+    let row: Option<AccountRow> = sql!(
+        db,
+        "SELECT id, kind, label, linked_at_unix, host_id, monthly_limit_micros \
+         FROM provider_accounts \
+         WHERE id = {account} AND user_id = {user} AND unlinked_at_unix IS NULL"
+    )
+    .fetch_optional()
+    .await?;
+    let Some(row) = row else {
+        return Err(ApiError::ProviderAccountNotFound);
+    };
+    let Some(limit) = row.monthly_limit_micros else {
+        return Ok(());
+    };
+    let spent = monthly_spend_for_account(db, account, now).await?;
+    if spent.micros() >= limit.micros() {
+        return Err(ApiError::ProviderMonthlyQuotaExceeded {
+            label: row.label,
+            spent: format_usd(spent),
+            limit: format_usd(limit),
+        });
+    }
+    Ok(())
 }
 
 /// Narrows the cloud usage panel to one provider.
@@ -95,7 +287,8 @@ async fn list(db: &Db, user: UserId) -> Result<Vec<ProviderAccountView>, ApiErro
     let removed = flyco_core::HostState::Removed;
     let rows: Vec<AccountRow> = sql!(
         db,
-        "SELECT provider_accounts.id, kind, provider_accounts.label, linked_at_unix, host_id \
+        "SELECT provider_accounts.id, kind, provider_accounts.label, linked_at_unix, host_id, \
+                provider_accounts.monthly_limit_micros \
          FROM provider_accounts \
          LEFT JOIN hosts ON hosts.id = provider_accounts.host_id \
          WHERE provider_accounts.user_id = {user} \
@@ -106,7 +299,17 @@ async fn list(db: &Db, user: UserId) -> Result<Vec<ProviderAccountView>, ApiErro
     .fetch_all()
     .await?;
 
-    Ok(rows.into_iter().map(Into::into).collect())
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let spent = monthly_spend_by_account(db, user, now_unix()).await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let current = spent.get(&row.id).copied().unwrap_or(Usd::ZERO);
+            row.into_view(current)
+        })
+        .collect())
 }
 
 /// Links a cloud-provider account, sealing its credentials at rest.
@@ -146,6 +349,7 @@ pub(crate) async fn link(
     user: UserId,
     request: LinkProvider,
 ) -> Result<ProviderAccountView, ApiError> {
+    let monthly_limit = validate_monthly_limit(request.monthly_limit)?;
     // Flyco's, minted here: the browser never sees a key, and the user has
     // nowhere to keep one.
     let login_key = LoginKey::generate();
@@ -161,6 +365,7 @@ pub(crate) async fn link(
         },
         resource_group,
         None,
+        monthly_limit,
     )
     .await?;
 
@@ -242,10 +447,15 @@ pub(crate) async fn create(
         },
         None,
         host,
+        None,
     )
     .await
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal insert helper carrying every column written at link time"
+)]
 async fn create_with(
     db: &Db,
     config: &ApiConfig,
@@ -254,6 +464,7 @@ async fn create_with(
     secrets: SealedSecrets<'_>,
     resource_group: Option<String>,
     host: Option<HostId>,
+    monthly_limit: Option<Usd>,
 ) -> Result<ProviderAccountView, ApiError> {
     let kind = secrets.credentials.kind();
     let sealed = config.token_cipher().seal(
@@ -266,9 +477,10 @@ async fn create_with(
     sql!(
         db,
         "INSERT INTO provider_accounts \
-         (id, user_id, kind, label, credentials_enc, resource_group, host_id, linked_at_unix) \
+         (id, user_id, kind, label, credentials_enc, resource_group, host_id, \
+          linked_at_unix, monthly_limit_micros) \
          VALUES ({id}, {user}, {kind}, {label.clone()}, {sealed}, {resource_group}, {host}, \
-                 {linked_at})"
+                 {linked_at}, {monthly_limit})"
     )
     .execute()
     .await?;
@@ -281,7 +493,89 @@ async fn create_with(
         label,
         linked_at_unix: linked_at,
         host_id: host,
+        monthly_limit,
+        monthly_spent: Usd::ZERO,
     })
+}
+
+/// Updates a linked cloud-provider account's label or monthly spend quota.
+///
+/// Cost per call: 2 D1 reads (account lookup + current-month spend rollup),
+/// 1 D1 write (account update), 0 KV / DO / R2 / subrequests.
+#[skyzen::openapi]
+async fn update_provider(
+    State(user): State<CurrentUser>,
+    params: Params,
+    Json(request): Json<UpdateProviderAccount>,
+    db: Db,
+) -> Outcome<Json<ProviderAccountView>> {
+    update(&db, user.id, &params, request)
+        .await
+        .map(Json)
+        .into()
+}
+
+async fn update(
+    db: &Db,
+    user: UserId,
+    params: &Params,
+    request: UpdateProviderAccount,
+) -> Result<ProviderAccountView, ApiError> {
+    let id: ProviderAccountId = path_id(params, "id")?;
+    if request.clear_monthly_limit && request.monthly_limit.is_some() {
+        return Err(ApiError::InvalidProviderAccountUpdate(
+            "cannot set monthly_limit and clear_monthly_limit together",
+        ));
+    }
+    let next_label = match request.label {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(ApiError::InvalidProviderAccountUpdate(
+                    "label cannot be empty",
+                ));
+            }
+            Some(trimmed.to_owned())
+        }
+        None => None,
+    };
+    let next_limit = validate_monthly_limit(request.monthly_limit)?;
+    if next_label.is_none() && next_limit.is_none() && !request.clear_monthly_limit {
+        return Err(ApiError::EmptyUpdate);
+    }
+
+    let existing: Option<AccountRow> = sql!(
+        db,
+        "SELECT id, kind, label, linked_at_unix, host_id, monthly_limit_micros \
+         FROM provider_accounts \
+         WHERE id = {id} AND user_id = {user} AND unlinked_at_unix IS NULL"
+    )
+    .fetch_optional()
+    .await?;
+    let Some(mut row) = existing else {
+        return Err(ApiError::ProviderAccountNotFound);
+    };
+
+    if let Some(label) = next_label {
+        row.label = label;
+    }
+    if request.clear_monthly_limit {
+        row.monthly_limit_micros = None;
+    } else if let Some(limit) = next_limit {
+        row.monthly_limit_micros = Some(limit);
+    }
+
+    sql!(
+        db,
+        "UPDATE provider_accounts \
+         SET label = {row.label.clone()}, monthly_limit_micros = {row.monthly_limit_micros} \
+         WHERE id = {id} AND user_id = {user} AND unlinked_at_unix IS NULL"
+    )
+    .execute()
+    .await?;
+
+    let spent = monthly_spend_for_account(db, id, now_unix()).await?;
+    Ok(row.into_view(spent))
 }
 
 /// Unlinks a cloud-provider account.
@@ -317,7 +611,8 @@ async fn unlink(db: &Db, user: UserId, params: &Params) -> Result<NoContent, Api
     // withdrawn when none was there to withdraw.
     let owned: Option<AccountRow> = sql!(
         db,
-        "SELECT id, kind, label, linked_at_unix, host_id FROM provider_accounts \
+        "SELECT id, kind, label, linked_at_unix, host_id, monthly_limit_micros \
+         FROM provider_accounts \
          WHERE id = {id} AND user_id = {user} AND unlinked_at_unix IS NULL"
     )
     .fetch_optional()
@@ -472,7 +767,9 @@ pub fn routes() -> Vec<RouteNode> {
         "/v1/providers".at(list_providers).post(link_provider),
         "/v1/providers/aws/iam-policy".at(aws_iam_policy),
         "/v1/providers/quickstart".post(provider_quickstart),
-        "/v1/providers/{id}".delete(unlink_provider),
+        "/v1/providers/{id}"
+            .patch(update_provider)
+            .delete(unlink_provider),
         "/v1/usage/cloud".at(cloud_usage),
     ))
     .into_route_nodes()

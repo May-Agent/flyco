@@ -786,6 +786,13 @@ export function linkProvider(
   return requestJson("POST", "/v1/providers", { json: input });
 }
 
+export function updateProvider(
+  id: string,
+  input: JsonBody<"flyco_api::provider_accounts::update_provider">,
+): Promise<JsonResponse<"flyco_api::provider_accounts::update_provider", 200>> {
+  return requestJson("PATCH", apiPath`/v1/providers/${id}`, { json: input });
+}
+
 export function unlinkProvider(id: string): Promise<void> {
   return requestVoid("DELETE", apiPath`/v1/providers/${id}`);
 }

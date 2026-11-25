@@ -107,6 +107,7 @@ async fn a_machine_you_own_cannot_be_linked_as_a_credential(ctx: TestContext, kv
             credentials: ProviderCredentials::Host {
                 host: HostId::generate(),
             },
+            monthly_limit: None,
         })
         .send()
         .await;
@@ -347,5 +348,192 @@ async fn linking_the_same_account_again_is_a_new_row_beside_the_old_one(
         listed.iter().map(|account| account.id).collect::<Vec<_>>(),
         vec![second],
         "the history stays history: only the live account is offered"
+    );
+}
+
+#[skyzen::test]
+async fn patch_provider_updates_and_clears_monthly_quota(ctx: TestContext, kv: Kv, db: Db) {
+    let client = ctx.client(migrated_router(&db).await);
+    let user = seed_user(&db).await;
+    let token = session::issue(&kv, user.id).await.expect("issue a session");
+    let account = seed_provider_account(&db, user.id).await;
+
+    // Set monthly limit to $40.00 and rename.
+    let updated = client
+        .patch(&format!("/v1/providers/{account}"))
+        .bearer(&token)
+        .json(&flyco_core::UpdateProviderAccount {
+            label: Some("gcp-account-1".to_owned()),
+            monthly_limit: Some(flyco_core::Usd::from_micros(40_000_000)),
+            clear_monthly_limit: false,
+        })
+        .send()
+        .await;
+    updated.assert_status(200);
+    let view: ProviderAccountView = updated.json();
+    assert_eq!(view.label, "gcp-account-1");
+    assert_eq!(
+        view.monthly_limit,
+        Some(flyco_core::Usd::from_micros(40_000_000))
+    );
+    assert_eq!(view.monthly_spent, flyco_core::Usd::ZERO);
+
+    // Zero limit is rejected.
+    let zero = client
+        .patch(&format!("/v1/providers/{account}"))
+        .bearer(&token)
+        .json(&flyco_core::UpdateProviderAccount {
+            label: None,
+            monthly_limit: Some(flyco_core::Usd::ZERO),
+            clear_monthly_limit: false,
+        })
+        .send()
+        .await;
+    zero.assert_status(422);
+    assert_eq!(
+        zero.json::<Problem>().kind,
+        "https://flyco.dev/problems/invalid-provider-account-update"
+    );
+
+    // Clear monthly limit.
+    let cleared = client
+        .patch(&format!("/v1/providers/{account}"))
+        .bearer(&token)
+        .json(&flyco_core::UpdateProviderAccount {
+            label: None,
+            monthly_limit: None,
+            clear_monthly_limit: true,
+        })
+        .send()
+        .await;
+    cleared.assert_status(200);
+    assert_eq!(cleared.json::<ProviderAccountView>().monthly_limit, None);
+}
+
+#[skyzen::test]
+async fn per_account_monthly_quota_rolls_up_current_month_spend_and_enforces_cap(
+    ctx: TestContext,
+    kv: Kv,
+    db: Db,
+) {
+    let client = ctx.client(migrated_router(&db).await);
+    let user = seed_user(&db).await;
+    let token = session::issue(&kv, user.id).await.expect("issue a session");
+
+    let first = seed_provider_account(&db, user.id).await;
+    let second = seed_provider_account(&db, user.id).await;
+
+    // Cap account 1 at $40 and account 2 at $100.
+    client
+        .patch(&format!("/v1/providers/{first}"))
+        .bearer(&token)
+        .json(&flyco_core::UpdateProviderAccount {
+            label: Some("gcp-40".to_owned()),
+            monthly_limit: Some(flyco_core::Usd::from_micros(40_000_000)),
+            clear_monthly_limit: false,
+        })
+        .send()
+        .await
+        .assert_status(200);
+    client
+        .patch(&format!("/v1/providers/{second}"))
+        .bearer(&token)
+        .json(&flyco_core::UpdateProviderAccount {
+            label: Some("gcp-100".to_owned()),
+            monthly_limit: Some(flyco_core::Usd::from_micros(100_000_000)),
+            clear_monthly_limit: false,
+        })
+        .send()
+        .await
+        .assert_status(200);
+
+    // Record $40 spend in the current month on account 1 and $100 in a prior
+    // month on account 2 (prior-month spend must not count toward this month).
+    let s1 = seed_session(&db, &user).await;
+    let s2 = seed_session(&db, &user).await;
+    let spec = MachineSpec {
+        provider: CloudProviderKind::Gcp,
+        machine_type: "c3d-standard-32".to_owned(),
+        runtime: Runtime::Vm,
+        region: "us-central1".to_owned(),
+        spot: true,
+        disk_gib: 50,
+    };
+    machines::reserve(&db, s1, first, &spec)
+        .await
+        .expect("reserve m1");
+    machines::reserve(&db, s2, second, &spec)
+        .await
+        .expect("reserve m2");
+
+    let now = crate::clock::now_unix();
+    let prior_month = crate::provider_accounts::utc_month_start_unix(now).saturating_sub(3_600);
+    let b1: String = sql!(db, "SELECT id FROM budgets WHERE session_id = {s1}")
+        .fetch_scalar()
+        .await
+        .expect("b1");
+    let b2: String = sql!(db, "SELECT id FROM budgets WHERE session_id = {s2}")
+        .fetch_scalar()
+        .await
+        .expect("b2");
+    sql!(
+        db,
+        "INSERT INTO spend_events (id, budget_id, kind, amount_micros, at_unix, detail) \
+         VALUES ('se_cur_1', {b1}, 'compute', 40000000, {now}, 'current month')"
+    )
+    .execute()
+    .await
+    .expect("insert current month spend");
+    sql!(
+        db,
+        "INSERT INTO spend_events (id, budget_id, kind, amount_micros, at_unix, detail) \
+         VALUES ('se_old_2', {b2}, 'compute', 100000000, {prior_month}, 'previous month')"
+    )
+    .execute()
+    .await
+    .expect("insert prior month spend");
+
+    // GET /v1/providers reports current-month spend per account.
+    let listed: Vec<ProviderAccountView> = client
+        .get("/v1/providers")
+        .bearer(&token)
+        .send()
+        .await
+        .json();
+    let v1 = listed.iter().find(|a| a.id == first).expect("first listed");
+    let v2 = listed
+        .iter()
+        .find(|a| a.id == second)
+        .expect("second listed");
+    assert_eq!(v1.monthly_spent, flyco_core::Usd::from_micros(40_000_000));
+    assert_eq!(v2.monthly_spent, flyco_core::Usd::ZERO);
+
+    // Account 1 is exhausted and rejected; account 2 remains eligible.
+    let exhausted = crate::provider_accounts::exhausted_accounts(&db, user.id, now)
+        .await
+        .expect("exhausted_accounts");
+    assert!(exhausted.contains(&first));
+    assert!(!exhausted.contains(&second));
+
+    let err = crate::provider_accounts::check_monthly_quota(&db, user.id, first, now)
+        .await
+        .expect_err("capped account must be rejected");
+    assert!(matches!(err, ApiError::ProviderMonthlyQuotaExceeded { .. }));
+    crate::provider_accounts::check_monthly_quota(&db, user.id, second, now)
+        .await
+        .expect("uncapped/under-limit account must pass");
+}
+
+#[test]
+fn utc_month_start_handles_leap_years_and_boundaries() {
+    // 2024-02-29T23:59:59Z -> 2024-02-01T00:00:00Z
+    assert_eq!(
+        crate::provider_accounts::utc_month_start_unix(1_709_251_199),
+        1_706_745_600
+    );
+    // 2026-11-25T01:00:00Z -> 2026-11-01T00:00:00Z
+    assert_eq!(
+        crate::provider_accounts::utc_month_start_unix(1_795_482_000),
+        1_793_491_200
     );
 }

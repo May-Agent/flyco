@@ -121,6 +121,11 @@ export interface ComputeCardProps {
    * which is not an error but the control plane saying what has to happen
    * first (issue #139). Omitted where unlinking is not on offer.
    */
+  /**
+   * Updates or clears the account's monthly spend cap (USD micros, or `null`
+   * to clear). Omitted where editing is not on offer.
+   */
+  onUpdateQuota?: ((limitMicros: number | null) => Promise<void>) | undefined;
   onUnlink?: (() => Promise<void>) | undefined;
 }
 
@@ -128,8 +133,46 @@ export default function ComputeCard(props: ComputeCardProps) {
   const [confirming, setConfirming] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<unknown>(null);
+  const [editingQuota, setEditingQuota] = createSignal(false);
+  const [quotaDraft, setQuotaDraft] = createSignal("");
+  const [quotaBusy, setQuotaBusy] = createSignal(false);
+  const [quotaError, setQuotaError] = createSignal<unknown>(null);
   /** What a refused unlink said, when the account is still in use. */
   const [refused, setRefused] = createSignal<InUseRefusal | null>(null);
+
+  function startEditingQuota(): void {
+    const current = props.account.monthly_limit ?? null;
+    setQuotaDraft(current === null ? "" : (current / 1_000_000).toFixed(2));
+    setQuotaError(null);
+    setEditingQuota(true);
+  }
+
+  async function saveQuota(limitMicros: number | null): Promise<void> {
+    const request = props.onUpdateQuota;
+    if (request === undefined) {
+      return;
+    }
+    setQuotaBusy(true);
+    setQuotaError(null);
+    try {
+      await request(limitMicros);
+      setEditingQuota(false);
+    } catch (failure) {
+      setQuotaError(failure);
+    } finally {
+      setQuotaBusy(false);
+    }
+  }
+
+  function submitQuota(event: SubmitEvent): void {
+    event.preventDefault();
+    const parsed = Number.parseFloat(quotaDraft().trim());
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      setQuotaError(new Error("Enter a monthly limit greater than $0."));
+      return;
+    }
+    void saveQuota(Math.round(parsed * 1_000_000));
+  }
 
   async function unlink(): Promise<void> {
     const request = props.onUnlink;
@@ -391,6 +434,85 @@ export default function ComputeCard(props: ComputeCardProps) {
               onChange={props.onSpot}
             />
           </span>
+        </Fact>
+      </Show>
+
+      <Show when={props.account.kind !== "host"}>
+        <Fact label="Monthly quota">
+          <Show
+            when={editingQuota()}
+            fallback={
+              <span class={styles.factInline}>
+                <Show
+                  when={props.account.monthly_limit !== null && props.account.monthly_limit !== undefined}
+                  fallback={<span class={styles.absent}>No limit</span>}
+                >
+                  <>
+                    <strong>{formatUsd(props.account.monthly_spent ?? 0)}</strong>
+                    <span class={styles.dim}>
+                      / {formatUsd(props.account.monthly_limit ?? 0)}
+                    </span>
+                    <Show
+                      when={
+                        (props.account.monthly_spent ?? 0) >=
+                        (props.account.monthly_limit ?? Number.POSITIVE_INFINITY)
+                      }
+                    >
+                      <span class={styles.absent}>Reached</span>
+                    </Show>
+                  </>
+                </Show>
+                <Show when={props.onUpdateQuota !== undefined}>
+                  <button
+                    type="button"
+                    class={styles.action}
+                    disabled={quotaBusy()}
+                    onClick={startEditingQuota}
+                  >
+                    {props.account.monthly_limit ? "Edit" : "Set"}
+                  </button>
+                </Show>
+              </span>
+            }
+          >
+            <form class={styles.factInline} onSubmit={submitQuota}>
+              <input
+                type="number"
+                min="0.01"
+                step="0.01"
+                aria-label={`Monthly quota in USD for ${props.account.label}`}
+                placeholder="100.00"
+                value={quotaDraft()}
+                disabled={quotaBusy()}
+                onInput={(event) => setQuotaDraft(event.currentTarget.value)}
+              />
+              <button type="submit" class={styles.action} disabled={quotaBusy()}>
+                Save
+              </button>
+              <Show when={props.account.monthly_limit !== null && props.account.monthly_limit !== undefined}>
+                <button
+                  type="button"
+                  class={styles.action}
+                  disabled={quotaBusy()}
+                  onClick={() => void saveQuota(null)}
+                >
+                  Clear
+                </button>
+              </Show>
+              <button
+                type="button"
+                class={styles.action}
+                disabled={quotaBusy()}
+                onClick={() => {
+                  setEditingQuota(false);
+                  setQuotaError(null);
+                }}
+              >
+                Cancel
+              </button>
+              <ProblemNotice error={quotaError()} />
+            </form>
+          </Show>
         </Fact>
       </Show>
 

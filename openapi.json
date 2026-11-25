@@ -3858,6 +3858,21 @@
                         "format": "int64",
                         "description": "When it was linked, seconds since the Unix epoch.",
                         "minimum": 0
+                      },
+                      "monthly_limit": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "$ref": "#/components/schemas/Usd",
+                            "description": "Optional monthly spend cap in USD micros (`None` when uncapped)."
+                          }
+                        ]
+                      },
+                      "monthly_spent": {
+                        "$ref": "#/components/schemas/Usd",
+                        "description": "Metered spend accrued on this account in the current UTC calendar month."
                       }
                     }
                   }
@@ -3890,6 +3905,17 @@
                   "label": {
                     "type": "string",
                     "description": "Human-readable name, so an account can be recognised in a list before\nit is unlinked."
+                  },
+                  "monthly_limit": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "$ref": "#/components/schemas/Usd",
+                        "description": "Optional monthly spend cap in USD micros. `None` leaves the account\nuncapped."
+                      }
+                    ]
                   }
                 }
               }
@@ -3940,6 +3966,21 @@
                       "format": "int64",
                       "description": "When it was linked, seconds since the Unix epoch.",
                       "minimum": 0
+                    },
+                    "monthly_limit": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/Usd",
+                          "description": "Optional monthly spend cap in USD micros (`None` when uncapped)."
+                        }
+                      ]
+                    },
+                    "monthly_spent": {
+                      "$ref": "#/components/schemas/Usd",
+                      "description": "Metered spend accrued on this account in the current UTC calendar month."
                     }
                   }
                 }
@@ -4393,6 +4434,21 @@
                       "format": "int64",
                       "description": "When it was linked, seconds since the Unix epoch.",
                       "minimum": 0
+                    },
+                    "monthly_limit": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/Usd",
+                          "description": "Optional monthly spend cap in USD micros (`None` when uncapped)."
+                        }
+                      ]
+                    },
+                    "monthly_spent": {
+                      "$ref": "#/components/schemas/Usd",
+                      "description": "Metered spend accrued on this account in the current UTC calendar month."
                     }
                   }
                 }
@@ -4500,6 +4556,21 @@
                       "format": "int64",
                       "description": "When it was linked, seconds since the Unix epoch.",
                       "minimum": 0
+                    },
+                    "monthly_limit": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/Usd",
+                          "description": "Optional monthly spend cap in USD micros (`None` when uncapped)."
+                        }
+                      ]
+                    },
+                    "monthly_spent": {
+                      "$ref": "#/components/schemas/Usd",
+                      "description": "Metered spend accrued on this account in the current UTC calendar month."
                     }
                   }
                 }
@@ -4848,6 +4919,21 @@
                       "format": "int64",
                       "description": "When it was linked, seconds since the Unix epoch.",
                       "minimum": 0
+                    },
+                    "monthly_limit": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/Usd",
+                          "description": "Optional monthly spend cap in USD micros (`None` when uncapped)."
+                        }
+                      ]
+                    },
+                    "monthly_spent": {
+                      "$ref": "#/components/schemas/Usd",
+                      "description": "Metered spend accrued on this account in the current UTC calendar month."
                     }
                   }
                 }
@@ -5264,6 +5350,21 @@
                       "format": "int64",
                       "description": "When it was linked, seconds since the Unix epoch.",
                       "minimum": 0
+                    },
+                    "monthly_limit": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/Usd",
+                          "description": "Optional monthly spend cap in USD micros (`None` when uncapped)."
+                        }
+                      ]
+                    },
+                    "monthly_spent": {
+                      "$ref": "#/components/schemas/Usd",
+                      "description": "Metered spend accrued on this account in the current UTC calendar month."
                     }
                   }
                 }
@@ -5375,6 +5476,122 @@
         "responses": {
           "204": {
             "description": "Done. There is nothing to return."
+          }
+        }
+      },
+      "patch": {
+        "summary": "Updates a linked cloud-provider account's label or monthly spend quota.",
+        "description": "Updates a linked cloud-provider account's label or monthly spend quota.\n\nCost per call: 2 D1 reads (account lookup + current-month spend rollup),\n1 D1 write (account update), 0 KV / DO / R2 / subrequests.",
+        "operationId": "flyco_api::provider_accounts::update_provider",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Extractor arguments",
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Request body of `PATCH /v1/providers/{id}`.",
+                "properties": {
+                  "clear_monthly_limit": {
+                    "type": "boolean",
+                    "description": "Clears the account's monthly spend cap when `true`."
+                  },
+                  "label": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "description": "New human-readable label, when renaming."
+                  },
+                  "monthly_limit": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "$ref": "#/components/schemas/Usd",
+                        "description": "New monthly spend cap in USD micros (must be greater than zero)."
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "One row of `GET /v1/providers`.",
+                  "required": [
+                    "id",
+                    "kind",
+                    "label",
+                    "linked_at_unix"
+                  ],
+                  "properties": {
+                    "host_id": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/Uuid",
+                          "description": "The enrolled machine this account *is*, when it is one.\n\n`None` for every cloud account. A host is a provider account\n(docs/host-enrollment.md), which is what keeps the catalog, session\ncreation and the usage panel free of a special case for it — but a\nclient holding both `GET /v1/hosts` and `GET /v1/providers` still has\nto know which account is which machine, and an id is the only honest\nway to say so. Inferring it from [`CloudProviderKind::Host`] would\nname the kind and not the machine."
+                        }
+                      ]
+                    },
+                    "id": {
+                      "$ref": "#/components/schemas/Uuid",
+                      "description": "Identifier used to unlink the account."
+                    },
+                    "kind": {
+                      "$ref": "#/components/schemas/CloudProviderKind",
+                      "description": "Which provider it is."
+                    },
+                    "label": {
+                      "type": "string",
+                      "description": "Label supplied when it was linked.\n\nFor a machine the user owns this is the host's own label, kept in\nstep by `PATCH /v1/hosts/{id}`: the two rows name the same thing, so\na rename that moved only one of them would leave the compute chip\ncalling a machine something its card no longer does."
+                    },
+                    "linked_at_unix": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "When it was linked, seconds since the Unix epoch.",
+                      "minimum": 0
+                    },
+                    "monthly_limit": {
+                      "oneOf": [
+                        {
+                          "type": "null"
+                        },
+                        {
+                          "$ref": "#/components/schemas/Usd",
+                          "description": "Optional monthly spend cap in USD micros (`None` when uncapped)."
+                        }
+                      ]
+                    },
+                    "monthly_spent": {
+                      "$ref": "#/components/schemas/Usd",
+                      "description": "Metered spend accrued on this account in the current UTC calendar month."
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -13315,6 +13532,17 @@
           "label": {
             "type": "string",
             "description": "Human-readable name, so an account can be recognised in a list before\nit is unlinked."
+          },
+          "monthly_limit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usd",
+                "description": "Optional monthly spend cap in USD micros. `None` leaves the account\nuncapped."
+              }
+            ]
           }
         }
       },
@@ -14382,6 +14610,21 @@
             "format": "int64",
             "description": "When it was linked, seconds since the Unix epoch.",
             "minimum": 0
+          },
+          "monthly_limit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usd",
+                "description": "Optional monthly spend cap in USD micros (`None` when uncapped)."
+              }
+            ]
+          },
+          "monthly_spent": {
+            "$ref": "#/components/schemas/Usd",
+            "description": "Metered spend accrued on this account in the current UTC calendar month."
           }
         }
       },
@@ -16224,6 +16467,34 @@
               "null"
             ],
             "description": "New title."
+          }
+        }
+      },
+      "UpdateProviderAccount": {
+        "type": "object",
+        "description": "Request body of `PATCH /v1/providers/{id}`.",
+        "properties": {
+          "clear_monthly_limit": {
+            "type": "boolean",
+            "description": "Clears the account's monthly spend cap when `true`."
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "New human-readable label, when renaming."
+          },
+          "monthly_limit": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Usd",
+                "description": "New monthly spend cap in USD micros (must be greater than zero)."
+              }
+            ]
           }
         }
       },

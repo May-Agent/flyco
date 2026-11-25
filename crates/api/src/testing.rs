@@ -36,7 +36,7 @@ use crate::vendors::Vendors;
 
 /// The schema every database-backed test starts from, in the order
 /// `wrangler d1 migrations apply` would run it.
-pub const MIGRATIONS: [&str; 40] = [
+pub const MIGRATIONS: [&str; 41] = [
     include_str!("../../../migrations/0001_init.sql"),
     include_str!("../../../migrations/0002_sessions.sql"),
     include_str!("../../../migrations/0003_daemon.sql"),
@@ -77,6 +77,7 @@ pub const MIGRATIONS: [&str; 40] = [
     include_str!("../../../migrations/0039_idempotency_request_hash.sql"),
     include_str!("../../../migrations/0040_antigravity_harness.sql"),
     include_str!("../../../migrations/0041_storage_quota.sql"),
+    include_str!("../../../migrations/0042_provider_account_quotas.sql"),
 ];
 
 /// Client id the test configuration presents to GitHub.

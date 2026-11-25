@@ -940,16 +940,36 @@ pub(crate) async fn automatic(
         },
     )
     .await?;
+    let exhausted = if account.is_none() {
+        crate::provider_accounts::exhausted_accounts(db, user, now_unix()).await?
+    } else {
+        std::collections::HashSet::new()
+    };
+    let had_entries = !entries.is_empty();
+    let eligible: Vec<MachineCatalogEntry> = if exhausted.is_empty() {
+        entries
+    } else {
+        entries
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .account
+                    .is_none_or(|account_id| !exhausted.contains(&account_id))
+            })
+            .collect()
+    };
     let nothing_yet = || {
-        if pending_accounts.is_empty() {
-            nothing_big_enough()
-        } else {
+        if !pending_accounts.is_empty() {
             ApiError::CatalogNotReady {
                 accounts: pending_accounts.len(),
             }
+        } else if had_entries && eligible.is_empty() && !exhausted.is_empty() {
+            ApiError::AllProviderQuotasExceeded
+        } else {
+            nothing_big_enough()
         }
     };
-    let entry = auto_linux_choice(&entries, spot, near).ok_or_else(nothing_yet)?;
+    let entry = auto_linux_choice(&eligible, spot, near).ok_or_else(nothing_yet)?;
     // `auto_linux_choice` only ever returns an entry with an account; the
     // read is written as a refusal rather than an unwrap so the invariant
     // is enforced here too, where it is used.

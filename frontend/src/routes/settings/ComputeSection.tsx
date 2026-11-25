@@ -34,7 +34,7 @@ import ComputeCard from "../../components/ComputeCard";
 import HostCard from "../../components/HostCard";
 import ProblemNotice from "../../components/ProblemNotice";
 import { useReadiness } from "../../components/Readiness";
-import { listCloudUsage, listHosts, unlinkProvider } from "../../api/client";
+import { listCloudUsage, listHosts, unlinkProvider, updateProvider } from "../../api/client";
 import { setSpotPreference, spotPreference } from "../../lib/localPreferences";
 import styles from "./Settings.module.css";
 
@@ -73,6 +73,16 @@ export default function ComputeSection() {
     await unlinkProvider(id);
     await readiness.refresh();
     void refetchUsage();
+  }
+
+  async function updateQuota(id: string, limitMicros: number | null): Promise<void> {
+    await updateProvider(
+      id,
+      limitMicros === null
+        ? { clear_monthly_limit: true }
+        : { monthly_limit: limitMicros, clear_monthly_limit: false },
+    );
+    await readiness.refresh();
   }
 
   /** A machine was renamed or removed; both lists can have moved. */
@@ -117,6 +127,7 @@ export default function ComputeSection() {
                 usage={usage()?.find((row) => row.account === account.id)}
                 spot={spot()}
                 onSpot={chooseSpot}
+                onUpdateQuota={(limit) => updateQuota(account.id, limit)}
                 onUnlink={() => unlink(account.id)}
               />
             )}
