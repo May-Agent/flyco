@@ -9,7 +9,10 @@ use flyco_core::machine::{CloudProviderKind, MachineSpec, MachineState, Runtime}
 use flyco_core::{MachineId, PermissionMode, SessionId, Usd};
 use serde_json::Value;
 
-use super::{CodespacesProvider, ENV_REPO_NAME, ensure_environment, included_core_hours};
+use super::{
+    CodespacesProvider, ENV_REPO_NAME, devcontainer_b64, devcontainer_json, ensure_environment,
+    included_core_hours,
+};
 use crate::http::{HttpRequest, HttpResponse, Method};
 use crate::testing::{RecordedTransport, RecordingTimer};
 use crate::{
@@ -199,10 +202,20 @@ async fn the_catalog_lists_every_machine_type_in_every_geography() {
 
 const EMPTY_CODESPACES: &str = r#"{"codespaces":[]}"#;
 
+fn current_devcontainer_blob() -> String {
+    let encoded = devcontainer_b64(&devcontainer_json("https://flyco.dev/"));
+    serde_json::json!({
+        "sha": "current-devcontainer-sha",
+        "content": format!("{encoded}\n"),
+    })
+    .to_string()
+}
+
 #[tokio::test]
 async fn a_provision_creates_the_codespace_and_polls_it_available() {
     let mut provider = provider_for(vec![
         json(EMPTY_CODESPACES),
+        json(&current_devcontainer_blob()),
         HttpResponse::new(201, CODESPACE_PROVISIONING.as_bytes().to_vec()),
         json(CODESPACE_AVAILABLE),
     ]);
@@ -232,7 +245,14 @@ async fn a_provision_creates_the_codespace_and_polls_it_available() {
         format!("{API}/repos/{ENV_REPO}/codespaces?per_page=100&page=1")
     );
 
-    let create = provider.transport().request(1);
+    let check_devcontainer = provider.transport().request(1);
+    assert_eq!(check_devcontainer.method, Method::Get);
+    assert_eq!(
+        check_devcontainer.url,
+        format!("{API}/repos/{ENV_REPO}/contents/.devcontainer/devcontainer.json")
+    );
+
+    let create = provider.transport().request(2);
     assert_eq!(create.method, Method::Post);
     assert_eq!(create.url, format!("{API}/user/codespaces"));
     let body = body_of(&create);
@@ -249,7 +269,7 @@ async fn a_provision_creates_the_codespace_and_polls_it_available() {
     assert_eq!(body["retention_period_minutes"], 43_200);
     assert_eq!(body["devcontainer_path"], ".devcontainer/devcontainer.json");
 
-    let poll = provider.transport().request(2);
+    let poll = provider.transport().request(3);
     assert_eq!(poll.method, Method::Get);
     assert_eq!(poll.url, format!("{API}/user/codespaces/{CODESPACE}"));
 }
@@ -258,6 +278,7 @@ async fn a_provision_creates_the_codespace_and_polls_it_available() {
 async fn a_provision_yields_a_continuation_when_the_build_outlives_the_polls() {
     let mut script = vec![
         json(EMPTY_CODESPACES),
+        json(&current_devcontainer_blob()),
         HttpResponse::new(201, CODESPACE_PROVISIONING.as_bytes().to_vec()),
     ];
     // POLLS_PER_INVOCATION inspections, all still building.
@@ -296,6 +317,7 @@ async fn a_provision_yields_a_continuation_when_the_build_outlives_the_polls() {
 async fn a_failed_build_is_an_operation_failure() {
     let mut provider = provider_for(vec![
         json(EMPTY_CODESPACES),
+        json(&current_devcontainer_blob()),
         HttpResponse::new(201, CODESPACE_PROVISIONING.as_bytes().to_vec()),
         json(&CODESPACE_PROVISIONING.replace("\"Provisioning\"", "\"Failed\"")),
     ]);
@@ -312,7 +334,11 @@ async fn a_failed_build_is_an_operation_failure() {
 
 #[tokio::test]
 async fn a_refusal_lifts_the_errors_code_out_of_the_document() {
-    let mut provider = provider_for(vec![json(EMPTY_CODESPACES), refused(422, ERROR_VALIDATION)]);
+    let mut provider = provider_for(vec![
+        json(EMPTY_CODESPACES),
+        json(&current_devcontainer_blob()),
+        refused(422, ERROR_VALIDATION),
+    ]);
 
     let error = provider
         .provision(&request_spec(MachineId::generate()))
@@ -705,4 +731,61 @@ async fn a_resize_that_fails_to_finish_stopping_never_calls_start() {
             .ends_with("/start")),
         "start must never be called while the codespace is still ShuttingDown"
     );
+}
+
+#[test]
+fn devcontainer_json_boots_as_root_for_dual_uid_daemon() {
+    let rendered = devcontainer_json("https://dev.flyco.dev/");
+    let parsed: Value = serde_json::from_str(&rendered).expect("valid JSON");
+    assert_eq!(
+        parsed["image"],
+        flyco_core::release::session_image_for_wire_protocol()
+    );
+    assert_eq!(
+        parsed["containerEnv"]["FLYCO_CONTROL_PLANE"],
+        "https://dev.flyco.dev/"
+    );
+    assert_eq!(parsed["postStartCommand"], "flycod codespace");
+    assert_eq!(parsed["remoteUser"], "root");
+}
+
+#[tokio::test]
+async fn provision_refreshes_a_stale_devcontainer_before_creating() {
+    let stale_blob = serde_json::json!({
+        "sha": "stale-blob-sha",
+        "content": devcontainer_b64(r#"{"image":"ghcr.io/lexoliu/flyco-session:wire-17","remoteUser":"flyco"}"#),
+    })
+    .to_string();
+    let mut provider = provider_for(vec![
+        json(EMPTY_CODESPACES),
+        json(&stale_blob),
+        HttpResponse::new(200, b"{}".to_vec()),
+        HttpResponse::new(201, CODESPACE_PROVISIONING.as_bytes().to_vec()),
+        json(CODESPACE_AVAILABLE),
+    ]);
+
+    let provisioned = provider
+        .provision(&request_spec(MachineId::generate()))
+        .await
+        .expect("provision refreshes stale devcontainer")
+        .ready()
+        .expect("codespace ready");
+    assert_eq!(provisioned.native_id, CODESPACE);
+
+    let put = provider.transport().request(2);
+    assert_eq!(put.method, Method::Put);
+    assert_eq!(
+        put.url,
+        format!("{API}/repos/{ENV_REPO}/contents/.devcontainer/devcontainer.json")
+    );
+    let body = body_of(&put);
+    assert_eq!(body["sha"], "stale-blob-sha");
+    assert_eq!(
+        body["content"],
+        devcontainer_b64(&devcontainer_json("https://flyco.dev/"))
+    );
+
+    let create = provider.transport().request(3);
+    assert_eq!(create.method, Method::Post);
+    assert_eq!(create.url, format!("{API}/user/codespaces"));
 }

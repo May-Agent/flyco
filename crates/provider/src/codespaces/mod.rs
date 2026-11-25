@@ -179,6 +179,8 @@ struct CodespaceListing {
 #[derive(Debug, Deserialize)]
 struct ContentBlob {
     sha: String,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 /// The machine entry inside a codespace, or one row of the machines
@@ -396,8 +398,10 @@ struct Devcontainer<'a> {
     container_env: DevcontainerEnv<'a>,
     /// The entrypoint GitHub runs each time the codespace starts.
     post_start_command: &'static str,
-    /// `flyco`, the image's own user — the daemon and the checkout both
-    /// belong to it.
+    /// `root`, matching the session image's `USER root` — `flycod codespace`
+    /// writes `0600 /etc/flycod/config.toml` and `flycod run` owns the
+    /// root-only managed policy directories while dropping privileges to
+    /// `flyco` for every harness, shell, PTY, and desktop process.
     remote_user: &'static str,
 }
 
@@ -411,9 +415,9 @@ struct DevcontainerEnv<'a> {
 
 /// The document [`ensure_environment`] writes into the repository.
 ///
-/// Rendered at link time rather than kept as a fixture: it bakes in the
-/// deployment's control-plane URL, which is the control plane's fact
-/// rather than the driver's, so the caller passes it in.
+/// Rendered at link time and refreshed on provision rather than kept as a
+/// fixture: it bakes in the deployment's control-plane URL and wire-protocol
+/// image tag so existing accounts never boot stale session images.
 ///
 /// # Panics
 ///
@@ -424,7 +428,7 @@ pub fn devcontainer_json(control_plane: &str) -> String {
         image: &flyco_core::release::session_image_for_wire_protocol(),
         container_env: DevcontainerEnv { control_plane },
         post_start_command: "flycod codespace",
-        remote_user: "flyco",
+        remote_user: "root",
     })
     .expect("a devcontainer is a flat document and always serializes")
 }
@@ -976,6 +980,14 @@ impl<T: HttpTransport, K: Timer> CloudProvider for CodespacesProvider<T, K> {
                 .await;
         }
 
+        sync_devcontainer(
+            &self.transport,
+            &self.token,
+            &self.env_repo,
+            &devcontainer_json(&request.bootstrap.control_plane_url),
+        )
+        .await?;
+
         let body = CreateCodespace {
             repository_id: self.env_repo_id,
             geo: &spec.region,
@@ -1189,10 +1201,35 @@ pub async fn ensure_environment<T: HttpTransport>(
         )));
     }
 
-    // The devcontainer is always rewritten: it pins the session image and
-    // the control-plane URL, and a stale one is a codespace that boots
-    // without its daemon. GitHub requires the existing blob's `sha` on update
-    // (returning 422 without it), so read it first when present.
+    sync_devcontainer(transport, token, &slug, devcontainer_json).await?;
+
+    Ok(EnvRepo {
+        id: repo.id,
+        full_name: repo.full_name,
+    })
+}
+
+/// Ensures `{slug}/.devcontainer/devcontainer.json` matches `devcontainer_json`.
+///
+/// Reads the current blob first and skips the write when its base64 body
+/// already matches, so provisioning an up-to-date account costs one `GET`
+/// and creates no empty commits while still refreshing stale images or
+/// devcontainer settings automatically.
+async fn sync_devcontainer<T: HttpTransport>(
+    transport: &T,
+    token: &str,
+    slug: &str,
+    devcontainer_json: &str,
+) -> Result<(), ProviderError> {
+    let request = |method: Method, url: String| {
+        HttpRequest::new(method, url)
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", API_VERSION)
+            .header("user-agent", USER_AGENT)
+            .bearer(token)
+    };
+
+    let desired_b64 = devcontainer_b64(devcontainer_json);
     let contents_url = format!("{API}/repos/{slug}/contents/{DEVCONTAINER_PATH}");
     let existing = transport
         .send(request(Method::Get, contents_url.clone()))
@@ -1201,6 +1238,13 @@ pub async fn ensure_environment<T: HttpTransport>(
         None
     } else if existing.is_success() {
         let blob: ContentBlob = existing.json()?;
+        if blob.content.as_deref().is_some_and(|raw| {
+            raw.bytes()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .eq(desired_b64.bytes())
+        }) {
+            return Ok(());
+        }
         Some(blob.sha)
     } else {
         return Err(refusal(&existing));
@@ -1209,16 +1253,12 @@ pub async fn ensure_environment<T: HttpTransport>(
     let put = transport
         .send(request(Method::Put, contents_url).json_body(&PutContents {
             message: "Boot flyco sessions",
-            content: &devcontainer_b64(devcontainer_json),
+            content: &desired_b64,
             sha: existing_sha.as_deref(),
         })?)
         .await?;
     if !put.is_success() {
         return Err(refusal(&put));
     }
-
-    Ok(EnvRepo {
-        id: repo.id,
-        full_name: repo.full_name,
-    })
+    Ok(())
 }
