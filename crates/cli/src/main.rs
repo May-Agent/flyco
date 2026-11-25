@@ -54,7 +54,7 @@ async fn dispatch(cli: Cli) -> Outcome<Exit> {
     let api = Api::new(base, token);
 
     match cli.command {
-        None => human::pick_harness(&api, mode).await,
+        None => human::enter_tui(&api, mode).await,
         Some(Command::Login { token }) => auth::login(&api, token, mode).await.map(|()| Exit::Ok),
         Some(Command::Logout) => auth::logout(&api, mode).await.map(|()| Exit::Ok),
         Some(Command::Auth {
@@ -97,9 +97,7 @@ async fn dispatch(cli: Cli) -> Outcome<Exit> {
         Some(Command::Handoff {
             from,
             session,
-            harness,
             message,
-            no_summary,
             include_untracked,
             spec,
         }) => {
@@ -108,9 +106,7 @@ async fn dispatch(cli: Cli) -> Outcome<Exit> {
                 handoff::Args {
                     from,
                     session,
-                    harness,
                     message,
-                    no_summary,
                     include_untracked,
                     spec,
                 },

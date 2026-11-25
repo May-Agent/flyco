@@ -7310,8 +7310,10 @@
               "application/json": {
                 "schema": {
                   "type": "object",
-                  "description": "`GET /v1/sessions/{id}/handoff`, daemon-scoped — what the daemon\nmaterializes after cloning, or `404` for a session that was never a\nhandoff.",
+                  "description": "`GET /v1/sessions/{id}/handoff`, daemon-scoped — what the daemon\nmaterializes after cloning, or `404` for a session that was never a\nlocal resume/handoff.",
                   "required": [
+                    "harness",
+                    "session_id",
                     "base_commit",
                     "patch_sha256",
                     "has_transcript"
@@ -7319,7 +7321,11 @@
                   "properties": {
                     "base_commit": {
                       "type": "string",
-                      "description": "The commit to check out before applying the stored patch."
+                      "description": "The commit to check out before applying the stored patch, or empty\nwhen no local patch needs to be replayed."
+                    },
+                    "harness": {
+                      "$ref": "#/components/schemas/HarnessKind",
+                      "description": "The harness whose native store receives the uploaded transcript payload."
                     },
                     "has_transcript": {
                       "type": "boolean",
@@ -7328,6 +7334,10 @@
                     "patch_sha256": {
                       "type": "string",
                       "description": "SHA-256 the applied patch must hash to, verified before `git\napply` so a corrupt object fails loudly."
+                    },
+                    "session_id": {
+                      "type": "string",
+                      "description": "The harness-native session id being resumed."
                     }
                   }
                 }
@@ -12175,8 +12185,10 @@
       },
       "HandoffView": {
         "type": "object",
-        "description": "`GET /v1/sessions/{id}/handoff`, daemon-scoped — what the daemon\nmaterializes after cloning, or `404` for a session that was never a\nhandoff.",
+        "description": "`GET /v1/sessions/{id}/handoff`, daemon-scoped — what the daemon\nmaterializes after cloning, or `404` for a session that was never a\nlocal resume/handoff.",
         "required": [
+          "harness",
+          "session_id",
           "base_commit",
           "patch_sha256",
           "has_transcript"
@@ -12184,7 +12196,11 @@
         "properties": {
           "base_commit": {
             "type": "string",
-            "description": "The commit to check out before applying the stored patch."
+            "description": "The commit to check out before applying the stored patch, or empty\nwhen no local patch needs to be replayed."
+          },
+          "harness": {
+            "$ref": "#/components/schemas/HarnessKind",
+            "description": "The harness whose native store receives the uploaded transcript payload."
           },
           "has_transcript": {
             "type": "boolean",
@@ -12193,6 +12209,10 @@
           "patch_sha256": {
             "type": "string",
             "description": "SHA-256 the applied patch must hash to, verified before `git\napply` so a corrupt object fails loudly."
+          },
+          "session_id": {
+            "type": "string",
+            "description": "The harness-native session id being resumed."
           }
         }
       },
@@ -13316,7 +13336,7 @@
       },
       "LocalHandoff": {
         "type": "object",
-        "description": "The provenance a `flyco handoff` create declares.",
+        "description": "The provenance a local native resume declares.",
         "required": [
           "harness",
           "session_id",
@@ -13326,19 +13346,19 @@
         "properties": {
           "base_commit": {
             "type": "string",
-            "description": "The commit the local work was based on — `git merge-base HEAD\norigin/<branch>` — which the cloud checkout rewinds the branch to\nbefore the patch applies, so the patch reproduces the local tree\nbyte-for-byte rather than failing against a moved branch tip."
+            "description": "The commit the local work was based on — `git merge-base HEAD\norigin/<branch>` — or empty when no local working-tree patch is\nbeing replayed."
           },
           "harness": {
             "$ref": "#/components/schemas/HarnessKind",
-            "description": "Which harness the local session ran under. The cloud session's own\n`harness` may differ — a Claude session handed to Codex is a\nlegitimate move — so the source is recorded rather than assumed."
+            "description": "Which harness the local session ran under. Must match the cloud\nsession's `harness`; cross-harness handoff is rejected."
           },
           "local_workdir": {
             "type": "string",
-            "description": "The sender's local workdir as an absolute path. Recorded for the\nhandoff prompt's path map and for forensics; the daemon never\nmaterializes it."
+            "description": "The sender's local workdir as an absolute path, recorded for forensics."
           },
           "session_id": {
             "type": "string",
-            "description": "The harness-native session id being handed off — Claude's session\nUUID, Codex's rollout/thread id, Devin's session name."
+            "description": "The harness-native session id to resume — Claude's session UUID,\nCodex's rollout/thread id, Devin's session id, or Antigravity's\nconversation UUID."
           }
         }
       },
@@ -15214,7 +15234,7 @@
             "allOf": [
               {
                 "$ref": "#/components/schemas/LocalHandoff",
-                "description": "`flyco handoff`: import a local harness session's state."
+                "description": "Same-harness native resume of a local session onto a cloud machine."
               },
               {
                 "type": "object",
@@ -15231,7 +15251,7 @@
                 }
               }
             ],
-            "description": "`flyco handoff`: import a local harness session's state."
+            "description": "Same-harness native resume of a local session onto a cloud machine."
           }
         ],
         "description": "Where a new session's context comes from, as `CreateSession::source`.\n\nAbsent means a fresh session — the overwhelmingly common case, so the\nfield is an `Option` rather than a required tag."

@@ -1,18 +1,21 @@
-//! `flyco handoff`: a local harness session's working state sent to a
-//! fresh cloud session.
+//! Same-harness native resume of a local session onto a cloud machine.
 //!
-//! A handoff is *not* a resume. The cloud session opens a new harness
-//! conversation whose first message is a handoff brief — the local
-//! session's own compact summary, an explicit environment-migration
-//! notice, and a path map — while the working tree arrives as a binary
-//! patch and the full transcript lands on disk for the agent to consult.
+//! Used by both `flyco handoff` and the interactive TUI's `/resume-claude`,
+//! `/resume-codex`, `/resume-agy`, and `/resume-devin` commands. The local
+//! session's native transcript (or single-session database) and optional
+//! binary git diff patch are uploaded to object storage, the session's
+//! `harness_session_id` is seeded with the local native id, and `flycod`
+//! materializes the payload straight into the matching harness's native
+//! store before opening the conversation via ACP `session/resume` /
+//! `session/load`. Cross-harness handoff is not supported.
 //!
 //! # Wire flow
 //!
-//! 1. `POST /v1/sessions` with [`SessionSource::LocalHandoff`] records a
+//! 1. `POST /v1/sessions` with [`SessionSource::LocalHandoff`] validates that
+//!    `source.harness == harness`, seeds `harness_session_id`, and records a
 //!    pending `handoffs` row; the machine is reserved but its provisioning
 //!    job is not yet queued — a daemon that booted before the payload
-//!    landed would clone without the patch.
+//!    landed would start without the transcript or patch.
 //! 2. `PUT /v1/sessions/{id}/handoff/patch` and
 //!    `PUT /v1/sessions/{id}/handoff/transcript` upload the two payloads
 //!    to object storage.
@@ -22,32 +25,16 @@
 //!    only then enqueues provisioning.
 //!
 //! On the machine, `flycod` asks `GET /v1/sessions/{id}/handoff` after
-//! cloning: the [`HandoffView`] names the base commit to check out before
-//! the patch applies and whether a transcript object waits to be written
-//! to [`HANDOFF_TRANSCRIPT_PATH`].
+//! cloning: the [`HandoffView`] names the harness and native session id,
+//! the optional base commit to rewind to before applying the patch, and
+//! whether a transcript payload waits to be materialized into the harness's
+//! native store.
 
 use serde::{Deserialize, Serialize};
 
 /// The workdir every provisioned machine checks the session's repository
 /// out into.
-///
-/// A constant rather than a per-machine fact because the handoff prompt's
-/// path map is written before the machine exists: the CLI rewrites the
-/// sender's local workdir prefix to this path, and could not do that if
-/// the destination were only known at provision time.
 pub const SESSION_WORKDIR: &str = "/srv/flyco/work";
-
-/// The directory a handoff's artifacts are materialized into, outside the
-/// workdir so the session's diff and file views stay clean.
-pub const HANDOFF_DIR: &str = "/var/lib/flyco/handoff";
-
-/// Where a handoff's uploaded transcript lands on the cloud machine.
-///
-/// Outside the workdir on purpose: inside it the file would appear in
-/// every diff the browser renders. The handoff prompt names this path so
-/// the agent can grep the previous session's history for detail the
-/// compact summary dropped.
-pub const HANDOFF_TRANSCRIPT_PATH: &str = "/var/lib/flyco/handoff/transcript";
 
 /// Largest handoff patch accepted, in bytes.
 ///
@@ -57,7 +44,7 @@ pub const HANDOFF_TRANSCRIPT_PATH: &str = "/var/lib/flyco/handoff/transcript";
 pub const HANDOFF_PATCH_BYTES_MAX: u64 = 256 * 1024 * 1024;
 
 /// Largest handoff transcript accepted, in bytes. Transcripts are JSONL
-/// and compact-but-not-tiny; a gigabyte is well past any real session.
+/// or single-session SQLite databases; a gigabyte is well past any real session.
 pub const HANDOFF_TRANSCRIPT_BYTES_MAX: u64 = 1024 * 1024 * 1024;
 
 /// Where a new session's context comes from, as `CreateSession::source`.
@@ -67,28 +54,25 @@ pub const HANDOFF_TRANSCRIPT_BYTES_MAX: u64 = 1024 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionSource {
-    /// `flyco handoff`: import a local harness session's state.
+    /// Same-harness native resume of a local session onto a cloud machine.
     LocalHandoff(LocalHandoff),
 }
 
-/// The provenance a `flyco handoff` create declares.
+/// The provenance a local native resume declares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LocalHandoff {
-    /// Which harness the local session ran under. The cloud session's own
-    /// `harness` may differ — a Claude session handed to Codex is a
-    /// legitimate move — so the source is recorded rather than assumed.
+    /// Which harness the local session ran under. Must match the cloud
+    /// session's `harness`; cross-harness handoff is rejected.
     pub harness: crate::harness::HarnessKind,
-    /// The harness-native session id being handed off — Claude's session
-    /// UUID, Codex's rollout/thread id, Devin's session name.
+    /// The harness-native session id to resume — Claude's session UUID,
+    /// Codex's rollout/thread id, Devin's session id, or Antigravity's
+    /// conversation UUID.
     pub session_id: String,
     /// The commit the local work was based on — `git merge-base HEAD
-    /// origin/<branch>` — which the cloud checkout rewinds the branch to
-    /// before the patch applies, so the patch reproduces the local tree
-    /// byte-for-byte rather than failing against a moved branch tip.
+    /// origin/<branch>` — or empty when no local working-tree patch is
+    /// being replayed.
     pub base_commit: String,
-    /// The sender's local workdir as an absolute path. Recorded for the
-    /// handoff prompt's path map and for forensics; the daemon never
-    /// materializes it.
+    /// The sender's local workdir as an absolute path, recorded for forensics.
     pub local_workdir: String,
 }
 
@@ -112,10 +96,15 @@ pub struct HandoffManifest {
 
 /// `GET /v1/sessions/{id}/handoff`, daemon-scoped — what the daemon
 /// materializes after cloning, or `404` for a session that was never a
-/// handoff.
+/// local resume/handoff.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct HandoffView {
-    /// The commit to check out before applying the stored patch.
+    /// The harness whose native store receives the uploaded transcript payload.
+    pub harness: crate::harness::HarnessKind,
+    /// The harness-native session id being resumed.
+    pub session_id: String,
+    /// The commit to check out before applying the stored patch, or empty
+    /// when no local patch needs to be replayed.
     pub base_commit: String,
     /// SHA-256 the applied patch must hash to, verified before `git
     /// apply` so a corrupt object fails loudly.
