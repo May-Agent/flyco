@@ -38,6 +38,7 @@ import {
   Wallet,
   WifiOff,
 } from "lucide-solid";
+import ApprovalPrompt from "../components/ApprovalPrompt";
 import { BudgetRaise } from "../components/BudgetPicker";
 import GoalChip from "../components/GoalChip";
 import ConfirmDialog from "../components/ConfirmDialog";
@@ -569,6 +570,16 @@ function SessionView(props: { id: string }) {
   const covered = createMemo(() => !refused() && notice()?.action?.kind === "resume");
 
   /**
+   * The pending approval currently occupying the composer slot, if any.
+   *
+   * Permission requests replace the composer instead of appearing as chat cards
+   * in the transcript, so the decision sits where the user acts next.
+   */
+  const activeApproval = createMemo(() =>
+    !refused() && !covered() ? waiting()[0] : undefined,
+  );
+
+  /**
    * Whether a daemon is holding the room — what a `!` command, a
    * `/compact`, a terminal keystroke or a context breakdown needs.
    *
@@ -1027,22 +1038,6 @@ function SessionView(props: { id: string }) {
           <div class={styles.scroller} ref={scroller} onScroll={noteScroll}>
             <div ref={transcriptBody}>
             {/*
-            The banner is sticky so an approval raised a hundred rows ago is
-            still one click away, and amber because it is the one thing on
-            the page holding everything else up.
-          */}
-            <Show when={waiting().length > 0}>
-              <div class={styles.approvalDock}>
-                <p class={styles.approvalBanner}>
-                  <AlertTriangle size={14} aria-hidden="true" />
-                  {waiting().length === 1
-                    ? "The agent is waiting on your decision."
-                    : `The agent is waiting on ${waiting().length} decisions.`}
-                </p>
-              </div>
-            </Show>
-
-            {/*
             An empty transcript says something different in every state,
             and the first one a new user meets is the one that matters
             most: the prompt has already gone out with `POST /v1/sessions`
@@ -1084,10 +1079,6 @@ function SessionView(props: { id: string }) {
                 repo={reposLabel(session()?.repos ?? [])}
                 provider={providerLabel()}
                 models={models()}
-                onDecide={(id, decision) => {
-                  void onDecide(id, decision).then(() => refetchSession());
-                }}
-                deciding={deciding()}
                 now={now()}
                 stoppedAtUnix={stoppedAtUnix()}
               />
@@ -1203,17 +1194,20 @@ function SessionView(props: { id: string }) {
                 </section>
               )}
             </Show>
-            <Show when={!refused()}>
-              <div
-                class={cx(styles.composerBox, covered() && styles.composerInert)}
-                ref={(el) => {
-                  // `inert` takes the box out of tabbing and hit-testing
-                  // while the notice lies over it; Solid's JSX types do
-                  // not know the attribute yet, so it is set on the node.
-                  createEffect(() => el.toggleAttribute("inert", covered()));
-                }}
-              >
-              <SessionComposer
+            <Show
+              when={activeApproval()}
+              fallback={
+                <Show when={!refused()}>
+                  <div
+                    class={cx(styles.composerBox, covered() && styles.composerInert)}
+                    ref={(el) => {
+                      // `inert` takes the box out of tabbing and hit-testing
+                      // while the notice lies over it; Solid's JSX types do
+                      // not know the attribute yet, so it is set on the node.
+                      createEffect(() => el.toggleAttribute("inert", covered()));
+                    }}
+                  >
+                  <SessionComposer
                 turnInFlight={status()?.status === "working"}
                 commands={commands()}
                 onSend={onSend}
@@ -1363,7 +1357,20 @@ function SessionView(props: { id: string }) {
                   </>
                 }
               />
-              </div>
+                  </div>
+                </Show>
+              }
+            >
+              {(approval) => (
+                <ApprovalPrompt
+                  approval={approval()}
+                  remaining={waiting().length}
+                  deciding={deciding()}
+                  onDecide={(id, decision) => {
+                    void onDecide(id, decision).then(() => refetchSession());
+                  }}
+                />
+              )}
             </Show>
           </div>
         </div>

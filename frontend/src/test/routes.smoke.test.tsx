@@ -790,6 +790,96 @@ describe("route smoke tests", () => {
     ).toBeInTheDocument();
   });
 
+  it("replaces the composer with a pending approval prompt instead of rendering an approval card in the transcript", async () => {
+    const base = vi.mocked(fetch).getMockImplementation();
+    const encoder = new TextEncoder();
+    const feeds: ReadableStreamDefaultController<Uint8Array>[] = [];
+    let decided: { path: string; body: unknown } | null = null;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const url = new URL(String(input instanceof Request ? input.url : input));
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (url.pathname === "/v1/events") {
+        return Promise.resolve(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                feeds.push(controller);
+              },
+            }),
+            { status: 200, headers: { "content-type": "text/event-stream" } },
+          ),
+        );
+      }
+      if (method === "POST" && url.pathname === "/v1/approvals/ap-1/decision") {
+        decided = { path: url.pathname, body: JSON.parse(String(init?.body)) };
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return base!(input, init);
+    });
+
+    const { findByRole, getByRole, queryByLabelText, queryByRole } =
+      renderAt("/sessions/abc-123");
+
+    // Composer is visible before any approval is pending.
+    expect(await findByRole("textbox", { name: "Message the agent" })).toBeInTheDocument();
+
+    await vi.waitFor(() => expect(feeds.length).toBeGreaterThan(0));
+    const pendingFrame = `id: 1\ndata: ${JSON.stringify({
+      session: "abc-123",
+      seq: 1,
+      at_unix: 1_800_000_000,
+      event: {
+        type: "approval_pending",
+        id: "ap-1",
+        payload: {
+          kind: "tool_use",
+          tool: "Bash",
+          input: { command: "uname -s -m" },
+        },
+      },
+    })}\n\n`;
+    for (const feed of feeds) {
+      feed.enqueue(encoder.encode(pendingFrame));
+    }
+
+    const approvalRegion = await findByRole("region", { name: "Approval" });
+    expect(approvalRegion.textContent).toContain("Run Bash");
+    expect(approvalRegion.textContent).toContain("uname -s -m");
+    // The approval replaces the composer slot rather than appearing beside it
+    // or inside the transcript list.
+    expect(queryByLabelText("Message the agent")).not.toBeInTheDocument();
+    expect(queryByRole("list", { name: "Transcript" })?.contains(approvalRegion)).toBeFalsy();
+
+    fireEvent.click(getByRole("button", { name: "Approve" }));
+    await vi.waitFor(() =>
+      expect(decided).toEqual({
+        path: "/v1/approvals/ap-1/decision",
+        body: { decision: "approved" },
+      }),
+    );
+
+    const decidedFrame = `id: 2\ndata: ${JSON.stringify({
+      session: "abc-123",
+      seq: 2,
+      at_unix: 1_800_000_005,
+      event: {
+        type: "approval_decided",
+        id: "ap-1",
+        decision: "approved",
+      },
+    })}\n\n`;
+    for (const feed of feeds) {
+      feed.enqueue(encoder.encode(decidedFrame));
+    }
+
+    // Once decided, the composer returns and no approval card stays in the transcript.
+    expect(await findByRole("textbox", { name: "Message the agent" })).toBeInTheDocument();
+    expect(queryByRole("region", { name: "Approval" })).not.toBeInTheDocument();
+  });
+
   it("offers a failed session a resume, and takes it back to provisioning", async () => {
     // The page used to state the provider's error and offer nothing: no
     // way on, and a composer that refused without saying why (issue #133).
