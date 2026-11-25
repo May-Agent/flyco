@@ -650,6 +650,9 @@ export type CloudUsageRow = JsonResponse<
   200
 >[number];
 
+/** Current R2 object storage usage and effective quota from `GET /v1/usage/storage`. */
+export type StorageUsageView = Schemas["StorageUsageView"];
+
 /**
  * Observed usage per linked harness account.
  *
@@ -668,6 +671,13 @@ export function listCloudUsage(
   provider?: CloudProviderKind,
 ): Promise<JsonResponse<"flyco_api::provider_accounts::cloud_usage", 200>> {
   return requestJson("GET", "/v1/usage/cloud", { query: { provider } });
+}
+
+/** Current R2 object storage usage and per-user quota. */
+export function getStorageUsage(): Promise<
+  JsonResponse<"flyco_api::storage_quota::get_storage_usage", 200>
+> {
+  return requestJson("GET", "/v1/usage/storage");
 }
 
 // --- /v1/mcp-servers ---------------------------------------------------------

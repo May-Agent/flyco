@@ -207,6 +207,20 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     );
 }
 
+fn format_lobby_storage(app: &AppState) -> String {
+    app.storage_usage.map_or_else(
+        || "loading…".to_owned(),
+        |usage| {
+            format!(
+                "{} / {} ({:.1}%)",
+                crate::discover::format_bytes(usage.used_bytes),
+                crate::discover::format_bytes(usage.quota_bytes),
+                crate::discover::storage_percent(usage.used_bytes, usage.quota_bytes)
+            )
+        },
+    )
+}
+
 fn draw_lobby(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let padded = Rect {
         x: area.x.saturating_add(2),
@@ -220,7 +234,7 @@ fn draw_lobby(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(1)])
+        .constraints([Constraint::Length(12), Constraint::Min(1)])
         .split(padded);
 
     let panes = Layout::default()
@@ -238,6 +252,7 @@ fn draw_lobby(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
     let branch_text = app.lobby.branch.as_deref().unwrap_or("(default)");
     let machine_text = app.lobby.machine_label.as_deref().unwrap_or("auto");
     let budget_text = format!("{}", app.lobby.budget);
+    let storage_text = format_lobby_storage(app);
 
     let cfg_lines = vec![
         kv_line(
@@ -250,6 +265,7 @@ fn draw_lobby(frame: &mut Frame<'_>, area: Rect, app: &AppState) {
         kv_line("Branch", branch_text, Color::White),
         kv_line("Machine", machine_text, Color::White),
         kv_line("Budget", &budget_text, Color::Green),
+        kv_line("Storage", &storage_text, Color::White),
         Line::raw(""),
         Line::from(vec![
             Span::styled("Type a prompt", Style::default().fg(Color::Cyan)),

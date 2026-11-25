@@ -202,10 +202,21 @@ pub(crate) async fn store(
     .fetch_scalar_optional()
     .await?;
     let id = existing.unwrap_or_else(SkillId::generate);
-
-    storage.put(&bundle_key(id), body.to_vec()).await?;
-
+    let key = bundle_key(id);
     let size = body.len() as u64;
+    crate::storage_quota::check_write(db, user, &key, size).await?;
+
+    storage.put(&key, body.to_vec()).await?;
+    crate::storage_quota::record_write(
+        db,
+        user,
+        None,
+        crate::storage_quota::StorageCategory::Skill,
+        &key,
+        size,
+    )
+    .await?;
+
     let row: SkillRow = sql!(
         db,
         "INSERT INTO skills (id, user_id, name, size_bytes, uploaded_at_unix) \
@@ -261,13 +272,15 @@ async fn remove(
     let id: SkillId = path_id(params, "id")?;
     let row = load(db, user, id).await?;
 
+    let key = bundle_key(id);
     sql!(
         db,
         "DELETE FROM skills WHERE id = {id} AND user_id = {user}"
     )
     .execute()
     .await?;
-    storage.delete(&bundle_key(id)).await?;
+    storage.delete(&key).await?;
+    crate::storage_quota::record_delete(db, &key).await?;
 
     tracing::info!(skill = %id, name = %row.name, "removed a skill bundle");
     Ok(NoContent)

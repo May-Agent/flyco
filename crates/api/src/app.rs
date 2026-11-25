@@ -52,7 +52,7 @@ use crate::{
     devin_oauth, env, handoffs, harness_accounts, hosts, idempotency, machines, marketplaces, mcp,
     mcp_catalog, memory, oauth, observations, problem, provider_accounts, provider_oauth,
     provisioning, push, relay, releases, repos, responses, session_repos, sessions, skill_catalog,
-    skills, transcripts, turns, usage_limits, users, webhooks, workdirs,
+    skills, storage_quota, transcripts, turns, usage_limits, users, webhooks, workdirs,
 };
 use flyco_core::wire::EventPage;
 
@@ -3172,26 +3172,47 @@ async fn observe(
 }
 
 /// Stores one batch of a session's transcript.
+///
+/// Costs 2 D1 reads (session owner + storage quota check), 1 D1 write
+/// (storage ledger upsert), 1 R2 HEAD + 1 R2 PUT.
 async fn put_transcript_batch(
     State(session): State<DaemonSession>,
     params: Params,
     body: Bytes,
+    db: Db,
     storage: Storage,
 ) -> Outcome<NoContent> {
-    store_batch(session.0, &params, body, &storage).await.into()
+    store_batch(session.0, &params, body, &db, &storage)
+        .await
+        .into()
 }
 
 async fn store_batch(
     session: SessionId,
     params: &Params,
     body: Bytes,
+    db: &Db,
     storage: &Storage,
 ) -> Result<NoContent, ApiError> {
     let stream = path_segment(params, "stream")?;
     let raw = path_segment(params, "seq")?;
     let seq = raw.parse::<u64>().map_err(|_| ApiError::MalformedId(raw))?;
 
+    let owner = sessions::owner(db, session).await?;
+    let key = transcripts::batch_key(&session.to_string(), &stream, seq);
+    let size = body.len() as u64;
+    storage_quota::check_write(db, owner, &key, size).await?;
+
     transcripts::put_batch(storage, session, &stream, seq, body.to_vec()).await?;
+    storage_quota::record_write(
+        db,
+        owner,
+        Some(session),
+        storage_quota::StorageCategory::Transcript,
+        &key,
+        size,
+    )
+    .await?;
     Ok(NoContent)
 }
 
@@ -3242,14 +3263,18 @@ struct PatchQuery {
 
 /// Stores the uncommitted diff of one checkout of a session about to be
 /// archived automatically.
+///
+/// Costs 2 D1 reads (session owner + storage quota check), 1 D1 write
+/// (storage ledger upsert), and 1 R2 PUT.
 #[skyzen::openapi]
 async fn put_workdir_patch(
     State(session): State<DaemonSession>,
     Query(query): Query<PatchQuery>,
     body: Bytes,
+    db: Db,
     storage: Storage,
 ) -> Outcome<NoContent> {
-    store_workdir_patch(session.0, query.repo.as_deref(), body, &storage)
+    store_workdir_patch(session.0, query.repo.as_deref(), body, &db, &storage)
         .await
         .into()
 }
@@ -3258,9 +3283,25 @@ async fn store_workdir_patch(
     session: SessionId,
     dir: Option<&str>,
     body: Bytes,
+    db: &Db,
     storage: &Storage,
 ) -> Result<NoContent, ApiError> {
-    workdirs::put(storage, session, dir.unwrap_or("."), body.to_vec()).await?;
+    let owner = sessions::owner(db, session).await?;
+    let dir = dir.unwrap_or(".");
+    let key = workdirs::key(session, dir);
+    let size = body.len() as u64;
+    storage_quota::check_write(db, owner, &key, size).await?;
+
+    workdirs::put(storage, session, dir, body.to_vec()).await?;
+    storage_quota::record_write(
+        db,
+        owner,
+        Some(session),
+        storage_quota::StorageCategory::WorkdirPatch,
+        &key,
+        size,
+    )
+    .await?;
     Ok(NoContent)
 }
 
@@ -3341,7 +3382,18 @@ async fn store_handoff_patch(
         .into_iter()
         .next()
         .ok_or(ApiError::CorruptRecord("a session with no repository"))?;
+    let key = workdirs::key(id, &primary.dir);
+    storage_quota::check_write(db, user.id, &key, bytes).await?;
     workdirs::put(storage, id, &primary.dir, body.to_vec()).await?;
+    storage_quota::record_write(
+        db,
+        user.id,
+        Some(id),
+        storage_quota::StorageCategory::WorkdirPatch,
+        &key,
+        bytes,
+    )
+    .await?;
     // Recorded after the put, never before: a row claiming an upload that
     // never landed would let `complete` pass against a missing object.
     handoffs::record_patch(db, id, &body).await?;
@@ -3380,7 +3432,18 @@ async fn store_handoff_transcript(
             limit: flyco_core::HANDOFF_TRANSCRIPT_BYTES_MAX,
         });
     }
+    let key = handoffs::transcript_key(id);
+    storage_quota::check_write(db, user.id, &key, bytes).await?;
     handoffs::put_transcript(storage, id, body.to_vec()).await?;
+    storage_quota::record_write(
+        db,
+        user.id,
+        Some(id),
+        storage_quota::StorageCategory::Handoff,
+        &key,
+        bytes,
+    )
+    .await?;
     handoffs::record_transcript(db, id, &body).await?;
     Ok(NoContent)
 }
@@ -3882,6 +3945,7 @@ fn authenticated_routes() -> Vec<RouteNode> {
     nodes.extend(repos::routes());
     nodes.extend(skill_catalog::routes());
     nodes.extend(skills::routes());
+    nodes.extend(storage_quota::routes());
     Route::new(nodes)
         .middleware(RequireAuth::new(FlycoAuthenticator::new()))
         .into_route_nodes()

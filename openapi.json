@@ -9018,7 +9018,7 @@
       },
       "put": {
         "summary": "Stores the uncommitted diff of one checkout of a session about to be archived automatically.",
-        "description": "Stores the uncommitted diff of one checkout of a session about to be\narchived automatically.",
+        "description": "Stores the uncommitted diff of one checkout of a session about to be\narchived automatically.\n\nCosts 2 D1 reads (session owner + storage quota check), 1 D1 write\n(storage ledger upsert), and 1 R2 PUT.",
         "operationId": "flyco_api::app::put_workdir_patch",
         "parameters": [
           {
@@ -9411,6 +9411,49 @@
                         "description": "When that limit resets, when the harness named a time.",
                         "minimum": 0
                       }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/usage/storage": {
+      "get": {
+        "summary": "`GET /v1/usage/storage` — the caller's current R2 storage usage and quota.",
+        "description": "`GET /v1/usage/storage` — the caller's current R2 storage usage and quota.\n\nCosts 2 D1 reads (quota lookup + grouped category sum), 0 writes, 0 KV,\n0 Durable Object calls, 0 R2 calls, 0 subrequests.",
+        "operationId": "flyco_api::storage_quota::get_storage_usage",
+        "responses": {
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "description": "Response of `GET /v1/usage/storage`: the caller's current R2 storage usage\nand effective per-user quota.",
+                  "required": [
+                    "used_bytes",
+                    "quota_bytes",
+                    "breakdown"
+                  ],
+                  "properties": {
+                    "breakdown": {
+                      "$ref": "#/components/schemas/StorageUsageBreakdown",
+                      "description": "Breakdown of `used_bytes` by object category."
+                    },
+                    "quota_bytes": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Effective storage quota for this user, in bytes.",
+                      "minimum": 0
+                    },
+                    "used_bytes": {
+                      "type": "integer",
+                      "format": "int64",
+                      "description": "Total bytes currently stored across all user-owned R2 object categories.",
+                      "minimum": 0
                     }
                   }
                 }
@@ -15681,6 +15724,69 @@
           }
         ],
         "description": "How a provider prices the persistent disk attached to a machine."
+      },
+      "StorageUsageBreakdown": {
+        "type": "object",
+        "description": "Per-category breakdown of a user's stored R2 objects.",
+        "required": [
+          "transcripts_bytes",
+          "handoffs_bytes",
+          "workdir_patches_bytes",
+          "skills_bytes"
+        ],
+        "properties": {
+          "handoffs_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Handoff and local-resume transcript payloads (`handoffs/`).",
+            "minimum": 0
+          },
+          "skills_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Uploaded skill zip bundles (`skills/`).",
+            "minimum": 0
+          },
+          "transcripts_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Session transcript JSONL batches (`transcripts/`).",
+            "minimum": 0
+          },
+          "workdir_patches_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Uncommitted checkout diff patches (`workdirs/`).",
+            "minimum": 0
+          }
+        }
+      },
+      "StorageUsageView": {
+        "type": "object",
+        "description": "Response of `GET /v1/usage/storage`: the caller's current R2 storage usage\nand effective per-user quota.",
+        "required": [
+          "used_bytes",
+          "quota_bytes",
+          "breakdown"
+        ],
+        "properties": {
+          "breakdown": {
+            "$ref": "#/components/schemas/StorageUsageBreakdown",
+            "description": "Breakdown of `used_bytes` by object category."
+          },
+          "quota_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Effective storage quota for this user, in bytes.",
+            "minimum": 0
+          },
+          "used_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total bytes currently stored across all user-owned R2 object categories.",
+            "minimum": 0
+          }
+        }
       },
       "StoredEvent": {
         "type": "object",

@@ -231,10 +231,23 @@ pub async fn status(api: &Api, mode: out::Mode) -> Outcome<()> {
     let me: CurrentUser = api.get("/v1/me").await?;
     match mode {
         out::Mode::Json => out::emit(&me),
-        out::Mode::Human => out::print(&format!(
-            "{} ({} sessions at once)",
-            me.login, me.session_cap
-        )),
+        out::Mode::Human => {
+            let storage = api
+                .get::<flyco_core::StorageUsageView>("/v1/usage/storage")
+                .await
+                .ok();
+            let line = match storage {
+                Some(usage) => format!(
+                    "{} ({} sessions at once) — storage {} / {}",
+                    me.login,
+                    me.session_cap,
+                    crate::discover::format_bytes(usage.used_bytes),
+                    crate::discover::format_bytes(usage.quota_bytes),
+                ),
+                None => format!("{} ({} sessions at once)", me.login, me.session_cap),
+            };
+            out::print(&line)
+        }
     }
 }
 

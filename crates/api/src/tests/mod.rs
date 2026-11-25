@@ -35,6 +35,7 @@ mod schema_version;
 mod sessions;
 mod skill_catalog;
 mod skills;
+mod storage_quota;
 mod turns;
 mod turnstile;
 mod usage;

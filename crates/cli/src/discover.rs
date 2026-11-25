@@ -3,7 +3,9 @@
 //! Each is one route, answered verbatim under `--json` and rendered as a
 //! table for a person.
 
-use flyco_core::{BranchPage, HarnessAccountView, HarnessFeature, MachineCatalog, RepoSummary};
+use flyco_core::{
+    BranchPage, HarnessAccountView, HarnessFeature, MachineCatalog, RepoSummary, StorageUsageView,
+};
 
 use crate::client::Api;
 use crate::{Outcome, out};
@@ -46,6 +48,83 @@ pub async fn catalog(api: &Api, mode: out::Mode) -> Outcome<()> {
             out::print(&text)
         }
     }
+}
+
+/// `flyco storage` — `GET /v1/usage/storage`.
+///
+/// # Errors
+/// Returns [`Failure`](crate::Failure) when the request fails or the answer does not decode.
+pub async fn storage(api: &Api, mode: out::Mode) -> Outcome<()> {
+    let usage: StorageUsageView = api.get("/v1/usage/storage").await?;
+    match mode {
+        out::Mode::Json => out::emit(&usage),
+        out::Mode::Human => {
+            let pct = storage_percent(usage.used_bytes, usage.quota_bytes);
+            let rows = vec![
+                vec![
+                    "Transcripts".to_owned(),
+                    format_bytes(usage.breakdown.transcripts_bytes),
+                ],
+                vec![
+                    "Handoffs".to_owned(),
+                    format_bytes(usage.breakdown.handoffs_bytes),
+                ],
+                vec![
+                    "Patches".to_owned(),
+                    format_bytes(usage.breakdown.workdir_patches_bytes),
+                ],
+                vec![
+                    "Skills".to_owned(),
+                    format_bytes(usage.breakdown.skills_bytes),
+                ],
+                vec![
+                    "Total".to_owned(),
+                    format!(
+                        "{} / {} ({pct:.1}%)",
+                        format_bytes(usage.used_bytes),
+                        format_bytes(usage.quota_bytes)
+                    ),
+                ],
+            ];
+            out::print(&out::table(&["CATEGORY", "USED"], &rows))
+        }
+    }
+}
+
+/// Formats a byte count using decimal SI units matching R2 billing (1 GB = 10^9 bytes).
+#[must_use]
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1_000.0;
+    const MB: f64 = 1_000_000.0;
+    const GB: f64 = 1_000_000_000.0;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display-only storage readout needs at most two decimal places"
+    )]
+    let value = bytes as f64;
+    if value >= GB {
+        format!("{:.2} GB", value / GB)
+    } else if value >= MB {
+        format!("{:.2} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Percentage of `quota` consumed by `used`, clamped to `[0.0, 100.0]`.
+#[must_use]
+pub fn storage_percent(used: u64, quota: u64) -> f64 {
+    if quota == 0 {
+        return if used == 0 { 0.0 } else { 100.0 };
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display-only percentage readout"
+    )]
+    let pct = (used as f64 / quota as f64) * 100.0;
+    pct.clamp(0.0, 100.0)
 }
 
 /// `flyco repos` — `GET /v1/github/repos`.

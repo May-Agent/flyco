@@ -113,6 +113,42 @@ pub struct LlmUsageView {
     pub resets_at_unix: Option<u64>,
 }
 
+/// Per-category breakdown of a user's stored R2 objects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+pub struct StorageUsageBreakdown {
+    /// Session transcript JSONL batches (`transcripts/`).
+    pub transcripts_bytes: u64,
+    /// Handoff and local-resume transcript payloads (`handoffs/`).
+    pub handoffs_bytes: u64,
+    /// Uncommitted checkout diff patches (`workdirs/`).
+    pub workdir_patches_bytes: u64,
+    /// Uploaded skill zip bundles (`skills/`).
+    pub skills_bytes: u64,
+}
+
+impl StorageUsageBreakdown {
+    /// Total bytes across all categories.
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.transcripts_bytes
+            .saturating_add(self.handoffs_bytes)
+            .saturating_add(self.workdir_patches_bytes)
+            .saturating_add(self.skills_bytes)
+    }
+}
+
+/// Response of `GET /v1/usage/storage`: the caller's current R2 storage usage
+/// and effective per-user quota.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct StorageUsageView {
+    /// Total bytes currently stored across all user-owned R2 object categories.
+    pub used_bytes: u64,
+    /// Effective storage quota for this user, in bytes.
+    pub quota_bytes: u64,
+    /// Breakdown of `used_bytes` by object category.
+    pub breakdown: StorageUsageBreakdown,
+}
+
 /// One thing a session's daemon saw happen to the harness account driving
 /// it, as `POST /v1/sessions/{id}/harness-observations` records it.
 ///

@@ -66,6 +66,7 @@ async fn dispatch(cli: Cli) -> Outcome<Exit> {
             .await
             .map(|()| Exit::Ok),
         Some(Command::Harnesses) => discover::harnesses(&api, mode).await.map(|()| Exit::Ok),
+        Some(Command::Storage) => discover::storage(&api, mode).await.map(|()| Exit::Ok),
         Some(Command::Session { command }) => session_command(&api, command, mode).await,
         Some(Command::Run {
             harness,
