@@ -1592,7 +1592,14 @@ export interface paths {
         delete: operations["flyco_api::provider_accounts::unlink_provider"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Updates a linked cloud-provider account's label or monthly spend quota.
+         * @description Updates a linked cloud-provider account's label or monthly spend quota.
+         *
+         *     Cost per call: 2 D1 reads (account lookup + current-month spend rollup),
+         *     1 D1 write (account update), 0 KV / DO / R2 / subrequests.
+         */
+        patch: operations["flyco_api::provider_accounts::update_provider"];
         trace?: never;
     };
     "/v1/push/subscriptions": {
@@ -5311,6 +5318,7 @@ export interface components {
              *     it is unlinked.
              */
             label: string;
+            monthly_limit?: null | components["schemas"]["Usd"];
         };
         /**
          * @description One row of `GET /v1/usage/llm`, covering one linked harness account.
@@ -5979,6 +5987,9 @@ export interface components {
              * @description When it was linked, seconds since the Unix epoch.
              */
             linked_at_unix: number;
+            monthly_limit?: null | components["schemas"]["Usd"];
+            /** @description Metered spend accrued on this account in the current UTC calendar month. */
+            monthly_spent?: components["schemas"]["Usd"];
         };
         /** @description One suggestion returned by the quickstart questionnaire. */
         ProviderBonusHint: {
@@ -7123,6 +7134,14 @@ export interface components {
             content?: string | null;
             /** @description New title. */
             title?: string | null;
+        };
+        /** @description Request body of `PATCH /v1/providers/{id}`. */
+        UpdateProviderAccount: {
+            /** @description Clears the account's monthly spend cap when `true`. */
+            clear_monthly_limit?: boolean;
+            /** @description New human-readable label, when renaming. */
+            label?: string | null;
+            monthly_limit?: null | components["schemas"]["Usd"];
         };
         /**
          * @description Request body of `PATCH /v1/sessions/{id}`.
@@ -9840,6 +9859,9 @@ export interface operations {
                          * @description When it was linked, seconds since the Unix epoch.
                          */
                         linked_at_unix: number;
+                        monthly_limit?: null | components["schemas"]["Usd"];
+                        /** @description Metered spend accrued on this account in the current UTC calendar month. */
+                        monthly_spent?: components["schemas"]["Usd"];
                     }[];
                 };
             };
@@ -9863,6 +9885,7 @@ export interface operations {
                      *     it is unlinked.
                      */
                     label: string;
+                    monthly_limit?: null | components["schemas"]["Usd"];
                 };
             };
         };
@@ -9893,6 +9916,9 @@ export interface operations {
                          * @description When it was linked, seconds since the Unix epoch.
                          */
                         linked_at_unix: number;
+                        monthly_limit?: null | components["schemas"]["Usd"];
+                        /** @description Metered spend accrued on this account in the current UTC calendar month. */
+                        monthly_spent?: components["schemas"]["Usd"];
                     };
                 };
             };
@@ -10113,6 +10139,9 @@ export interface operations {
                          * @description When it was linked, seconds since the Unix epoch.
                          */
                         linked_at_unix: number;
+                        monthly_limit?: null | components["schemas"]["Usd"];
+                        /** @description Metered spend accrued on this account in the current UTC calendar month. */
+                        monthly_spent?: components["schemas"]["Usd"];
                     };
                 };
             };
@@ -10187,6 +10216,9 @@ export interface operations {
                          * @description When it was linked, seconds since the Unix epoch.
                          */
                         linked_at_unix: number;
+                        monthly_limit?: null | components["schemas"]["Usd"];
+                        /** @description Metered spend accrued on this account in the current UTC calendar month. */
+                        monthly_spent?: components["schemas"]["Usd"];
                     };
                 };
             };
@@ -10351,6 +10383,9 @@ export interface operations {
                          * @description When it was linked, seconds since the Unix epoch.
                          */
                         linked_at_unix: number;
+                        monthly_limit?: null | components["schemas"]["Usd"];
+                        /** @description Metered spend accrued on this account in the current UTC calendar month. */
+                        monthly_spent?: components["schemas"]["Usd"];
                     };
                 };
             };
@@ -10541,6 +10576,9 @@ export interface operations {
                          * @description When it was linked, seconds since the Unix epoch.
                          */
                         linked_at_unix: number;
+                        monthly_limit?: null | components["schemas"]["Usd"];
+                        /** @description Metered spend accrued on this account in the current UTC calendar month. */
+                        monthly_spent?: components["schemas"]["Usd"];
                     };
                 };
             };
@@ -10606,6 +10644,62 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    "flyco_api::provider_accounts::update_provider": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        /** @description Extractor arguments */
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** @description Clears the account's monthly spend cap when `true`. */
+                    clear_monthly_limit?: boolean;
+                    /** @description New human-readable label, when renaming. */
+                    label?: string | null;
+                    monthly_limit?: null | components["schemas"]["Usd"];
+                };
+            };
+        };
+        responses: {
+            /** @description Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        host_id?: null | components["schemas"]["Uuid"];
+                        /** @description Identifier used to unlink the account. */
+                        id: components["schemas"]["Uuid"];
+                        /** @description Which provider it is. */
+                        kind: components["schemas"]["CloudProviderKind"];
+                        /**
+                         * @description Label supplied when it was linked.
+                         *
+                         *     For a machine the user owns this is the host's own label, kept in
+                         *     step by `PATCH /v1/hosts/{id}`: the two rows name the same thing, so
+                         *     a rename that moved only one of them would leave the compute chip
+                         *     calling a machine something its card no longer does.
+                         */
+                        label: string;
+                        /**
+                         * Format: int64
+                         * @description When it was linked, seconds since the Unix epoch.
+                         */
+                        linked_at_unix: number;
+                        monthly_limit?: null | components["schemas"]["Usd"];
+                        /** @description Metered spend accrued on this account in the current UTC calendar month. */
+                        monthly_spent?: components["schemas"]["Usd"];
+                    };
+                };
             };
         };
     };

@@ -758,6 +758,7 @@ async fn finish_azure(
                 client_secret: identity.client_secret,
                 subscription_id: request.subscription_id,
             },
+            monthly_limit: None,
         },
     )
     .await?;
@@ -961,6 +962,7 @@ async fn finish_gcp(
             credentials: ProviderCredentials::Gcp {
                 service_account_json,
             },
+            monthly_limit: None,
         },
     )
     .await?;
@@ -1327,6 +1329,7 @@ async fn link_codespaces_account(
                 owner_id,
                 included_core_hours,
             },
+            monthly_limit: None,
         },
     )
     .await

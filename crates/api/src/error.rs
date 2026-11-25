@@ -234,6 +234,32 @@ pub enum ApiError {
     #[error("provider account not found", status = StatusCode::NOT_FOUND)]
     ProviderAccountNotFound,
 
+    /// The provider account has reached or exceeded its configured monthly spend cap.
+    #[error(
+        "provider account {label} has reached its monthly quota ({spent} / {limit})",
+        status = StatusCode::CONFLICT
+    )]
+    ProviderMonthlyQuotaExceeded {
+        /// Human-readable account label.
+        label: String,
+        /// Current-month metered spend formatted as USD.
+        spent: String,
+        /// Configured monthly cap formatted as USD.
+        limit: String,
+    },
+
+    /// Every linked cloud account eligible for automatic selection has reached
+    /// its configured monthly spend cap.
+    #[error(
+        "every linked cloud account has reached its monthly quota",
+        status = StatusCode::CONFLICT
+    )]
+    AllProviderQuotasExceeded,
+
+    /// The submitted monthly spend cap or label update for a provider account is invalid.
+    #[error("invalid provider account update: {0}", status = StatusCode::UNPROCESSABLE_ENTITY)]
+    InvalidProviderAccountUpdate(&'static str),
+
     /// The submitted harness credential cannot be stored or used.
     #[error("this harness credential is unusable: {0}", status = StatusCode::UNPROCESSABLE_ENTITY)]
     InvalidHarnessCredential(&'static str),
@@ -1704,6 +1730,9 @@ impl ApiError {
             Self::InvalidPushSubscription(_) => "invalid-push-subscription",
             Self::PushDeliveryFailed(_) => "push-delivery-failed",
             Self::ProviderAccountNotFound => "provider-account-not-found",
+            Self::ProviderMonthlyQuotaExceeded { .. } => "provider-monthly-quota-exceeded",
+            Self::AllProviderQuotasExceeded => "all-provider-quotas-exceeded",
+            Self::InvalidProviderAccountUpdate(_) => "invalid-provider-account-update",
             Self::InvalidHarnessCredential(_) => "invalid-harness-credential",
             Self::HarnessAccountNotFound => "harness-account-not-found",
             Self::HarnessAccountInUse { .. } => "harness-account-in-use",

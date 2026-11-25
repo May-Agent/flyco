@@ -96,7 +96,7 @@ pub use providers::{
     AwsIamPolicy, CodespacesBootstrap, CodespacesBootstrapRequest, FinishAzureOauth,
     FinishCodespacesOauth, FinishGcpOauth, LinkProvider, ProviderAccountView, ProviderBonusHint,
     ProviderCredentials, ProviderOauthChoice, ProviderOauthProgress, ProviderOauthStart,
-    QuickstartAnswers,
+    QuickstartAnswers, UpdateProviderAccount,
 };
 pub use push::{PushKeys, PushSubscription, PushSubscriptionView, VapidPublicKey};
 pub use release::{PublishedBinary, PublishedObject};
