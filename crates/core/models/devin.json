@@ -15,8 +15,8 @@
   },
   {
     "id": "swe-2-1-medium",
-    "label": "SWE-2.1 Medium",
-    "description": "SWE-2.1 Medium · a model on Devin.",
+    "label": "SWE-2.1",
+    "description": "SWE-2.1 · a model on Devin.",
     "is_default": true,
     "efforts": [
       "low",
@@ -29,8 +29,8 @@
   },
   {
     "id": "swe-2-1-low-lightning",
-    "label": "SWE-2.1 Ultrafast Low",
-    "description": "SWE-2.1 Ultrafast Low · a model on Devin.",
+    "label": "SWE-2.1 Ultrafast",
+    "description": "SWE-2.1 Ultrafast · a model on Devin.",
     "is_default": false,
     "efforts": [
       "low",
@@ -43,8 +43,8 @@
   },
   {
     "id": "swe-2-high",
-    "label": "SWE-2 High",
-    "description": "SWE-2 High · a model on Devin.",
+    "label": "SWE-2",
+    "description": "SWE-2 · a model on Devin.",
     "is_default": false,
     "efforts": [
       "low",
@@ -57,8 +57,8 @@
   },
   {
     "id": "swe-2-medium-lightning",
-    "label": "SWE-2 Medium Ultrafast",
-    "description": "SWE-2 Medium Ultrafast · a model on Devin.",
+    "label": "SWE-2 Ultrafast",
+    "description": "SWE-2 Ultrafast · a model on Devin.",
     "is_default": false,
     "efforts": [
       "low",
@@ -71,8 +71,8 @@
   },
   {
     "id": "swe-2-flash-medium",
-    "label": "SWE-2 Flash Medium",
-    "description": "SWE-2 Flash Medium · a model on Devin.",
+    "label": "SWE-2 Flash",
+    "description": "SWE-2 Flash · a model on Devin.",
     "is_default": false,
     "efforts": [
       "low",
@@ -85,8 +85,8 @@
   },
   {
     "id": "swe-2-flash-medium-lightning",
-    "label": "SWE-2 Flash Medium Ultrafast",
-    "description": "SWE-2 Flash Medium Ultrafast · a model on Devin.",
+    "label": "SWE-2 Flash Ultrafast",
+    "description": "SWE-2 Flash Ultrafast · a model on Devin.",
     "is_default": false,
     "efforts": [
       "low",
@@ -519,8 +519,8 @@
   },
   {
     "id": "glm-5-2",
-    "label": "GLM-5.2 High",
-    "description": "GLM-5.2 High · a model on Devin.",
+    "label": "GLM-5.2",
+    "description": "GLM-5.2 · a model on Devin.",
     "is_default": false,
     "efforts": [
       "low",
@@ -533,8 +533,8 @@
   },
   {
     "id": "glm-5-2-1m",
-    "label": "GLM-5.2 High 1M",
-    "description": "GLM-5.2 High 1M · a model on Devin.",
+    "label": "GLM-5.2 1M",
+    "description": "GLM-5.2 1M · a model on Devin.",
     "is_default": false,
     "efforts": [
       "low",

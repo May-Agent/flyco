@@ -145,6 +145,7 @@ impl Display {
                 reason: "the desktop needs Xvfb, and flycod only ships on Linux".to_owned(),
             });
         }
+        ensure_x11_socket_dir()?;
         let (mut announced, log) = std::io::pipe().map_err(|error| DisplayError::Server {
             reason: format!("could not make the display pipe: {error}"),
         })?;
@@ -152,16 +153,16 @@ impl Display {
         cmd.arg("-nolisten")
             .arg("tcp")
             .arg("-displayfd")
-            .arg("2")
+            .arg("1")
             .arg("-screen")
             .arg("0")
             .arg(format!("{}x{}x24", config.width, config.height))
-            // The display number arrives on stderr, repurposed as the
-            // announcement channel: the first line is the number, the
-            // rest is the server's diagnostics.
-            .stderr(Stdio::from(log))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null());
+            // Keep stderr separated from `-displayfd` so X11 diagnostic lines
+            // (e.g. `_XSERVTransmkdir` warnings) never corrupt the display
+            // number written to stdout.
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
         if let Some(user) = agent {
             user.apply_std_command(&mut cmd, std::iter::empty::<(&str, &str)>());
         }
@@ -494,6 +495,30 @@ struct Resolved {
     /// The keymap level the keysym lives at — the modifier mask that has
     /// to be held for it to come out.
     level: u8,
+}
+
+/// Ensures `/tmp/.X11-unix` exists with standard sticky `1777` permissions
+/// before spawning an unprivileged `Xvfb`.
+///
+/// Under dual-UID isolation `flycod` runs as root while `Xvfb` drops to the
+/// unprivileged `flyco` user; on fresh container `/tmp` mounts where
+/// `/tmp/.X11-unix` does not yet exist, `Xvfb` fails with
+/// `_XSERVTransmkdir: ERROR: euid != 0`.
+fn ensure_x11_socket_dir() -> Result<(), DisplayError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if crate::privilege::current_euid() != 0 {
+        return Ok(());
+    }
+    let dir = std::path::Path::new("/tmp/.X11-unix");
+    std::fs::create_dir_all(dir).map_err(|error| DisplayError::Server {
+        reason: format!("could not create {}: {error}", dir.display()),
+    })?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777)).map_err(|error| {
+        DisplayError::Server {
+            reason: format!("could not set permissions on {}: {error}", dir.display()),
+        }
+    })?;
+    Ok(())
 }
 
 /// Reads the display number Xvfb announced on our pipe.

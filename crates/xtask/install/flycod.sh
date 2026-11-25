@@ -211,6 +211,7 @@ install_session_runtime() {
   # - Agent workspace and writable harness state (`flyco:flyco`).
   install -d -o root -g root -m 0700 /etc/flycod /var/lib/flyco/transcripts /var/lib/flyco/daemon-home
   install -d -o root -g root -m 0755 /var/lib/flyco /var/lib/flyco/codex /var/lib/flyco/devin-config /var/lib/flyco/antigravity /var/lib/flyco/antigravity/config /etc/claude-code
+  install -d -o root -g root -m 1777 /tmp/.X11-unix
   install -d -o root -g "$runtime_group" -m 0750 /var/lib/flyco/run
   install -d -o "$runtime_user" -g "$runtime_group" -m 0755 /srv/flyco/work
   install -d -o "$runtime_user" -g "$runtime_group" -m 0750 /var/lib/flyco/claude /var/lib/flyco/devin /var/lib/flyco/antigravity/antigravity-cli
